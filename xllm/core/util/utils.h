@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "slice.h"
+#include "rec.pb.h"
 
 namespace xllm {
 namespace util {
@@ -70,6 +71,9 @@ const T& max(const std::vector<T>& vec) {
 bool match_suffix(const Slice<int32_t>& data, const Slice<int32_t>& suffix);
 
 std::vector<uint32_t> cal_vec_split_index(uint32_t vec_size, uint32_t part_num);
+
+torch::Tensor convert_rec_tensor_to_torch(
+    const proto::InferInputTensor& input_tensor);
 
 }  // namespace util
 }  // namespace xllm

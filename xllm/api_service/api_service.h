@@ -109,6 +109,7 @@ class APIService : public proto::XllmAPIService {
   std::unique_ptr<EmbeddingServiceImpl> embedding_service_impl_;
   std::unique_ptr<ModelsServiceImpl> models_service_impl_;
   std::unique_ptr<ImageGenerationServiceImpl> image_generation_service_impl_;
+  std::unique_ptr<RecCompletionServiceImpl> rec_completion_service_impl_;
 };
 
 }  // namespace xllm
