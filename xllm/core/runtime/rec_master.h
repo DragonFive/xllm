@@ -19,121 +19,53 @@ limitations under the License.
 #include <thread>
 
 #include "framework/chat_template/jinja_chat_template.h"
-#include "common/rate_limiter.h"
-#include "common/threadpool.h"
-#include "runtime/master.h"
 #include "framework/model/model_args.h"
+#include "runtime/master.h"
 #include "runtime/rec_engine.h"
 #include "scheduler/continuous_scheduler.h"
+#include "scheduler/fixsteps_scheduler.h"
+#include "util/threadpool.h"
 
 namespace xllm {
 
 class RecMaster : public Master {
  public:
   explicit RecMaster(const Options& options);
-  ~RecMaster() = default;
+  ~RecMaster();
 
-  // schedule a request, the engine will execute the request asynchronously
-  // and call the callback with output when the request is done
-  // the callback will be called multiple times if the request is a streaming
-  // request
-  void schedule_async(
-      std::string prompt,
-      std::optional<std::vector<int>> prompt_tokens,
-      std::optional<std::vector<proto::InferInputTensor>> input_tensors,
-      RequestParams sp,
-      Priority priority,
-      bool stream,
-      OutputCallback callback) override;
+  // handle a request, the engine will execute the request asynchronously
+  // completion/encode
+  void handle_request(std::string prompt,
+                      std::optional<std::vector<int>> prompt_tokens,
+                      std::optional<MMData> mm_data,
+                      RequestParams sp,
+                      OutputCallback callback);
 
-  void schedule_chat_async(
-      std::vector<Message> messages,
-      std::optional<std::vector<int>> prompt_tokens,
-      std::optional<std::vector<proto::InferInputTensor>> input_tensors,
-      RequestParams sp,
-      Priority priority,
-      bool stream,
-      OutputCallback callback) override;
-
-  // Additional virtual methods for API service compatibility
-  void get_cache_info(std::vector<uint64_t>& cluster_ids,
-                      std::vector<int64_t>& k_cache_ids,
-                      std::vector<int64_t>& v_cache_ids) override {
-    // OmniRec does not support cache info, provide empty implementation
-    cluster_ids.clear();
-    k_cache_ids.clear();
-    v_cache_ids.clear();
-  }
-
-  bool link_cluster(const std::vector<uint64_t>& cluster_ids,
-                    const std::vector<std::string>& device_ips,
-                    const std::vector<uint16_t>& ports,
-                    const int32_t dp_size) override {
-    // OmniRec does not support cluster linking, return false
-    return false;
-  }
-
-  bool unlink_cluster(const std::vector<uint64_t>& cluster_ids,
-                      const std::vector<std::string>& device_ips,
-                      const std::vector<uint16_t>& ports,
-                      const int32_t dp_size) override {
-    // OmniRec does not support cluster unlinking, return false
-    return false;
-  }
-
-  // Inherit all public methods from Master
-  void start() override;
-  void stop() override;
-
-  const TokensItemConverter* tokens_item_converter() const {
-    return dynamic_cast<OmniRecEngine*>(engine_.get())->tokens_item_converter();
-  }
+  // start the handling loop
+  void run() override;
 
  private:
-  std::shared_ptr<Request> create_request(
+  std::shared_ptr<Request> generate_request(
       std::string prompt,
       std::optional<std::vector<int>> prompt_tokens,
-      std::optional<std::vector<proto::InferInputTensor>> input_tensors,
-      const RequestParams& sp,
-      Priority priority,
-      bool stream,
-      OutputCallback callback);
-
-  std::shared_ptr<Request> create_chat_request(
-      const std::vector<Message>& messages,
-      std::optional<std::vector<int>> prompt_tokens,
-      const RequestParams& sp,
-      Priority priority,
-      bool stream,
-      OutputCallback callback);
-
-  void schedule(
-      std::string prompt,
-      std::optional<std::vector<int>> prompt_tokens,
-      std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+      std::optional<MMData> mm_data,
       RequestParams sp,
-      Priority priority,
-      bool stream,
-      OutputCallback callback);
-
-  void schedule(
-      std::vector<Message> messages,
-      std::optional<std::vector<int>> prompt_tokens,
-      std::optional<std::vector<proto::InferInputTensor>> input_tensors,
-      RequestParams sp,
-      Priority priority,
-      bool stream,
       OutputCallback callback);
 
   std::unique_ptr<Scheduler> scheduler_;
+  // model args
   ModelArgs model_args_;
   std::unique_ptr<ThreadPool> threadpool_;
   std::unique_ptr<Tokenizer> tokenizer_;
+  // chat template instance
   std::unique_ptr<JinjaChatTemplate> chat_template_;
-  // Thread management
+  // thread for moving forward the scheduler
   std::thread loop_thread_;
-  std::atomic<bool> running_{false};
+  // flag to stop the loop
   std::atomic<bool> stopped_{false};
+
+  // flag to indicate if the handler is running
+  std::atomic<bool> running_{false};
 };
 
-}  // namespace llm
+}  // namespace xllm
