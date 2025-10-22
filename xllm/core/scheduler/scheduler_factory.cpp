@@ -13,13 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "scheduler/scheduler_factory.h"
-
 #include "scheduler/chunked_prefill_scheduler.h"
 #include "scheduler/continuous_scheduler.h"
 #include "scheduler/disagg_pd_scheduler.h"
 #include "scheduler/dit_scheduler.h"
 #include "scheduler/fixsteps_scheduler.h"
+#include "scheduler/scheduler_factory.h"
 #include "scheduler/zero_eviction_scheduler.h"
 
 namespace xllm {

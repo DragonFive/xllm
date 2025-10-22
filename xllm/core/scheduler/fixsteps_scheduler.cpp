@@ -13,8 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "fixsteps_scheduler.h"
-
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <folly/MPMCQueue.h>
@@ -24,13 +22,14 @@ limitations under the License.
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include "common/metrics.h"
 
+#include "common/metrics.h"
+#include "fixsteps_scheduler.h"
+#include "framework/batch/batch.h"
+#include "framework/batch/batch_factory.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
-#include "framework/batch/batch.h"
 #include "runtime/engine.h"
-#include "framework/batch/batch_factory.h"
 
 namespace xllm {
 
@@ -54,10 +53,10 @@ bool FixStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   return false;
 }
 
-  void FixStepsScheduler::handle_prefill_requests(
-      size_t& remaining_token_budget,
-      size_t& remaining_seq_budget,
-      std::vector<std::shared_ptr<Request>>& finished_requests){
+void FixStepsScheduler::handle_prefill_requests(
+    size_t& remaining_token_budget,
+    size_t& remaining_seq_budget,
+    std::vector<std::shared_ptr<Request>>& finished_requests) {
   // Handle new request prompt first.
   // Include those requests that are preempted by others.
   //
@@ -75,7 +74,7 @@ bool FixStepsScheduler::add_request(std::shared_ptr<Request>& request) {
          kv_cache_manager_->kv_cache_utilization() <
              FLAGS_prefill_scheduling_memory_usage_threshold) {
     std::shared_ptr<Request> request(waiting_priority_queue_.top());
-    if (request->finished() || request->cancelled()) { 
+    if (request->finished() || request->cancelled()) {
       // kv_cache_manager_->deallocate(request.get());
       //  release the ownership of the request
       finished_requests.emplace_back(request);
@@ -222,14 +221,14 @@ std::vector<Batch> FixStepsScheduler::prepare_batch() {
   }
 
   // update the batch
-  auto batches =
-      BatchFactory::get_instance(options_.dp_size())
-          ->create_batches(running_requests_,
-                           running_sequences_,
-                           running_sequences_budgets_,
-                           kv_cache_manager_->get_copy_in_cache_block_infos(),
-                           kv_cache_manager_->get_copy_out_cache_block_infos(),
-                           kv_cache_manager_->get_swap_cache_block_infos());
+  auto batches = BatchFactory::get_instance(options_.dp_size())
+                     ->create_rec_batches(
+                         running_requests_,
+                         running_sequence_groups_,
+                         running_sequences_budgets_,
+                         kv_cache_manager_->get_copy_in_cache_block_infos(),
+                         kv_cache_manager_->get_copy_out_cache_block_infos(),
+                         kv_cache_manager_->get_swap_cache_block_infos());
 
   // update metrics before returning
   if (!batches[0].empty()) {
@@ -257,8 +256,6 @@ std::vector<Batch> FixStepsScheduler::prepare_batch() {
   }
   return batches;
 }
-
-
 
 std::vector<Batch> FixStepsScheduler::schedule_request(
     const absl::Duration& timeout) {
