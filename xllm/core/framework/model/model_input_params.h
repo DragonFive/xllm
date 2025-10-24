@@ -208,10 +208,14 @@ struct ModelInputParams {
 // Rec model specific input parameters
 struct RecModelInputParams {
   // Rec model specific parameters
+
   enum class RecStage {
     PREFILL,  // Prefill stage
     DECODE    // Decode stage
   };
+
+  // Add T5Stage as an alias for RecStage for compatibility
+  using T5Stage = RecStage;
 
   RecStage rec_stage = RecStage::PREFILL;
   bool is_hybrid_mode = false;
@@ -240,9 +244,7 @@ struct RecModelInputParams {
   // generate rec: decoder embedding
   torch::Tensor decoder_context_embedding;
 
-  // Flag to indicate whether to update KV cache for different attention types
-  bool update_self_attn_cache = true;
-  bool update_cross_attn_cache = false;
+  // Flag removed; cache update now controlled externally
   bool is_first_prefill = true;
 
   // Rec model tokens
@@ -258,14 +260,11 @@ struct RecModelInputParams {
     RecModelInputParams params;
 
     // Copy Rec specific parameters
-    params.model_type = model_type;
     params.rec_stage = rec_stage;
     params.is_hybrid_mode = is_hybrid_mode;
     params.has_encoder_output = has_encoder_output;
     params.encoder_seq_lens = encoder_seq_lens;
     params.encoder_max_seq_len = encoder_max_seq_len;
-    params.update_self_attn_cache = update_self_attn_cache;
-    params.update_cross_attn_cache = update_cross_attn_cache;
     params.bos_token_id = bos_token_id;
     params.bs = bs;
     params.group_width = group_width;
@@ -295,16 +294,13 @@ struct RecModelInputParams {
   }
 
   void print() const {
-    LOG(INFO) << "RecModelInputParams: model_type is "
-              << static_cast<int>(model_type) << " , rec_stage is "
+    LOG(INFO) << "RecModelInputParams: rec_stage is "
               << static_cast<int>(rec_stage) << " , is_hybrid_mode is "
               << is_hybrid_mode << " , has_encoder_output is "
               << has_encoder_output;
     LOG(INFO) << "RecModelInputParams: encoder_seq_lens is " << encoder_seq_lens
               << ", encoder_max_seq_len is " << encoder_max_seq_len;
-    LOG(INFO) << "RecModelInputParams: update_self_attn_cache is "
-              << update_self_attn_cache << ", update_cross_attn_cache is "
-              << update_cross_attn_cache << ", is_first_prefill is "
+    LOG(INFO) << "RecModelInputParams: is_first_prefill is "
               << is_first_prefill;
     LOG(INFO) << "RecModelInputParams: bos_token_id is " << bos_token_id
               << ", bs is " << bs << ", group_width is " << group_width
