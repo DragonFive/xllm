@@ -205,6 +205,12 @@ DECLARE_COUNTER(proto_latency_seconds_o2proto);
 // engine metrics
 DECLARE_COUNTER(prepare_input_latency_seconds);
 
+// rec engine metrics
+DECLARE_COUNTER(rec_first_token_latency_seconds);
+DECLARE_COUNTER(rec_second_token_latency_seconds);
+DECLARE_COUNTER(rec_third_token_latency_seconds);
+DECLARE_COUNTER(rec_sampling_latency_seconds);
+
 // multi node metrics
 DECLARE_COUNTER(worker_service_latency_seconds);
 DECLARE_COUNTER(engine_latency_seconds);
