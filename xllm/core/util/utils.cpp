@@ -178,7 +178,7 @@ torch::Dtype convert_rec_type_to_torch(proto::DataType data_type) {
   }
 }
 
-torch::Tensor convert_omnirec_tensor_to_torch(
+torch::Tensor convert_rec_tensor_to_torch(
     const proto::InferInputTensor& input_tensor) {
   std::vector<int64_t> shape;
   shape.reserve(input_tensor.shape_size());

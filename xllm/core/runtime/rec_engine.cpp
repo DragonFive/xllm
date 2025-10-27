@@ -250,7 +250,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
 
   Timer timer;
   auto forward_inputs = workers_[0]->prepare_inputs(batches[0]);
-  COUNTER_ADD(prepare_input_latency_seconds, timer.elapsed_seconds());
+  COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
 
   if (!forward_inputs.token_ids.defined()) {
     // empty input, just return
@@ -260,11 +260,11 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
   timer.reset();
   // Prefill step: Run the first model execution
   const auto& prefill_output = get_model_output(forward_inputs);
-  COUNTER_ADD(rec_first_token_latency_seconds, timer.elapsed_seconds());
+  COUNTER_ADD(rec_first_token_latency_microseconds, timer.elapsed_microseconds());
 
   timer.reset();
   batches[0].process_sample_output(prefill_output.sample_output, false);
-  COUNTER_ADD(rec_sampling_latency_seconds, timer.elapsed_seconds());
+  COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
 
   // Decode steps: Run the model 2 more times for decoding
   ForwardOutput decode_output;
@@ -272,19 +272,20 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
   for (int i = 0; i < 2; ++i) {
     timer.reset();
     forward_inputs = workers_[0]->prepare_inputs(batches[0]);
-    COUNTER_ADD(prepare_input_latency_seconds, timer.elapsed_seconds());
+    COUNTER_ADD(prepare_input_latency_microseconds,
+                timer.elapsed_microseconds());
 
     timer.reset();
     decode_output = get_model_output(forward_inputs);
     if (i == 0) {
-      COUNTER_ADD(rec_second_token_latency_seconds, timer.elapsed_seconds());
+      COUNTER_ADD(rec_second_token_latency_microseconds, timer.elapsed_microseconds());
     } else if (i == 1) {
-      COUNTER_ADD(rec_third_token_latency_seconds, timer.elapsed_seconds());
+      COUNTER_ADD(rec_third_token_latency_microseconds, timer.elapsed_microseconds());
     }
 
     timer.reset();
     batches[0].process_sample_output(decode_output.sample_output, false);
-    COUNTER_ADD(rec_sampling_latency_seconds, timer.elapsed_seconds());
+    COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
   }
 
   batches[0].finish();

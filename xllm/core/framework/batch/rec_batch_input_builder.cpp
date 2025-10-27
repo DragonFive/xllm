@@ -256,7 +256,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
           if (!sequence) continue;
 
-          const auto& token_ids = sequence->token_ids();
+          const auto& token_ids = sequence->tokens();
 
           // Build generated tokens
           auto& cur_generated_tokens = thread_generated_tokens[i];
@@ -327,7 +327,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       size_t seq_idx = 0;
       for (const auto& group : sequence_groups_) {
         for (const auto& sequence : group->sequences()) {
-          const auto& token_ids = sequence->token_ids();
+          const auto& token_ids = sequence->tokens();
 
           // Optimize generated tokens construction
           auto& cur_generated_tokens = generated_tokens.emplace_back();

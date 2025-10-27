@@ -182,14 +182,16 @@ DEFINE_COUNTER(prepare_input_latency_seconds,
                "Latency of preparing input in seconds");
 
 // rec engine metrics
-DEFINE_COUNTER(rec_first_token_latency_seconds,
-               "Latency of rec first token generation in seconds");
-DEFINE_COUNTER(rec_second_token_latency_seconds,
-               "Latency of rec second token generation in seconds");
-DEFINE_COUNTER(rec_third_token_latency_seconds,
-               "Latency of rec third token generation in seconds");
-DEFINE_COUNTER(rec_sampling_latency_seconds,
-               "Latency of rec sampling in seconds");
+DEFINE_COUNTER(rec_first_token_latency_microseconds,
+               "Latency of rec first token generation in microseconds");
+DEFINE_COUNTER(rec_second_token_latency_microseconds,
+               "Latency of rec second token generation in microseconds");
+DEFINE_COUNTER(rec_third_token_latency_microseconds,
+               "Latency of rec third token generation in microseconds");
+DEFINE_COUNTER(rec_sampling_latency_microseconds,
+               "Latency of rec sampling in microseconds");
+DEFINE_COUNTER(expand_beam_latency_microseconds,
+               "Latency of expand beam in microseconds");
 
 // multi node metrics
 DEFINE_COUNTER(worker_service_latency_seconds,

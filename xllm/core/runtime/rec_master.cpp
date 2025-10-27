@@ -262,6 +262,8 @@ std::shared_ptr<Request> RecMaster::generate_request(
                            callback,
                            nullptr,
                            sp.decode_address);
+    req_state.is_rec_model = true;
+    req_state.bos_token_id = model_args_.bos_token_id();
     std::shared_ptr<Request> request;
 
     auto request = std::make_shared<Request>(sp.request_id,

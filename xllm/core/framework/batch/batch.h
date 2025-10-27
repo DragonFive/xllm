@@ -107,6 +107,8 @@ class Batch {
 
   bool get_batch_prefill_status() const { return all_seqs_in_prefill_; }
 
+  void finish();
+
  private:
   // prepare forward inputs for Rec model
   ForwardInput prepare_rec_forward_input(uint32_t num_decoding_tokens,

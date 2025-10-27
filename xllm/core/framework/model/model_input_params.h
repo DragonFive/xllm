@@ -250,7 +250,6 @@ struct RecModelInputParams {
   bool is_first_prefill = true;
 
   // Rec model tokens
-  int32_t bos_token_id = 0;  // Beginning of sequence token for Rec decoder
   int64_t bs = 0;
   int64_t group_width = 0;
   int32_t seq_len = 0;
@@ -268,7 +267,6 @@ struct RecModelInputParams {
     params.has_encoder_output = has_encoder_output;
     params.encoder_seq_lens = encoder_seq_lens;
     params.encoder_max_seq_len = encoder_max_seq_len;
-    params.bos_token_id = bos_token_id;
     params.bs = bs;
     params.group_width = group_width;
     params.is_first_prefill = is_first_prefill;
@@ -305,8 +303,7 @@ struct RecModelInputParams {
               << ", encoder_max_seq_len is " << encoder_max_seq_len;
     LOG(INFO) << "RecModelInputParams: is_first_prefill is "
               << is_first_prefill;
-    LOG(INFO) << "RecModelInputParams: bos_token_id is " << bos_token_id
-              << ", bs is " << bs << ", group_width is " << group_width
+    LOG(INFO) << ", bs is " << bs << ", group_width is " << group_width
               << ", seq_len is " << seq_len;
   }
 };
