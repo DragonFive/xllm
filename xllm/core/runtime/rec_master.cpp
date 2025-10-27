@@ -68,7 +68,7 @@ RecMaster::RecMaster(const Options& options)
       .enable_service_routing(options_.enable_service_routing())
       .enable_decode_response_to_service(enable_decode_response_to_service)
       .schedule_rec(true);
-  scheduler_ = create_rec_scheduler(engine_.get(), scheduler_options);
+  scheduler_ = create_fixsteps_scheduler(engine_.get(), scheduler_options);
 
   // OmniRec model does not have a tokenizer
   chat_template_ = nullptr;

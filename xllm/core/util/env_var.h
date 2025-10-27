@@ -22,5 +22,7 @@ namespace util {
 
 bool get_bool_env(const std::string& key, bool defaultValue);
 
+int get_int_env(const std::string& key, int defaultValue);
+
 }  // namespace util
 }  // namespace xllm

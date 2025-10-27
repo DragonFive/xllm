@@ -48,7 +48,7 @@ cc_library(
     llm_engine.cpp
     vlm_engine.cpp
     dit_engine.cpp
-    rec_egnine.cpp
+    rec_engine.cpp
     worker_client.cpp
     xservice_client.cpp
     params_utils.cpp

@@ -219,6 +219,8 @@ struct RecModelInputParams {
 
   RecStage rec_stage = RecStage::PREFILL;
   bool is_hybrid_mode = false;
+  // Flag to distinguish encoder vs decoder forward calls
+  bool is_encoder_forward = false;
   // For Rec decoder cross-attention
   bool has_encoder_output = false;
   // Length of encoder output sequence for each sequence
@@ -262,6 +264,7 @@ struct RecModelInputParams {
     // Copy Rec specific parameters
     params.rec_stage = rec_stage;
     params.is_hybrid_mode = is_hybrid_mode;
+    params.is_encoder_forward = is_encoder_forward;
     params.has_encoder_output = has_encoder_output;
     params.encoder_seq_lens = encoder_seq_lens;
     params.encoder_max_seq_len = encoder_max_seq_len;

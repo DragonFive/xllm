@@ -30,5 +30,17 @@ bool get_bool_env(const std::string& key, bool defaultValue) {
           strVal == "True");
 }
 
+int get_int_env(const std::string& key, int defaultValue) {
+  const char* val = std::getenv(key.c_str());
+  if (val == nullptr) {
+    return defaultValue;
+  }
+  try {
+    return std::stoi(val);
+  } catch (const std::exception&) {
+    return defaultValue;
+  }
+}
+
 }  // namespace util
 }  // namespace xllm
