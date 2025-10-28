@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "rec_batch_input_builder.h"
 
+#include "common/mspti_helper.h"
+
 #include <algorithm>
 #include <cstring>
 #include <future>
@@ -22,12 +24,14 @@ limitations under the License.
 #include <thread>
 #include <vector>
 
+#include "common/mspti_helper.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
 #include "framework/sampling/sampling_params.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
+#include "util/utils.h"
 
 namespace xllm {
 
@@ -87,7 +91,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
                 sequence_groups_.begin(),
                 sequence_groups_.end(),
                 0,
-                [](int sum, const auto& group) { return sum + group->size(); })
+                [](int sum, const auto& group) { return sum + group->sequences().size(); })
           : 0;
 
   if (UNLIKELY(num_sequences == 0)) {

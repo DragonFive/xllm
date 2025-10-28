@@ -190,8 +190,8 @@ DEFINE_COUNTER(rec_third_token_latency_microseconds,
                "Latency of rec third token generation in microseconds");
 DEFINE_COUNTER(rec_sampling_latency_microseconds,
                "Latency of rec sampling in microseconds");
-DEFINE_COUNTER(expand_beam_latency_microseconds,
-               "Latency of expand beam in microseconds");
+DEFINE_HISTOGRAM(expand_beam_latency_microseconds,
+                "Histogram of expand beam latency in microseconds");
 
 // multi node metrics
 DEFINE_COUNTER(worker_service_latency_seconds,

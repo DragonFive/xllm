@@ -211,7 +211,7 @@ DECLARE_COUNTER(rec_first_token_latency_microseconds);
 DECLARE_COUNTER(rec_second_token_latency_microseconds);
 DECLARE_COUNTER(rec_third_token_latency_microseconds);
 DECLARE_COUNTER(rec_sampling_latency_microseconds);
-DECLARE_COUNTER(expand_beam_latency_microseconds);
+DECLARE_HISTOGRAM(expand_beam_latency_microseconds);
 
 // multi node metrics
 DECLARE_COUNTER(worker_service_latency_seconds);

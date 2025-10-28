@@ -104,12 +104,21 @@ class RecBatchInputBuilder : public BatchInputBuilder {
       void reset() { pool_index = 0; }
     };
 
+    // Cache data structure
+    struct CacheData {
+      std::vector<int32_t> encoder_tokens;
+      std::vector<int> encoder_seq_lens;
+      std::vector<torch::Tensor> encoder_sparse_embeddings;
+      std::vector<torch::Tensor> decoder_context_embeddings;
+    };
+
     // Pre-created constant tensors
     torch::Tensor fixed_positions_tensor;
     torch::Tensor fixed_encoder_positions_tensor;
     torch::Tensor empty_tensor;
 
     MemoryPool memory_pool;
+    CacheData cache_data;
 
     HighPerformanceCache() {
       // Pre-create commonly used tensors to avoid repeated creation

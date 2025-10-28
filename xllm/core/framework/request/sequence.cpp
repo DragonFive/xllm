@@ -91,9 +91,15 @@ Sequence::Sequence(size_t index,
       tokens_[num_tokens_++] = sequence_params_.bos_token_id;
       token_to_count_map_[sequence_params_.bos_token_id]++;
     }
+    
+    volatile_num_prompt_tokens_ = num_prompt_tokens_;
+    input_embedding_ = input_embedding;
+    cur_generated_token_idx_ = num_prompt_tokens_;
+    // init logprob state
+    logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
-    size_t capacity = sequence_params_.seq_capacity;
+    capacity = sequence_params_.seq_capacity;
     CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
     num_prompt_tokens_ = prompt_token_ids.size();
     tokens_.resize(capacity);
@@ -102,13 +108,13 @@ Sequence::Sequence(size_t index,
       tokens_[num_tokens_++] = token_id;
       token_to_count_map_[token_id]++;
     }
+    
+    volatile_num_prompt_tokens_ = num_prompt_tokens_;
+    input_embedding_ = input_embedding;
+    cur_generated_token_idx_ = num_prompt_tokens_;
+    // init logprob state
+    logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
   }
-
-  volatile_num_prompt_tokens_ = num_prompt_tokens_;
-  input_embedding_ = input_embedding;
-  cur_generated_token_idx_ = num_prompt_tokens_;
-  // init logprob state
-  logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
 }
 
 Sequence::Sequence(const Sequence& other)
