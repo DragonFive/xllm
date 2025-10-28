@@ -18,7 +18,7 @@ limitations under the License.
 #include <pybind11/pybind11.h>
 
 #include "absl/time/time.h"
-#include "common/threadpool.h"
+#include "util/threadpool.h"
 #include "models/base/model_registry.h"
 #include "rec_master.h"
 #include "runtime/rec_engine.h"

@@ -15,7 +15,7 @@ limitations under the License.
 
 #include "hash_util.h"
 
-#include <MurmurHash3.h>
+#include "third_party/smhasher/src/MurmurHash3.h"
 #include <glog/logging.h>
 #include <string.h>
 

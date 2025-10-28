@@ -88,14 +88,14 @@ Sequence::Sequence(size_t index,
     }
     tokens_.resize(capacity);
     for (size_t i = 0; i < num_prompt_tokens_; ++i) {
-      token_ids_[num_tokens_++] = sequence_params_.bos_token_id;
+      tokens_[num_tokens_++] = sequence_params_.bos_token_id;
       token_to_count_map_[sequence_params_.bos_token_id]++;
     }
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
     CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
     num_prompt_tokens_ = prompt_token_ids.size();
-    auto capacity = sequence_params_.seq_capacity;
+    capacity = sequence_params_.seq_capacity;
     tokens_.resize(capacity);
     // add the prompt tokens
     for (const auto token_id : prompt_token_ids) {
