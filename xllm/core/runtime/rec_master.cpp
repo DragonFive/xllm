@@ -19,7 +19,7 @@ limitations under the License.
 
 #include "absl/time/time.h"
 #include "util/threadpool.h"
-#include "models/base/model_registry.h"
+#include "models/model_registry.h"
 #include "rec_master.h"
 #include "runtime/rec_engine.h"
 #include "runtime/xservice_client.h"

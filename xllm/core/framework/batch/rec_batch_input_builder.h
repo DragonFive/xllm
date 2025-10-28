@@ -16,8 +16,8 @@ limitations under the License.
 #pragma once
 
 #include <torch/torch.h>
-#include <future>
 
+#include <future>
 #include <vector>
 
 #include "batch_input_builder.h"
@@ -25,6 +25,7 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/request/mm_data.h"
 #include "framework/request/sequence.h"
+#include "framework/request/sequences_group.h"
 #include "runtime/forward_params.h"
 #include "util/threadpool.h"
 
@@ -79,7 +80,8 @@ class RecBatchInputBuilder : public BatchInputBuilder {
   static std::vector<Sequence*> extract_sequences_from_groups(
       const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups);
 
-  // Member variables - only keep sequence_groups_, others inherited from parent class
+  // Member variables - only keep sequence_groups_, others inherited from parent
+  // class
   const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups_;
 
   // High performance cache system

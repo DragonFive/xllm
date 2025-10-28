@@ -93,9 +93,9 @@ Sequence::Sequence(size_t index,
     }
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
+    size_t capacity = sequence_params_.seq_capacity;
     CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
     num_prompt_tokens_ = prompt_token_ids.size();
-    capacity = sequence_params_.seq_capacity;
     tokens_.resize(capacity);
     // add the prompt tokens
     for (const auto token_id : prompt_token_ids) {
@@ -300,8 +300,8 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
   const auto ids = Slice<int32_t>(tokens_, size);
 
   // For rec model, return token_ids directly without decode
-  const size_t start = num_prompt_tokens_;
   if (is_rec_model()) {
+    const size_t start = num_prompt_tokens_;
     SequenceOutput output;
     output.index = index_;
     output.token_ids = ids.slice(start, size);

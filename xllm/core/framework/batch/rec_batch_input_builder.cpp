@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "rec_batch_input_builder.h"
+
 #include <algorithm>
 #include <cstring>
 #include <future>
@@ -24,7 +26,6 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
 #include "framework/sampling/sampling_params.h"
-#include "rec_batch_input_builder.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
 
@@ -915,7 +916,6 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   input_params.rec_params->rec_stage = RecModelInputParams::RecStage::PREFILL;
   input_params.rec_params->is_hybrid_mode = false;
   input_params.rec_params->has_encoder_output = true;
-  input_params.rec_params->bos_token_id = 0;
   input_params.rec_params->is_first_prefill = is_first_prefill;
   input_params.rec_params->bs = bs;
   input_params.rec_params->group_width = group_width;
