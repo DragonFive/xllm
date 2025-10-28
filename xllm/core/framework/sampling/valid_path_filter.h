@@ -3,7 +3,7 @@
 #include <torch/torch.h>
 #include <torch/types.h>
 
-#include "common/hash_util.h"
+#include "util/hash_util.h"
 #include "util/threadpool.h"
 
 namespace xllm {

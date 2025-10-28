@@ -30,6 +30,7 @@ cc_library(
   SRCS
     device_name_utils.cpp
     env_var.cpp
+    hash_util.cpp
     json_reader.cpp
     net.cpp
     pretty_print.cpp
@@ -48,6 +49,7 @@ cc_library(
     Boost::serialization
     absl::synchronization
     ${Python_LIBRARIES}
+    proto::xllm_proto
     :platform
 )
 target_link_libraries(util PRIVATE OpenSSL::SSL OpenSSL::Crypto)

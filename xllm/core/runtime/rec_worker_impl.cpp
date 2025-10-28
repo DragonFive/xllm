@@ -26,11 +26,6 @@ limitations under the License.
 
 namespace xllm {
 
-namespace {
-// Environment variable for configuring async thread pool size
-constexpr const char* ENV_REC_ASYNC_THREAD_NUM = "REC_ASYNC_THREAD_NUM";
-}  // namespace
-
 RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
                              const runtime::Options& options)
@@ -39,7 +34,7 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
   filter_mask_stream_ = device_.get_stream_from_pool();
 
   // Initialize thread pool for async operations using environment variable
-  int thread_num = util::get_int_env(ENV_REC_ASYNC_THREAD_NUM, 2);
+  int thread_num = util::get_int_env(util::EXTRA_THREAD_NUM, 16);
   thread_pool_ = std::make_shared<ThreadPool>(thread_num);
 }
 
