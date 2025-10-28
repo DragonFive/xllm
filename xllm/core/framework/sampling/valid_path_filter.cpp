@@ -8,7 +8,7 @@
 #include <future>
 #include <mutex>
 
-#include "common/hash_util.h"
+#include "util/hash_util.h"
 #include "util/env_var.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"
@@ -17,6 +17,7 @@
 namespace xllm {
 
 namespace {
+
 void parse_valid_path_filter_file(
     std::vector<std::vector<int32_t>>& tokens_list,
     const std::string& valid_path_filter_file) {

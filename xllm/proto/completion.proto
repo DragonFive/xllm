@@ -4,7 +4,7 @@ option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
 
 import "common.proto";
-import "rec.proto"
+import "rec.proto";
 
 // Next ID: 26
 message CompletionRequest {

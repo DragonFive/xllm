@@ -106,7 +106,7 @@ std::vector<Batch> BatchFactory::create_batches(
   return batches;
 }
 
-std::vector<Batch> BatchFactory ::create_rec_batches(
+std::vector<Batch> BatchFactory::create_rec_batches(
     const std::vector<std::shared_ptr<Request>>& running_requests,
     const std::vector<Sequence*>& running_sequences,
     const std::vector<size_t>& running_sequences_budgets,

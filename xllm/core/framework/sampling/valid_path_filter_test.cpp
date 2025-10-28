@@ -25,7 +25,7 @@ TEST(ValidPathFilterTest, Vector) {
   torch::Device device(torch::kCPU);
   int32_t vocab_size = 5;
   ValidPathFilter filter =
-      ValidPathFilter(tokens_list, 0, vocab_size, dtype, device);
+      ValidPathFilter(tokens_list, vocab_size, dtype, device);
   std::vector<std::vector<int32_t>> candidate_tokens = {{1, 2, 3}, {1}, {}};
 
   const auto options = torch::dtype(dtype).device(device);
@@ -71,7 +71,7 @@ TEST(ValidPathFilterTest, File) {
   torch::Device device(torch::kCPU);
   int32_t vocab_size = 5;
   ValidPathFilter filter =
-      ValidPathFilter(rec_tokens_file, 0, vocab_size, dtype, device);
+      ValidPathFilter(rec_tokens_file, vocab_size, dtype, device);
   std::vector<std::vector<int32_t>> candidate_tokens = {{1, 2, 3}, {1}, {}};
 
   const auto options = torch::dtype(dtype).device(device);

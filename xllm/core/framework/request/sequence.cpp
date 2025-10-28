@@ -88,27 +88,33 @@ Sequence::Sequence(size_t index,
     }
     tokens_.resize(capacity);
     for (size_t i = 0; i < num_prompt_tokens_; ++i) {
-      token_ids_[num_tokens_++] = sequence_params_.bos_token_id;
+      tokens_[num_tokens_++] = sequence_params_.bos_token_id;
       token_to_count_map_[sequence_params_.bos_token_id]++;
     }
+    
+    volatile_num_prompt_tokens_ = num_prompt_tokens_;
+    input_embedding_ = input_embedding;
+    cur_generated_token_idx_ = num_prompt_tokens_;
+    // init logprob state
+    logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
+    auto capacity = sequence_params_.seq_capacity;
     CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
     num_prompt_tokens_ = prompt_token_ids.size();
-    auto capacity = sequence_params_.seq_capacity;
     tokens_.resize(capacity);
     // add the prompt tokens
     for (const auto token_id : prompt_token_ids) {
       tokens_[num_tokens_++] = token_id;
       token_to_count_map_[token_id]++;
     }
+    
+    volatile_num_prompt_tokens_ = num_prompt_tokens_;
+    input_embedding_ = input_embedding;
+    cur_generated_token_idx_ = num_prompt_tokens_;
+    // init logprob state
+    logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
   }
-
-  volatile_num_prompt_tokens_ = num_prompt_tokens_;
-  input_embedding_ = input_embedding;
-  cur_generated_token_idx_ = num_prompt_tokens_;
-  // init logprob state
-  logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
 }
 
 Sequence::Sequence(const Sequence& other)
@@ -300,8 +306,8 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
   const auto ids = Slice<int32_t>(tokens_, size);
 
   // For rec model, return token_ids directly without decode
-  const size_t start = num_prompt_tokens_;
   if (is_rec_model()) {
+    const size_t start = num_prompt_tokens_;
     SequenceOutput output;
     output.index = index_;
     output.token_ids = ids.slice(start, size);

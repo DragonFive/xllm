@@ -21,12 +21,7 @@ cc_library(
   DEPS
     glog::glog
     torch
-    :hash_util
-    :threadpool
-    :tensor_helper
-    :timer
-    :env_var
-    :slice
+    :util
     $<$<BOOL:${USE_NPU}>:xllm_ops>
 )
 

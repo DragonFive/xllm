@@ -22,14 +22,10 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "models/model_registry.h"
 #include "util/env_var.h"
 
 namespace xllm {
-
-namespace {
-// Environment variable for configuring async thread pool size
-constexpr const char* ENV_REC_ASYNC_THREAD_NUM = "REC_ASYNC_THREAD_NUM";
-}  // namespace
 
 RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
@@ -39,7 +35,7 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
   filter_mask_stream_ = device_.get_stream_from_pool();
 
   // Initialize thread pool for async operations using environment variable
-  int thread_num = util::get_int_env(ENV_REC_ASYNC_THREAD_NUM, 2);
+  int thread_num = util::get_int_env(util::EXTRA_THREAD_NUM, 16);
   thread_pool_ = std::make_shared<ThreadPool>(thread_num);
 }
 
@@ -288,8 +284,7 @@ std::future<torch::Tensor> RecWorkerImpl::prepare_filter_mask_async(
       }
 
       // Copy to device using the dedicated H2D stream
-      torch::Tensor device_mask =
-          cpu_mask.to(device_.device(), /*non_blocking=*/true);
+      torch::Tensor device_mask = cpu_mask.to(device_, /*non_blocking=*/true);
 
       // Synchronize the H2D stream to ensure copy is complete
       filter_mask_stream_->synchronize();

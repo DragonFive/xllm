@@ -16,8 +16,8 @@ limitations under the License.
 #pragma once
 
 #include <torch/torch.h>
-#include <future>
 
+#include <future>
 #include <vector>
 
 #include "batch_input_builder.h"
@@ -25,6 +25,7 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/request/mm_data.h"
 #include "framework/request/sequence.h"
+#include "framework/request/sequences_group.h"
 #include "runtime/forward_params.h"
 #include "util/threadpool.h"
 
@@ -79,7 +80,8 @@ class RecBatchInputBuilder : public BatchInputBuilder {
   static std::vector<Sequence*> extract_sequences_from_groups(
       const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups);
 
-  // Member variables - only keep sequence_groups_, others inherited from parent class
+  // Member variables - only keep sequence_groups_, others inherited from parent
+  // class
   const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups_;
 
   // High performance cache system
@@ -102,12 +104,21 @@ class RecBatchInputBuilder : public BatchInputBuilder {
       void reset() { pool_index = 0; }
     };
 
+    // Cache data structure
+    struct CacheData {
+      std::vector<int32_t> encoder_tokens;
+      std::vector<int> encoder_seq_lens;
+      std::vector<torch::Tensor> encoder_sparse_embeddings;
+      std::vector<torch::Tensor> decoder_context_embeddings;
+    };
+
     // Pre-created constant tensors
     torch::Tensor fixed_positions_tensor;
     torch::Tensor fixed_encoder_positions_tensor;
     torch::Tensor empty_tensor;
 
     MemoryPool memory_pool;
+    CacheData cache_data;
 
     HighPerformanceCache() {
       // Pre-create commonly used tensors to avoid repeated creation

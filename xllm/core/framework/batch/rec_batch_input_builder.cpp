@@ -13,6 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "rec_batch_input_builder.h"
+
+#include "common/mspti_helper.h"
+
 #include <algorithm>
 #include <cstring>
 #include <future>
@@ -20,13 +24,14 @@ limitations under the License.
 #include <thread>
 #include <vector>
 
+#include "common/mspti_helper.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
 #include "framework/sampling/sampling_params.h"
-#include "rec_batch_input_builder.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
+#include "util/utils.h"
 
 namespace xllm {
 
@@ -86,7 +91,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
                 sequence_groups_.begin(),
                 sequence_groups_.end(),
                 0,
-                [](int sum, const auto& group) { return sum + group->size(); })
+                [](int sum, const auto& group) { return sum + group->sequences().size(); })
           : 0;
 
   if (UNLIKELY(num_sequences == 0)) {
@@ -243,7 +248,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
         for (size_t i = start_idx;
              i < end_idx && i < static_cast<size_t>(num_sequences);
              ++i) {
-          Sequence* const sequence = nullptr;
+          const Sequence* sequence = nullptr;
           // Get sequence from sequence_groups
           size_t seq_idx = 0;
           for (const auto& group : sequence_groups_) {
@@ -915,7 +920,6 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   input_params.rec_params->rec_stage = RecModelInputParams::RecStage::PREFILL;
   input_params.rec_params->is_hybrid_mode = false;
   input_params.rec_params->has_encoder_output = true;
-  input_params.rec_params->bos_token_id = 0;
   input_params.rec_params->is_first_prefill = is_first_prefill;
   input_params.rec_params->bs = bs;
   input_params.rec_params->group_width = group_width;

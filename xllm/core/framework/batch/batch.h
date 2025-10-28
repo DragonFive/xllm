@@ -113,11 +113,13 @@ class Batch {
 
   void finish();
 
- private:
   // prepare forward inputs for Rec model
   ForwardInput prepare_rec_forward_input(uint32_t num_decoding_tokens,
-                                         uint32_t min_decoding_bach_size,
-                                         const ModelArgs& args);
+                                         uint32_t min_decoding_batch_size,
+                                         const ModelArgs& args,
+                                         ThreadPool* thread_pool = nullptr);
+
+ private:
 
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
 

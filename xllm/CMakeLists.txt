@@ -28,8 +28,13 @@ cc_binary(
     nlohmann_json::nlohmann_json
 )
 
-# link brpc
+# link brpc - brpc handles its own SSL dependencies
 target_link_libraries(xllm PRIVATE glog::glog brpc leveldb::leveldb ZLIB::ZLIB protobuf::libprotobuf ${OpenCV_LIBS})
+# Link vcpkg OpenSSL libraries explicitly for brpc compatibility
+target_link_libraries(xllm PRIVATE
+    ${CMAKE_BINARY_DIR}/vcpkg_installed/arm64-linux/lib/libssl.a
+    ${CMAKE_BINARY_DIR}/vcpkg_installed/arm64-linux/lib/libcrypto.a
+)
 add_dependencies(xllm brpc-static)
 
 if(USE_NPU)

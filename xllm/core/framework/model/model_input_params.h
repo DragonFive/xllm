@@ -26,6 +26,132 @@ limitations under the License.
 #include "util/tensor_helper.h"
 
 namespace xllm {
+
+// Rec model specific input parameters
+struct RecModelInputParams {
+  // Rec model specific parameters
+
+  enum class RecStage {
+    PREFILL,  // Prefill stage
+    DECODE    // Decode stage
+  };
+
+  RecStage rec_stage = RecStage::PREFILL;
+  bool is_hybrid_mode = false;
+  // Flag to distinguish encoder vs decoder forward calls
+  bool is_encoder_forward = false;
+  // For Rec decoder cross-attention
+  bool has_encoder_output = false;
+  // Length of encoder output sequence for each sequence
+  std::vector<int32_t> encoder_seq_lens;
+  // Pre-constructed tensor for encoder_seq_lens
+  torch::Tensor encoder_seq_lens_tensor;
+  // max encoder seq len
+  int32_t encoder_max_seq_len = 0;
+
+  // Additional parameters needed by rec_batch_input_builder
+  bool is_first_prefill = true;
+  int32_t bs = 0;  // batch size
+  int32_t group_width = 0;
+  int32_t seq_len = 0;
+  std::vector<std::vector<int32_t>> generated_tokens;
+  torch::Tensor encoder_sparse_embedding;
+  torch::Tensor decoder_context_embedding;
+
+  // Separate KV cache parameters for different attention types
+  // For Rec decoder: self_attn uses growing cache, cross_attn uses fixed cache
+  torch::Tensor cross_attn_kv_cu_seq_lens;   // KV lengths for cross-attention
+  torch::Tensor cross_attn_new_cache_slots;  // Cache slots for cross-attention
+  torch::Tensor cross_attn_block_tables;     // Block tables for cross-attention
+  std::vector<int> cross_attn_kv_cu_seq_lens_vec;
+
+  torch::Tensor encoder_token_ids;
+  // Rec encoder positions
+  torch::Tensor encoder_positions;
+
+  RecModelInputParams to(const c10::Device& device) const {
+    RecModelInputParams result = *this;
+    
+    // Move tensors to the specified device
+    if (encoder_seq_lens_tensor.defined()) {
+      result.encoder_seq_lens_tensor = encoder_seq_lens_tensor.to(device);
+    }
+    
+    if (encoder_sparse_embedding.defined()) {
+      result.encoder_sparse_embedding = encoder_sparse_embedding.to(device);
+    }
+    
+    if (decoder_context_embedding.defined()) {
+      result.decoder_context_embedding = decoder_context_embedding.to(device);
+    }
+    
+    if (cross_attn_kv_cu_seq_lens.defined()) {
+      result.cross_attn_kv_cu_seq_lens = cross_attn_kv_cu_seq_lens.to(device);
+    }
+    
+    if (cross_attn_new_cache_slots.defined()) {
+      result.cross_attn_new_cache_slots = cross_attn_new_cache_slots.to(device);
+    }
+    
+    if (cross_attn_block_tables.defined()) {
+      result.cross_attn_block_tables = cross_attn_block_tables.to(device);
+    }
+    
+    if (encoder_token_ids.defined()) {
+      result.encoder_token_ids = encoder_token_ids.to(device);
+    }
+    
+    if (encoder_positions.defined()) {
+      result.encoder_positions = encoder_positions.to(device);
+    }
+    
+    return result;
+  }
+
+  void print() const {
+    LOG(INFO) << "RecModelInputParams:"
+              << "  rec_stage: " << (rec_stage == RecStage::PREFILL ? "PREFILL" : "DECODE")
+              << "  is_hybrid_mode: " << is_hybrid_mode
+              << "  is_encoder_forward: " << is_encoder_forward
+              << "  has_encoder_output: " << has_encoder_output
+              << "  encoder_max_seq_len: " << encoder_max_seq_len
+              << "  is_first_prefill: " << is_first_prefill
+              << "  bs: " << bs
+              << "  group_width: " << group_width
+              << "  seq_len: " << seq_len
+              << "  encoder_seq_lens size: " << encoder_seq_lens.size()
+              << "  cross_attn_kv_cu_seq_lens_vec size: " << cross_attn_kv_cu_seq_lens_vec.size()
+              << "  generated_tokens size: " << generated_tokens.size();
+    
+    // Print tensor shapes if defined
+    if (encoder_seq_lens_tensor.defined()) {
+      LOG(INFO) << "  encoder_seq_lens_tensor shape: " << encoder_seq_lens_tensor.sizes();
+    }
+    if (encoder_sparse_embedding.defined()) {
+      LOG(INFO) << "  encoder_sparse_embedding shape: " << encoder_sparse_embedding.sizes();
+    }
+    if (decoder_context_embedding.defined()) {
+      LOG(INFO) << "  decoder_context_embedding shape: " << decoder_context_embedding.sizes();
+    }
+    if (cross_attn_kv_cu_seq_lens.defined()) {
+      LOG(INFO) << "  cross_attn_kv_cu_seq_lens shape: " << cross_attn_kv_cu_seq_lens.sizes();
+    }
+    if (cross_attn_new_cache_slots.defined()) {
+      LOG(INFO) << "  cross_attn_new_cache_slots shape: " << cross_attn_new_cache_slots.sizes();
+    }
+    if (cross_attn_block_tables.defined()) {
+      LOG(INFO) << "  cross_attn_block_tables shape: " << cross_attn_block_tables.sizes();
+    }
+    if (encoder_token_ids.defined()) {
+      LOG(INFO) << "  encoder_token_ids shape: " << encoder_token_ids.sizes();
+    }
+    if (encoder_positions.defined()) {
+      LOG(INFO) << "  encoder_positions shape: " << encoder_positions.sizes();
+    }
+  }
+
+};
+
 struct CacheBlockInfo {
   int32_t device_block_id = 0;
   int32_t host_block_id = 0;
@@ -209,107 +335,6 @@ struct ModelInputParams {
   bool is_rec_model() const { return rec_params.has_value(); }
 };
 
-// Rec model specific input parameters
-struct RecModelInputParams {
-  // Rec model specific parameters
 
-  enum class RecStage {
-    PREFILL,  // Prefill stage
-    DECODE    // Decode stage
-  };
-
-  // Add T5Stage as an alias for RecStage for compatibility
-  using T5Stage = RecStage;
-
-  RecStage rec_stage = RecStage::PREFILL;
-  bool is_hybrid_mode = false;
-  // Flag to distinguish encoder vs decoder forward calls
-  bool is_encoder_forward = false;
-  // For Rec decoder cross-attention
-  bool has_encoder_output = false;
-  // Length of encoder output sequence for each sequence
-  std::vector<int32_t> encoder_seq_lens;
-  // Pre-constructed tensor for encoder_seq_lens
-  torch::Tensor encoder_seq_lens_tensor;
-  // max encoder seq len
-  int32_t encoder_max_seq_len = 0;
-
-  // Separate KV cache parameters for different attention types
-  // For Rec decoder: self_attn uses growing cache, cross_attn uses fixed cache
-  torch::Tensor cross_attn_kv_cu_seq_lens;   // KV lengths for cross-attention
-  torch::Tensor cross_attn_new_cache_slots;  // Cache slots for cross-attention
-  torch::Tensor cross_attn_block_tables;     // Block tables for cross-attention
-  std::vector<int> cross_attn_kv_cu_seq_lens_vec;
-
-  torch::Tensor encoder_token_ids;
-  // Rec encoder positions
-  torch::Tensor encoder_positions;
-
-  // Rec sparse embedding
-  torch::Tensor encoder_sparse_embedding;
-  // generate rec: decoder embedding
-  torch::Tensor decoder_context_embedding;
-
-  // Flag removed; cache update now controlled externally
-  bool is_first_prefill = true;
-
-  // Rec model tokens
-  int64_t bs = 0;
-  int64_t group_width = 0;
-  int32_t seq_len = 0;
-
-  // generated tokens used for Rec sampler mask
-  std::vector<std::vector<int32_t>> generated_tokens;
-
-  RecModelInputParams to(const torch::Device& device) const {
-    RecModelInputParams params;
-
-    // Copy Rec specific parameters
-    params.rec_stage = rec_stage;
-    params.is_hybrid_mode = is_hybrid_mode;
-    params.is_encoder_forward = is_encoder_forward;
-    params.has_encoder_output = has_encoder_output;
-    params.encoder_seq_lens = encoder_seq_lens;
-    params.encoder_max_seq_len = encoder_max_seq_len;
-    params.bs = bs;
-    params.group_width = group_width;
-    params.is_first_prefill = is_first_prefill;
-
-    // all tensors should be on the same device
-    params.cross_attn_kv_cu_seq_lens =
-        safe_to(cross_attn_kv_cu_seq_lens, device, true);
-    params.cross_attn_new_cache_slots =
-        safe_to(cross_attn_new_cache_slots, device, true);
-    params.cross_attn_block_tables =
-        safe_to(cross_attn_block_tables, device, true);
-
-    params.encoder_token_ids = safe_to(encoder_token_ids, device, true);
-    params.encoder_positions = safe_to(encoder_positions, device, true);
-    params.encoder_sparse_embedding =
-        safe_to(encoder_sparse_embedding, device, true);
-    params.decoder_context_embedding =
-        safe_to(decoder_context_embedding, device, true);
-
-    params.encoder_seq_lens_tensor =
-        safe_to(encoder_seq_lens_tensor, device, true);
-
-    params.generated_tokens = generated_tokens;
-
-    return params;
-  }
-
-  void print() const {
-    LOG(INFO) << "RecModelInputParams: rec_stage is "
-              << static_cast<int>(rec_stage) << " , is_hybrid_mode is "
-              << is_hybrid_mode << " , has_encoder_output is "
-              << has_encoder_output;
-    LOG(INFO) << "RecModelInputParams: encoder_seq_lens is " << encoder_seq_lens
-              << ", encoder_max_seq_len is " << encoder_max_seq_len;
-    LOG(INFO) << "RecModelInputParams: is_first_prefill is "
-              << is_first_prefill;
-    LOG(INFO) << ", bs is " << bs << ", group_width is " << group_width
-              << ", seq_len is " << seq_len;
-  }
-};
 
 }  // namespace xllm
