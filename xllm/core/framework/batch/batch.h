@@ -111,7 +111,14 @@ class Batch {
 
   bool get_batch_prefill_status() const { return all_seqs_in_prefill_; }
 
+  void finish();
+
  private:
+  // prepare forward inputs for Rec model
+  ForwardInput prepare_rec_forward_input(uint32_t num_decoding_tokens,
+                                         uint32_t min_decoding_bach_size,
+                                         const ModelArgs& args);
+
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
 
   void append_token_for_sequence(Sequence* seq,
