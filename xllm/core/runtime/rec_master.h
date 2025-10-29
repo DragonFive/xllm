@@ -52,7 +52,7 @@ class RecMaster : public Master {
       RequestParams sp,
       OutputCallback callback);
 
-  std::unique_ptr<Scheduler> scheduler_;
+  std::unique_ptr<FixStepsScheduler> scheduler_;
   // model args
   ModelArgs model_args_;
   std::unique_ptr<ThreadPool> threadpool_;

@@ -120,13 +120,13 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
   if (FLAGS_backend == "llm") {
     CHECK(completion_service_impl_) << " completion service is invalid.";
     std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
-        ctrl, done_guard.release(), request, response);
+        ctrl, done_guard.release(), const_cast<proto::CompletionRequest*>(request), response);
     completion_service_impl_->process_async(call);
   } else if (FLAGS_backend == "rec") {
     CHECK(rec_completion_service_impl_)
         << " rec completion service is invalid.";
     std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
-        ctrl, done_guard.release(), request, response);
+        ctrl, done_guard.release(), const_cast<proto::CompletionRequest*>(request), response);
     rec_completion_service_impl_->process_async(call);
   }
 }

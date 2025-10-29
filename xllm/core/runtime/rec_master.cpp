@@ -108,7 +108,7 @@ void RecMaster::handle_request(std::string prompt,
                                RequestParams sp,
                                OutputCallback callback) {
   // add one pending request
-  scheduler_->inc_pending_requests(1);
+  scheduler_->incr_pending_requests(1);
   auto cb = [callback = std::move(callback),
              scheduler = scheduler_.get()](const RequestOutput& output) {
     output.log_request_status();
@@ -124,7 +124,7 @@ void RecMaster::handle_request(std::string prompt,
     AUTO_COUNTER(request_handling_latency_seconds_completion);
 
     // remove the pending request after scheduling
-    SCOPE_GUARD([this] { scheduler_->dec_pending_requests(); });
+    SCOPE_GUARD([this] { scheduler_->decr_pending_requests(); });
 
     Timer timer;
     // verify the prompt
@@ -167,9 +167,9 @@ std::shared_ptr<Request> RecMaster::generate_request(
         << "[Rec DEBUG] generate_request - received prompt_tokens.size(): "
         << local_prompt_tokens.size()
         << ", prompt.length(): " << prompt.length();
-  } else if (!mm_data.has_value()) {
+  } else if (mm_data.has_value()) {
     // sparse LLM
-    for (int i = 0; i < mm_data.value().size(); ++i) {
+    for (int i = 0; i < mm_data.value().data.size(); ++i) {
       // For Rec model, if prompt_tokens is not provided, we cannot proceed
       // since this model doesn't have a tokenizer
       LOG(ERROR) << "Rec model requires prompt_tokens/embedding to be provided";
@@ -258,8 +258,6 @@ std::shared_ptr<Request> RecMaster::generate_request(
                            sp.decode_address);
     req_state.is_rec_model = true;
     req_state.bos_token_id = model_args_.bos_token_id();
-    std::shared_ptr<Request> request;
-
     auto request = std::make_shared<Request>(sp.request_id,
                                              sp.x_request_id,
                                              sp.x_request_time,

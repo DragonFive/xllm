@@ -185,7 +185,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
 
 // Type alias for the return type of process_completion_request_params
 using ProcessCompletionResult = std::optional<
-    std::tuple<RequestParams, std::optional<std::vector<int>>, bool>>;
+    std::tuple<RequestParams, std::optional<std::vector<int>>, bool, std::string>>;
 // Common function to process request parameters and validation
 ProcessCompletionResult process_completion_request_params(
     std::shared_ptr<CompletionCall> call,
@@ -327,7 +327,7 @@ void RecCompletionServiceImpl::process_async_impl(
     for (int i = 0; i < rpc_request.input_tensors_size(); ++i) {
       const auto& tensor = rpc_request.input_tensors(i);
       mm_dict[tensor.name()] =
-          convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
+          xllm::util::convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
     }
     mm_data = std::move(MMData(MMType::EMBEDDING, mm_dict));
   }
