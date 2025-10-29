@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "models/model_registry.h"
 #include "util/env_var.h"
 
 namespace xllm {
@@ -284,7 +285,7 @@ std::future<torch::Tensor> RecWorkerImpl::prepare_filter_mask_async(
 
       // Copy to device using the dedicated H2D stream
       torch::Tensor device_mask =
-          cpu_mask.to(device_, /*non_blocking=*/true);
+          cpu_mask.to(device_.device(), /*non_blocking=*/true);
 
       // Synchronize the H2D stream to ensure copy is complete
       filter_mask_stream_->synchronize();

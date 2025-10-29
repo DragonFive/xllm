@@ -26,6 +26,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "util/pretty_print.h"
 #include "util/timer.h"
+#include "util/utils.h"
 #include "worker.h"
 
 namespace xllm {
@@ -103,7 +104,7 @@ bool RecEngine::init_model() {
   const int64_t n_kv_heads = args_.n_kv_heads().value_or(n_heads);
   n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size);
   head_dim_ = args_.head_dim();
-  dtype_ = xllm::util::parse_dtype(args_.dtype(), options_.devices()[0]);
+  dtype_ = parse_dtype(args_.dtype(), options_.devices()[0]);
 
   // key + value for all layers
   LOG(INFO) << "Block info, block_size: " << options_.block_size()
