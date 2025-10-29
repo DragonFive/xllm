@@ -65,9 +65,8 @@ RecMaster::RecMaster(const Options& options)
       .instance_role(options_.instance_role())
       .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
       .enable_service_routing(options_.enable_service_routing())
-      .enable_decode_response_to_service(enable_decode_response_to_service)
-      .schedule_rec(true);
-  scheduler_ = create_continuous_scheduler(engine_.get(), scheduler_options);
+      .enable_decode_response_to_service(enable_decode_response_to_service);
+  scheduler_ = create_fixsteps_scheduler(engine_.get(), scheduler_options);
 
   // OmniRec model does not have a tokenizer
   chat_template_ = nullptr;
@@ -107,7 +106,6 @@ void RecMaster::handle_request(std::string prompt,
                                std::optional<std::vector<int>> prompt_tokens,
                                std::optional<MMData> mm_data,
                                RequestParams sp,
-                               std::optional<Call*> call,
                                OutputCallback callback) {
   // add one pending request
   scheduler_->inc_pending_requests(1);
@@ -122,8 +120,7 @@ void RecMaster::handle_request(std::string prompt,
                          prompt_tokens = std::move(prompt_tokens),
                          mm_data = std::move(mm_data),
                          sp = std::move(sp),
-                         callback = std::move(cb),
-                         call = std::move(call)]() mutable {
+                         callback = std::move(cb)]() mutable {
     AUTO_COUNTER(request_handling_latency_seconds_completion);
 
     // remove the pending request after scheduling
@@ -139,7 +136,6 @@ void RecMaster::handle_request(std::string prompt,
                                     std::move(prompt_tokens),
                                     std::move(mm_data),
                                     sp,
-                                    call,
                                     callback);
     if (!request) {
       return;
@@ -156,8 +152,7 @@ std::shared_ptr<Request> RecMaster::generate_request(
     std::string prompt,
     std::optional<std::vector<int>> prompt_tokens,
     std::optional<MMData> mm_data,
-    const RequestParams& sp,
-    std::optional<Call*> call,
+    RequestParams sp,
     OutputCallback callback) {
   // For Rec model, prompt is expected to be empty and prompt_tokens should
   // contain the actual data Skip prompt empty check as mentioned in

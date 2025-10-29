@@ -153,7 +153,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
   if (FLAGS_backend == "rec") {
     auto output_tensor = response.mutable_output_tensors()->Add();
     output_tensor->set_name("omnirec_result");
-    if (FLAGS_enable_convert_tokens_to_item) {
+    if (true) {
       output_tensor->set_datatype(proto::DataType::INT64);
       output_tensor->mutable_shape()->Add(req_output.outputs.size());
       output_tensor->mutable_shape()->Add(1);  // Single item per output
@@ -189,7 +189,7 @@ using ProcessCompletionResult = std::optional<
 // Common function to process request parameters and validation
 ProcessCompletionResult process_completion_request_params(
     std::shared_ptr<CompletionCall> call,
-    const std::unordered_set<std::string>& models,
+    const absl::flat_hash_set<std::string>& models,
     xllm::RateLimiter* rate_limiter) {
   const auto& rpc_request = call->request();
 
@@ -320,20 +320,20 @@ void RecCompletionServiceImpl::process_async_impl(
   const auto& rpc_request = call->request();
   std::optional<MMData> mm_data = std::nullopt;
   if (rpc_request.input_tensors_size()) {
-    HISTOGRAM_OBSERVE(rec_input_first_dim,
-                      rpc_request.input_tensors(0).shape(0));
+    // HISTOGRAM_OBSERVE(rec_input_first_dim,
+    //                  rpc_request.input_tensors(0).shape(0));
 
     MMDict mm_dict;
     for (int i = 0; i < rpc_request.input_tensors_size(); ++i) {
       const auto& tensor = rpc_request.input_tensors(i);
       mm_dict[tensor.name()] =
-          xllm::utils::convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
+          convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
     }
     mm_data = std::move(MMData(MMType::EMBEDDING, mm_dict));
   }
-  if (rpc_request.beam_width() > 0) {
-    GAUGE_SET(rec_beam_search_width, rpc_request.beam_width());
-  }
+  // if (rpc_request.beam_width() > 0) {
+  //   GAUGE_SET(rec_beam_search_width, rpc_request.beam_width());
+  // }
 
   const auto& model = rpc_request.model();
   // schedule the request

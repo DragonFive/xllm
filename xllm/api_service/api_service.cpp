@@ -63,9 +63,8 @@ APIService::APIService(Master* master,
         std::make_unique<ImageGenerationServiceImpl>(
             dynamic_cast<DiTMaster*>(master), model_names);
   } else if (FLAGS_backend == "rec") {
-    rec_completion_service_impl_ =
-        ServiceImplFactory<RecCompletionServiceImpl>::create_service_impl(
-            dynamic_cast<RecMaster*>(master), model_names);
+    rec_completion_service_impl_ = std::make_unique<RecCompletionServiceImpl>(
+        dynamic_cast<RecMaster*>(master), model_names);
   }
   models_service_impl_ =
       ServiceImplFactory<ModelsServiceImpl>::create_service_impl(
@@ -126,7 +125,7 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
   } else if (FLAGS_backend == "rec") {
     CHECK(rec_completion_service_impl_)
         << " rec completion service is invalid.";
-    std::shared_ptr<Call> call = std::make_shared<RecCompletionCall>(
+    std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
         ctrl, done_guard.release(), request, response);
     rec_completion_service_impl_->process_async(call);
   }
@@ -155,7 +154,7 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
   } else if (FLAGS_backend == "rec") {
     CHECK(rec_completion_service_impl_)
         << " rec completion service is invalid.";
-    ProcessHttpRequestImpl<RecCompletionCall, RecCompletionServiceImpl>(
+    ProcessHttpRequestImpl<CompletionCall, RecCompletionServiceImpl>(
         rec_completion_service_impl_, done_guard, arena, ctrl);
   }
 }

@@ -143,7 +143,7 @@ void FixStepsScheduler::handle_prefill_requests(
   }
 
   if (running_sequences_.empty() && !waiting_priority_queue_.empty() &&
-      running_queue_.empty()) {
+      running_queue_->empty()) {
     LOG(ERROR)
         << "Request prompt is too long, no enough budget/memory to schedule "
            "a single sequence.";
@@ -151,10 +151,10 @@ void FixStepsScheduler::handle_prefill_requests(
     std::shared_ptr<Request> request(waiting_priority_queue_.top());
     waiting_priority_queue_.pop();
     // block_manager_->release_blocks_for(request.get());
-    engine_->get_response_handler()->on_request_finish_with_error(
+    response_processor_->process_failed_request(
         request,
         {StatusCode::RESOURCE_EXHAUSTED,
-         "No enough memory to schedule single sequence"});
+         "No enough budget to schedule single sequence."});
   }
 }
 
@@ -224,7 +224,7 @@ std::vector<Batch> FixStepsScheduler::prepare_batch() {
   auto batches = BatchFactory::get_instance(options_.dp_size())
                      ->create_rec_batches(
                          running_requests_,
-                         running_sequence_groups_,
+                         running_sequences_,
                          running_sequences_budgets_,
                          kv_cache_manager_->get_copy_in_cache_block_infos(),
                          kv_cache_manager_->get_copy_out_cache_block_infos(),
@@ -250,9 +250,9 @@ std::vector<Batch> FixStepsScheduler::prepare_batch() {
             kv_cache_manager_->kv_cache_utilization());
   if (!FLAGS_enable_continuous_kvcache) {
     GAUGE_SET(num_blocks_in_prefix_cache,
-              std::min(kv_cache_manager_->num_blocks_in_prefix_cache(), 0));
-    GAUGE_SET(num_free_blocks, std::max(kv_cache_manager_->num_free_blocks(), 0));
-    GAUGE_SET(num_used_blocks, std::min(kv_cache_manager_->num_used_blocks(), 0));
+              kv_cache_manager_->num_blocks_in_prefix_cache().size());
+    GAUGE_SET(num_free_blocks, kv_cache_manager_->num_free_blocks().size());
+    GAUGE_SET(num_used_blocks, kv_cache_manager_->num_used_blocks().size());
   }
   return batches;
 }
@@ -289,7 +289,7 @@ std::vector<Batch> FixStepsScheduler::schedule_request(
 void FixStepsScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
-    std::vector<Batch> batch = wait_for_batch(timeout);
+    std::vector<Batch> batch = schedule_request(timeout);
     bool all_empty =
         std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
           return one_batch.empty();

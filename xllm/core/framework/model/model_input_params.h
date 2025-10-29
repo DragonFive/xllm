@@ -57,7 +57,7 @@ struct RecModelInputParams {
   int32_t bs = 0;  // batch size
   int32_t group_width = 0;
   int32_t seq_len = 0;
-  std::vector<torch::Tensor> generated_tokens;
+  std::vector<std::vector<int32_t>> generated_tokens;
   torch::Tensor encoder_sparse_embedding;
   torch::Tensor decoder_context_embedding;
 
