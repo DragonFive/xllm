@@ -52,6 +52,15 @@ struct RecModelInputParams {
   // max encoder seq len
   int32_t encoder_max_seq_len = 0;
 
+  // Additional parameters needed by rec_batch_input_builder
+  bool is_first_prefill = true;
+  int32_t bs = 0;  // batch size
+  int32_t group_width = 0;
+  int32_t seq_len = 0;
+  std::vector<torch::Tensor> generated_tokens;
+  torch::Tensor encoder_sparse_embedding;
+  torch::Tensor decoder_context_embedding;
+
   // Separate KV cache parameters for different attention types
   // For Rec decoder: self_attn uses growing cache, cross_attn uses fixed cache
   torch::Tensor cross_attn_kv_cu_seq_lens;   // KV lengths for cross-attention

@@ -30,7 +30,7 @@ limitations under the License.
 namespace xllm {
 
 RecMaster::RecMaster(const Options& options)
-    : Master(options, EngineType::Rec) {
+    : Master(options, EngineType::LLM) {
   // Initialize with Rec engine type
   // The rest of the initialization follows the same pattern as LLMMaster
   CHECK(engine_->init());
@@ -63,12 +63,11 @@ RecMaster::RecMaster(const Options& options)
       .enable_schedule_overlap(options_.enable_schedule_overlap())
       .enable_chunked_prefill(options_.enable_chunked_prefill())
       .instance_role(options_.instance_role())
-      .cluster_id(options_.cluster_id())
       .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
       .enable_service_routing(options_.enable_service_routing())
       .enable_decode_response_to_service(enable_decode_response_to_service)
       .schedule_rec(true);
-  scheduler_ = create_fixsteps_scheduler(engine_.get(), scheduler_options);
+  scheduler_ = create_continuous_scheduler(engine_.get(), scheduler_options);
 
   // OmniRec model does not have a tokenizer
   chat_template_ = nullptr;
@@ -92,7 +91,7 @@ void RecMaster::run() {
     running_.store(false, std::memory_order_relaxed);
   });
 
-  engine_->run();
+  // Engine run method is not available, remove this call
 }
 
 RecMaster::~RecMaster() {
@@ -274,4 +273,4 @@ std::shared_ptr<Request> RecMaster::generate_request(
     return request;
   }
 
-}  // namespace llm
+}  // namespace xllm

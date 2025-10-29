@@ -156,13 +156,13 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
     if (FLAGS_enable_convert_tokens_to_item) {
       output_tensor->set_datatype(proto::DataType::INT64);
       output_tensor->mutable_shape()->Add(req_output.outputs.size());
-      output_tensor->mutable_shape()->Add(req_output.outputs[0].item_ids.size());
+      output_tensor->mutable_shape()->Add(1);  // Single item per output
 
       auto context = output_tensor->mutable_contents();
       for (int i = 0; i < req_output.outputs.size(); ++i) {
-        context->mutable_int64_contents()->Add(
-            req_output.outputs[i].item_ids.value().begin(),
-            req_output.outputs[i].item_ids.value().end());
+        if (req_output.outputs[i].item_ids.has_value()) {
+          context->mutable_int64_contents()->Add(req_output.outputs[i].item_ids.value());
+        }
       }
     } else {
       output_tensor->set_datatype(proto::DataType::INT32);
@@ -284,10 +284,10 @@ void CompletionServiceImpl::process_async_impl(
     return;  // Error already handled in process_completion_request_params
   }
 
-  auto [request_params, prompt_tokens, include_usage] =
+  auto [request_params, prompt_tokens, include_usage, model] =
       std::move(result.value());
   // schedule the request
-  master_->handle_request(std::move(rpc_request.prompt()),
+  master_->handle_request(std::move(call->request().prompt()),
                           std::move(prompt_tokens),
                           std::move(request_params),
                           call.get(),
@@ -327,7 +327,7 @@ void RecCompletionServiceImpl::process_async_impl(
     for (int i = 0; i < rpc_request.input_tensors_size(); ++i) {
       const auto& tensor = rpc_request.input_tensors(i);
       mm_dict[tensor.name()] =
-          utils::convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
+          xllm::utils::convert_rec_tensor_to_torch(tensor).to(torch::kBFloat16);
     }
     mm_data = std::move(MMData(MMType::EMBEDDING, mm_dict));
   }

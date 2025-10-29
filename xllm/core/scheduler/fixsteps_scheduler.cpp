@@ -42,7 +42,7 @@ FixStepsScheduler::FixStepsScheduler(Engine* engine, const Options& options)
 
 bool FixStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
-  CHECK(!request->sequences.empty());
+  CHECK(!request->sequences().empty());
 
   if (request_queue_.write(request)) {  //.get()
     // take over the ownership of the request
@@ -83,8 +83,8 @@ void FixStepsScheduler::handle_prefill_requests(
       continue;
     }
 
-    const size_t num_sequences = request->sequences.size();
-    if (!request->is_preempted()) {
+    const size_t num_sequences = request->sequences().size();
+    if (!request->preempted()) {
       CHECK(num_sequences == 1)
           << "Waiting request should have only one sequence.";
     }
@@ -97,8 +97,8 @@ void FixStepsScheduler::handle_prefill_requests(
     bool can_schedule = true;
     std::vector<Sequence*> prefill_sequences;
     std::vector<size_t> prefill_sequences_budget;
-    prefill_sequences.reserve(request->sequences.size());
-    prefill_sequences_budget.reserve(request->sequences.size());
+    prefill_sequences.reserve(request->sequences().size());
+    prefill_sequences_budget.reserve(request->sequences().size());
     for (auto& prefill_sequence : request->sequences()) {
       if (prefill_sequence->finished()) {
         continue;
@@ -143,7 +143,7 @@ void FixStepsScheduler::handle_prefill_requests(
   }
 
   if (running_sequences_.empty() && !waiting_priority_queue_.empty() &&
-      running_queue_.empty()) {
+      running_queue_->empty()) {
     LOG(ERROR)
         << "Request prompt is too long, no enough budget/memory to schedule "
            "a single sequence.";
@@ -151,7 +151,7 @@ void FixStepsScheduler::handle_prefill_requests(
     std::shared_ptr<Request> request(waiting_priority_queue_.top());
     waiting_priority_queue_.pop();
     // block_manager_->release_blocks_for(request.get());
-    response_handler_->on_request_finish_with_error(
+    engine_->get_response_handler()->on_request_finish_with_error(
         request,
         {StatusCode::RESOURCE_EXHAUSTED,
          "No enough memory to schedule single sequence"});
@@ -240,19 +240,19 @@ std::vector<Batch> FixStepsScheduler::prepare_batch() {
             pending_requests_.load(std::memory_order_relaxed));
   GAUGE_SET(num_running_requests, running_requests_.size());
   GAUGE_SET(num_waiting_requests,
-            waiting_priority_queue_.size() + running_queue_.size());
+            waiting_priority_queue_.size() + running_queue_->size());
 
   GAUGE_ADD(num_preempted_requests, num_preempted_requests);
 
-  GAUGE_SET(num_running_sequences, running_sequence_groups_.size());
+  GAUGE_SET(num_running_sequences, running_sequences_.size());
 
   GAUGE_SET(kv_cache_utilization_perc,
             kv_cache_manager_->kv_cache_utilization());
   if (!FLAGS_enable_continuous_kvcache) {
     GAUGE_SET(num_blocks_in_prefix_cache,
-              util::min(kv_cache_manager_->num_blocks_in_prefix_cache()));
-    GAUGE_SET(num_free_blocks, util::max(kv_cache_manager_->num_free_blocks()));
-    GAUGE_SET(num_used_blocks, util::min(kv_cache_manager_->num_used_blocks()));
+              std::min(kv_cache_manager_->num_blocks_in_prefix_cache(), 0));
+    GAUGE_SET(num_free_blocks, std::max(kv_cache_manager_->num_free_blocks(), 0));
+    GAUGE_SET(num_used_blocks, std::min(kv_cache_manager_->num_used_blocks(), 0));
   }
   return batches;
 }
@@ -286,7 +286,7 @@ std::vector<Batch> FixStepsScheduler::schedule_request(
 
 // step the scheduler forward by one step
 // may get blocked if there are no requests to process
-void RecContinuousScheduler::step(const absl::Duration& timeout) {
+void FixStepsScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
     std::vector<Batch> batch = wait_for_batch(timeout);
@@ -300,7 +300,7 @@ void RecContinuousScheduler::step(const absl::Duration& timeout) {
     engine_->step(batch);
     kv_cache_manager_->reset_copy_content();
   } else {
-    LOG(ERROR) << "RecContinuousScheduler::step() not supported with "
+    LOG(ERROR) << "FixStepsScheduler::step() not supported with "
                   "enable_schedule_overlap";
   }
 }

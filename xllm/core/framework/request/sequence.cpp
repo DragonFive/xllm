@@ -99,7 +99,7 @@ Sequence::Sequence(size_t index,
     logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
-    capacity = sequence_params_.seq_capacity;
+    auto capacity = sequence_params_.seq_capacity;
     CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
     num_prompt_tokens_ = prompt_token_ids.size();
     tokens_.resize(capacity);
