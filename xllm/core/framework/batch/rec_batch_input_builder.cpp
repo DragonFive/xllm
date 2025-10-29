@@ -248,7 +248,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
         for (size_t i = start_idx;
              i < end_idx && i < static_cast<size_t>(num_sequences);
              ++i) {
-          Sequence* sequence = nullptr;
+          const Sequence* sequence = nullptr;
           // Get sequence from sequence_groups
           size_t seq_idx = 0;
           for (const auto& group : sequence_groups_) {

@@ -96,6 +96,7 @@ Sequence::Sequence(size_t index,
     input_embedding_ = input_embedding;
     cur_generated_token_idx_ = num_prompt_tokens_;
     // init logprob state
+    auto capacity = sequence_params_.seq_capacity;
     logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";

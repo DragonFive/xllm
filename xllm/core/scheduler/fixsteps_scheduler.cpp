@@ -143,7 +143,7 @@ void FixStepsScheduler::handle_prefill_requests(
   }
 
   if (running_sequences_.empty() && !waiting_priority_queue_.empty() &&
-      running_queue_->empty()) {
+      running_queue_.empty()) {
     LOG(ERROR)
         << "Request prompt is too long, no enough budget/memory to schedule "
            "a single sequence.";
