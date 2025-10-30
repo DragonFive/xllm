@@ -52,7 +52,6 @@ cc_library(
     proto::xllm_proto
     :platform
     SMHasherSupport
-    :common
 )
 target_link_libraries(util PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 add_dependencies(util brpc-static)
