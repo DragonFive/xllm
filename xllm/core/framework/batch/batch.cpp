@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "batch.h"
-
 #include <c10/core/DeviceType.h>
 #include <torch/torch.h>
 
 #include <vector>
 
+#include "batch.h"
 #include "batch_input_builder.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -29,6 +28,7 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
 #include "framework/sampling/sampling_params.h"
+#include "rec_batch_input_builder.h"
 #include "runtime/params_utils.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"
@@ -68,7 +68,12 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
 
 ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size,
-                                          const ModelArgs& args) {
+                                          const ModelArgs& args,
+                                          ThreadPool* thread_pool) {
+  if (FLAGS_backend == "rec") {
+    return prepare_rec_forward_input(
+        num_decoding_tokens, min_decoding_batch_size, args, thread_pool);
+  }
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
                             input_embeddings_vec_,
@@ -78,6 +83,57 @@ ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                             &args);
   return builder.build_forward_input(num_decoding_tokens,
                                      min_decoding_batch_size);
+}
+
+ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
+                                              uint32_t min_decoding_batch_size,
+                                              const ModelArgs& args,
+                                              ThreadPool* thread_pool) {
+  // Convert SequencesGroup* to std::unique_ptr<SequencesGroup> for
+  // compatibility
+  std::vector<std::unique_ptr<SequencesGroup>> sequence_groups_ptrs;
+  for (auto* group : sequence_groups_) {
+    // Note: This is a temporary workaround. In production, we should avoid this
+    // conversion and modify the interface to work with raw pointers directly.
+    sequence_groups_ptrs.emplace_back(std::unique_ptr<SequencesGroup>(group));
+  }
+
+  RecBatchInputBuilder builder(
+      sequence_groups_ptrs,
+      allowed_max_tokens_,
+      input_embeddings_vec_,
+      mm_data_vec_,
+      swap_block_transfer_infos_,
+      batch_id_,
+      &args,
+      thread_pool);  // Temporarily not using thread pool
+
+  auto result = builder.build_rec_forward_input(num_decoding_tokens,
+                                                min_decoding_batch_size);
+
+  // Release the unique_ptrs without deleting the objects
+  for (auto& ptr : sequence_groups_ptrs) {
+    ptr.release();
+  }
+
+  return result;
+}
+
+std::vector<Sequence*> Batch::get_sequences() const {
+  // If sequences_ is not empty, return it directly
+  if (!sequences_.empty()) {
+    return sequences_;
+  }
+
+  // Otherwise, extract sequences from sequence_groups_
+  std::vector<Sequence*> result;
+  for (const auto* seq_group : sequence_groups_) {
+    const auto& sequences = seq_group->sequences();
+    for (const auto& seq_ptr : sequences) {
+      result.push_back(seq_ptr.get());
+    }
+  }
+  return result;
 }
 
 RawForwardInput Batch::prepare_forward_input(uint32_t start_idx,
@@ -148,7 +204,8 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   if (sample_output.embeddings.defined()) {
     const int64_t num_seqs = sample_output.embeddings.size(0);
     int64_t output_idx = 0;
-    for (auto* seq : sequences_) {
+    const auto& sequences = get_sequences();
+    for (auto* seq : sequences) {
       CHECK_LT(output_idx, num_seqs);
       auto cur_seq_embed =
           safe_to(sample_output.embeddings[output_idx++], torch::kFloat32);
@@ -161,7 +218,8 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   // this means all sequences are in prefill stage status.
   const int64_t num_seqs = sample_output.next_tokens.size(0);
   int64_t output_idx = 0;
-  for (auto* seq : sequences_) {
+  const auto& sequences = get_sequences();
+  for (auto* seq : sequences) {
     if (seq->finished()) {
       output_idx++;
       continue;
@@ -335,6 +393,13 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
        sequence_group_id < sequence_groups_.size();
        sequence_group_id++) {
     update_for_sequence_group(sequence_group_id);
+  }
+}
+
+void Batch::finish() {
+  // Finish all sequence groups
+  for (auto* sequence_group : sequence_groups_) {
+    sequence_group->finish();
   }
 }
 }  // namespace xllm

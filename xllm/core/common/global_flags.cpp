@@ -13,11 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "global_flags.h"
-
 #include <limits>
 
 #include "brpc/reloadable_flags.h"
+#include "global_flags.h"
 
 // NOTE: related flags should be placed together.
 
@@ -417,6 +416,7 @@ DEFINE_bool(
     "Whether to enable prefetch weight,only applicable to Qwen3-dense model."
     "The default prefetching ratio for gateup weight is 40%."
     "If adjustments are needed, e.g. export PREFETCH_COEFFOCIENT=0.5");
+
 // rec prefill-only mode
 DEFINE_bool(enable_rec_prefill_only,
             false,
