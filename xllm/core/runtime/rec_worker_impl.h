@@ -39,6 +39,9 @@ class RecWorkerImpl : public WorkerImpl {
 
   // Override init_model for Rec specific implementation
   bool init_model(const std::string& model_weights_path) override;
+  
+  // Override init_model with ModelContext for Rec specific implementation
+  bool init_model(ModelContext& context) override;
 
   // Override step for Rec specific implementation
   std::optional<ForwardOutput> step(

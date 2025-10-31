@@ -28,6 +28,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "models/model_registry.h"
 #include "util/env_var.h"
+#include "util/utils.h"
 
 namespace xllm {
 
@@ -74,6 +75,24 @@ bool RecWorkerImpl::init_model(const std::string& model_weights_path) {
   valid_path_filter_ = std::make_unique<ValidPathFilter>(
       filter_bin_path.value(), args.vocab_size(), dtype_, device_);
 
+  return true;
+}
+
+bool RecWorkerImpl::init_model(ModelContext& context) {
+  CHECK(model_ == nullptr) << "Model is already initialized.";
+  device_.set_device();
+
+  // Try to create a causal LM model (Rec models are typically based on CausalLM)
+  model_ = create_llm_model(context);
+
+  // Check if model creation was successful
+  CHECK(model_ != nullptr) << "Failed to create Rec model.";
+  model_executor_ = std::make_unique<Executor>(
+      model_.get(), context.get_model_args(), device_, options_);
+
+  if (FLAGS_enable_beam_search_kernel) {
+    beam_searcher_ = std::make_unique<BeamSearcher>();
+  }
   return true;
 }
 
