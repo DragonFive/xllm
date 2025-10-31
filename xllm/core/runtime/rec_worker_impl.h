@@ -38,7 +38,7 @@ class RecWorkerImpl : public WorkerImpl {
                 const runtime::Options& options);
 
   // Override init_model for Rec specific implementation
-  bool init_model(ModelContext& context) override;
+  bool init_model(const std::string& model_weights_path) override;
 
   // Override step for Rec specific implementation
   std::optional<ForwardOutput> step(
@@ -56,9 +56,6 @@ class RecWorkerImpl : public WorkerImpl {
   // Async filter mask preparation with overlap
   std::future<torch::Tensor> prepare_filter_mask_async(
       const std::vector<std::vector<int32_t>>& generated_tokens);
-
-  // Flag to control beam search usage
-  bool use_beam_search_ = true;
 
   // Stream for H2D memory copy operations
   std::unique_ptr<Stream> filter_mask_stream_;

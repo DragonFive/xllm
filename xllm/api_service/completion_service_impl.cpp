@@ -153,6 +153,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
   if (FLAGS_backend == "rec") {
     auto output_tensor = response.mutable_output_tensors()->Add();
     output_tensor->set_name("omnirec_result");
+    // TODO: replace true with flags after converter merge
     if (true) {
       output_tensor->set_datatype(proto::DataType::INT64);
       output_tensor->mutable_shape()->Add(req_output.outputs.size());
@@ -331,9 +332,6 @@ void RecCompletionServiceImpl::process_async_impl(
     }
     mm_data = std::move(MMData(MMType::EMBEDDING, mm_dict));
   }
-  // if (rpc_request.beam_width() > 0) {
-  //   GAUGE_SET(rec_beam_search_width, rpc_request.beam_width());
-  // }
 
   // schedule the request
   master_->handle_request(std::move(rpc_request.prompt()),

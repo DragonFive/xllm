@@ -21,6 +21,10 @@ limitations under the License.
 #include <exception>
 #include <utility>
 
+#include "butil/file_util.h"
+#include "butil/files/dir_reader_linux.h"
+#include "butil/files/file_path.h"
+#include "butil/strings/string_util.h"
 #include "common/metrics.h"
 #include "models/model_registry.h"
 #include "util/env_var.h"
@@ -39,17 +43,36 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
   thread_pool_ = std::make_shared<ThreadPool>(thread_num);
 }
 
-bool RecWorkerImpl::init_model(ModelContext& context) {
-  CHECK(model_ == nullptr) << "Model is already initialized.";
-  device_.set_device();
+bool RecWorkerImpl::init_model(const std::string& model_weights_path) {
+  auto model_loader = ModelLoader::create(model_weights_path);
 
-  // Try to create a rec model (using llm model factory)
-  model_ = create_llm_model(context);
+  auto args = model_loader->model_args();
+  auto quant_args = model_loader->quant_args();
+  torch::ScalarType dtype = util::parse_dtype(args.dtype(), device_);
 
-  // Don't find model in rec models
-  CHECK(model_ != nullptr) << "Failed to create rec model.";
-  model_executor_ = std::make_unique<Executor>(
-      model_.get(), context.get_model_args(), device_, options_);
+  if (options_.enable_speculative_decode() && FLAGS_enable_atb_spec_kernel) {
+    args.num_speculative_tokens(options_.num_speculative_tokens());
+  }
+
+  // create model context
+  dtype_ = dtype;
+  auto tensor_options = torch::dtype(dtype_).device(device_);
+  context_ = ModelContext(parallel_args_, args, quant_args, tensor_options);
+
+  // init model, create model executor
+  bool status = this->init_model(context_);
+  if (!status) {
+    return false;
+  }
+
+  this->load_model(std::move(model_loader));
+
+  status_ = Status::LOADED;
+  // TODO: replace path with flags after filter merge
+  butil::FilePath filter_bin_path =
+      butil::FilePath(model_weights_path).Append("replace me when merge");
+  valid_path_filter_ = std::make_unique<ValidPathFilter>(
+      filter_bin_path.value(), args.vocab_size(), dtype_, device_);
 
   return true;
 }
@@ -78,7 +101,8 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
   // Start async filter mask preparation early for overlap (if beam search is
   // enabled)
   std::future<torch::Tensor> filter_mask_future;
-  if (use_beam_search_ && !input_params_micro_batches.empty() &&
+
+  if (!input_params_micro_batches.empty() &&
       input_params_micro_batches[0].is_rec_model() &&
       input_params_micro_batches[0].rec_params.has_value()) {
     auto& rec_params = input_params_micro_batches[0].rec_params.value();
@@ -193,7 +217,7 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
         logits.index_select(/*dim=*/0, concated_sampling_params.sample_idxes);
 
     // Apply filter mask if available
-    if (use_beam_search_ && filter_mask.defined()) {
+    if (filter_mask.defined()) {
       // Ensure filter_mask has the same batch size as sample_logits
       if (filter_mask.size(0) == sample_logits.size(0)) {
         sample_logits = sample_logits + filter_mask;
