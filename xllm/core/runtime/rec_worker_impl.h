@@ -68,6 +68,9 @@ class RecWorkerImpl : public WorkerImpl {
 
   // ValidPathFilter for beam search filtering
   std::unique_ptr<ValidPathFilter> valid_path_filter_;
+
+  // BeamSearcher for beam search functionality
+  std::unique_ptr<BeamSearcher> beam_searcher_;
 };
 
 }  // namespace xllm
