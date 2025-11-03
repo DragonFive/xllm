@@ -401,3 +401,9 @@ DEFINE_bool(enable_rec_prefill_only,
             false,
             "Enable rec prefill-only mode (no decoder self-attention blocks "
             "allocation)");
+
+DEFINE_bool(enable_constrained_decoding,
+            false,
+            "Whether to enable constrained decoding, which is used to ensure "
+            "that the output meets specific format or structural requirements "
+            "through pre-defined rules.");
