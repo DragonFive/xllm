@@ -25,7 +25,10 @@ limitations under the License.
 #include <filesystem>
 #include <vector>
 
+#include "core/common/version_singleton.h"
+#include "core/framework/state_dict/rec_vocab_dict.h"
 #include "core/framework/tokenizer/fast_tokenizer.h"
+#include "core/framework/tokenizer/rec_tokenizer.h"
 #include "core/framework/tokenizer/sentencepiece_tokenizer.h"
 #include "core/framework/tokenizer/tiktoken_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer_factory.h"
@@ -50,6 +53,12 @@ HFModelLoader::HFModelLoader(const std::string& model_weights_path)
       << "Failed to find model weights files in " << model_weights_path;
   // sort the model weights files by name
   std::sort(model_weights_files_.begin(), model_weights_files_.end());
+
+  //@todo: 'false' will be replaced with generative recommendation judgment
+  if (false) {
+    CHECK(load_rec_vocab(model_weights_path))
+        << "Failed to load rec content from " << model_weights_path;
+  }
 }
 
 std::unique_ptr<Tokenizer> HFModelLoader::tokenizer() const {

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 /* Copyright 2025 The xLLM Authors. All Rights Reserved.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
@@ -14,12 +15,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+=======
+>>>>>>> 5c97614 (feat: add generative recommendation tokenizer.)
 #pragma once
 
 #include <list>
 #include <memory>
 #include <mutex>
+<<<<<<< HEAD
 #include <shared_mutex>
+=======
+>>>>>>> 5c97614 (feat: add generative recommendation tokenizer.)
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -38,7 +44,11 @@ class VersionSingleton {
     T* instance = nullptr;
 
     {
+<<<<<<< HEAD
       std::shared_lock<std::shared_mutex> lock(instance_map_mutex_);
+=======
+      std::lock_guard<std::mutex> lock(instance_map_mutex_);
+>>>>>>> 5c97614 (feat: add generative recommendation tokenizer.)
       auto it = instance_map_.find(version);
       if (it != instance_map_.end()) {
         instance = it->second.get();
@@ -46,7 +56,11 @@ class VersionSingleton {
     }
 
     if (instance == nullptr) {
+<<<<<<< HEAD
       std::unique_lock<std::shared_mutex> lock(instance_map_mutex_);
+=======
+      std::lock_guard<std::mutex> lock(instance_map_mutex_);
+>>>>>>> 5c97614 (feat: add generative recommendation tokenizer.)
 
       auto it = instance_map_.find(version);
       if (it == instance_map_.end()) {

@@ -208,3 +208,11 @@ DECLARE_int64(max_token_per_req);
 DECLARE_bool(enable_beam_search_kernel);
 
 DECLARE_bool(enable_rec_prefill_only);
+
+DECLARE_bool(enable_qwen3_reranker);
+
+DECLARE_string(reasoning_parser);
+
+DECLARE_bool(enable_shm);
+
+DECLARE_bool(enable_constrained_decoding);
