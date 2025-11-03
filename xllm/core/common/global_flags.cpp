@@ -386,3 +386,18 @@ DEFINE_int64(buffer_size_per_seq,
 DEFINE_bool(enable_beam_search_kernel,
             false,
             "Whether to enable beam search kernel.");
+
+// --- reasoning parser config ---
+DEFINE_string(reasoning_parser,
+              "",
+              "Specify the reasoning parser for handling reasoning "
+              "interactions(e.g. glm45, qwen3, deepseek-r1).");
+
+// --- qwen3 reranker config ---
+DEFINE_bool(enable_qwen3_reranker, false, "Whether to enable qwen3 reranker.");
+
+// rec prefill-only mode
+DEFINE_bool(enable_rec_prefill_only,
+            false,
+            "Enable rec prefill-only mode (no decoder self-attention blocks "
+            "allocation)");
