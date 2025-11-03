@@ -206,3 +206,5 @@ DECLARE_bool(enable_shm);
 DECLARE_bool(enable_prefetch_weight);
 
 DECLARE_bool(enable_rec_prefill_only);
+
+DECLARE_bool(enable_constrained_decoding);
