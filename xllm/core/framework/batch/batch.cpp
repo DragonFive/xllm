@@ -224,8 +224,11 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   for (auto* seq : sequences) {
     if (seq->finished()) {
       output_idx++;
+      LOG(INFO) << "[debug1104] seq finished :" << seq->num_generated_tokens();
       continue;
     }
+    LOG(INFO) << "[debug1104] seq not finished :"
+              << seq->num_generated_tokens();
     if (update_sequence_state(seq, replace_fake_token)) {
       continue;
     }

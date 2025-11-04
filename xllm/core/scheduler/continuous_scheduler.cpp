@@ -48,8 +48,9 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       waiting_priority_queue_(create_comparator(options.priority_strategy())),
       waiting_priority_queue_offline_(
           create_comparator(options.priority_strategy())) {
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 1";
   CHECK(engine_ != nullptr);
-
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 1.1";
   if (!FLAGS_enable_continuous_kvcache) {
     kv_cache_manager_ = engine_->block_manager_pool();
   } else {
@@ -60,7 +61,7 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   enable_prefix_cache_ = FLAGS_enable_prefix_cache;
 
   last_batch_.resize(options_.dp_size());
-
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 1.2";
   ProfileManager::Options profile_manager_options;
   profile_manager_options.dp_size(options.dp_size())
       .enable_schedule_overlap(options.enable_schedule_overlap())
@@ -73,7 +74,7 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       .enable_profile_token_budget(options.enable_profile_token_budget());
   profile_manager_ =
       std::make_unique<ProfileManager>(engine, profile_manager_options);
-
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 1.3";
   response_processor_ = std::make_unique<AsyncResponseProcessor>(
       engine_->tokenizer(),
       options_.instance_role(),
@@ -83,10 +84,11 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   if (options_.enable_service_routing()) {
     XServiceClient::get_instance()->set_scheduler(this);
   }
-
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 1.4";
   instance_info_.name = options_.instance_name().value_or("");
   instance_info_.type = options_.instance_role().value().to_string();
   instance_info_.dp_size = options.dp_size();
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 1.5";
 }
 
 ContinuousScheduler::~ContinuousScheduler() { running_requests_.clear(); }
@@ -105,6 +107,7 @@ bool ContinuousScheduler::add_request(std::shared_ptr<Request>& request) {
 }
 
 void ContinuousScheduler::create_running_queue(const Options& options) {
+  LOG(INFO) << "[debug1104] begin ContinuousScheduler create_running_queue";
   if (options.priority_strategy() == "FCFS") {
     running_queue_offline_ = std::make_unique<FCFSQueue>();
     running_queue_ = std::make_unique<FCFSQueue>();
@@ -122,6 +125,7 @@ void ContinuousScheduler::create_running_queue(const Options& options) {
     running_queue_offline_ =
         std::make_unique<DynamicPriorityQueue>(std::move(comparator));
   }
+  LOG(INFO) << "[debug1104] after ContinuousScheduler create_running_queue";
 }
 
 bool ContinuousScheduler::check_if_enough_to_evict(

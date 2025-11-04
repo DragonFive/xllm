@@ -35,6 +35,7 @@ RecMaster::RecMaster(const Options& options)
   // Initialize with Rec engine type
   // The rest of the initialization follows the same pattern as LLMMaster
   CHECK(engine_->init());
+  LOG(INFO) << "[debug1104] end init engine";
 
   model_args_ = engine_->model_args();
 
@@ -67,7 +68,9 @@ RecMaster::RecMaster(const Options& options)
       .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
       .enable_service_routing(options_.enable_service_routing())
       .enable_decode_response_to_service(enable_decode_response_to_service);
+  LOG(INFO) << "[debug1104] create fixsteps scheduler";
   scheduler_ = create_fixsteps_scheduler(engine_.get(), scheduler_options);
+  LOG(INFO) << "[debug1104] end create fixsteps scheduler";
 
   // OmniRec model does not have a tokenizer
   chat_template_ = nullptr;
@@ -132,16 +135,17 @@ void RecMaster::handle_request(std::string prompt,
     if (!sp.verify_params(callback)) {
       return;
     }
-
+    LOG(INFO) << "[debug1104] after generate_request 0";
     auto request = generate_request(std::move(prompt),
                                     std::move(prompt_tokens),
                                     std::move(mm_data),
                                     sp,
                                     callback);
+    LOG(INFO) << "[debug1104] after generate_request 1";
     if (!request) {
       return;
     }
-
+    LOG(INFO) << "[debug1104] after generate_request 2";
     if (!scheduler_->add_request(request)) {
       CALLBACK_WITH_ERROR(StatusCode::RESOURCE_EXHAUSTED,
                           "No available resources to schedule request");
@@ -158,7 +162,7 @@ std::shared_ptr<Request> RecMaster::generate_request(
   // For Rec model, prompt is expected to be empty and prompt_tokens should
   // contain the actual data Skip prompt empty check as mentioned in
   // requirements
-
+  LOG(INFO) << "[debug1104] RecMaster::generate_request 0";
   Timer timer;
   std::vector<int> local_prompt_tokens;
 
@@ -189,7 +193,7 @@ std::shared_ptr<Request> RecMaster::generate_request(
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, "Prompt is too long");
     return nullptr;
   }
-
+  LOG(INFO) << "[debug1104] RecMaster::generate_request 1";
   uint32_t max_tokens = sp.max_tokens;
   if (max_tokens == 0) {
     const uint32_t kDefaultMaxTokens = 5120;
@@ -256,11 +260,13 @@ std::shared_ptr<Request> RecMaster::generate_request(
                          sp.decode_address);
   req_state.is_rec_model = true;
   req_state.bos_token_id = model_args_.bos_token_id();
+  LOG(INFO) << "[debug1104] RecMaster::generate_request 2";
   auto request = std::make_shared<Request>(sp.request_id,
                                            sp.x_request_id,
                                            sp.x_request_time,
                                            std::move(req_state),
                                            sp.service_request_id);
+  LOG(INFO) << "[debug1104] RecMaster::generate_request 3";
   return request;
 }
 

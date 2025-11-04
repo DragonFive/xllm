@@ -55,6 +55,7 @@ std::unique_ptr<ContinuousScheduler> create_continuous_scheduler(
 std::unique_ptr<FixStepsScheduler> create_fixsteps_scheduler(
     Engine* engine,
     ContinuousScheduler::Options options) {
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler";
   return std::make_unique<FixStepsScheduler>(engine, options);
 }
 

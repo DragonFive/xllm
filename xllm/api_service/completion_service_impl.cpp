@@ -318,12 +318,13 @@ RecCompletionServiceImpl::RecCompletionServiceImpl(
 
 void RecCompletionServiceImpl::process_async_impl(
     std::shared_ptr<CompletionCall> call) {
+  LOG(INFO) << "[debug1104] RecCompletionServiceImpl::process_async_impl 0";
   auto result = process_completion_request_params(
       call, models_, master_->get_rate_limiter());
   if (!result.has_value()) {
     return;  // Error already handled in process_completion_request_params
   }
-
+  LOG(INFO) << "[debug1104] RecCompletionServiceImpl::process_async_impl 1";
   auto [request_params, prompt_tokens, include_usage, model] =
       std::move(result.value());
   const auto& rpc_request = call->request();
@@ -341,6 +342,7 @@ void RecCompletionServiceImpl::process_async_impl(
     mm_data = std::move(MMData(MMType::EMBEDDING, mm_dict));
   }
 
+  LOG(INFO) << "[debug1104] RecCompletionServiceImpl::process_async_impl 2";
   // schedule the request
   master_->handle_request(std::move(rpc_request.prompt()),
                           std::move(prompt_tokens),

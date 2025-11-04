@@ -158,6 +158,7 @@ Sequence::Sequence(const Sequence& other)
 }
 
 void Sequence::append_token(const Token& token) {
+  LOG(INFO) << "[debug1104] seq append_token " << num_tokens_;
   CHECK_LT(num_tokens_, tokens_.size())
       << "exceed the token capacity of the sequence";
   CHECK(!finished_) << "cannot append token to a finished sequence";
@@ -479,7 +480,7 @@ bool Sequence::finished() const {
   if (is_rec_model() && tokens().empty()) {
     return false;
   }
-
+  LOG(INFO) << "[debug1104] seq is check finish...";
   // Embedding sequence never be finished until it updates its embeddings
   if (finish_status_invalidated_ &&
       sequence_params_.sampling_param->is_embeddings) {
@@ -494,6 +495,7 @@ bool Sequence::finished() const {
   if (finish_reason != FinishReason::NONE) {
     finish_reason_ = finish_reason;
     finished_ = true;
+    LOG(INFO) << "[debug1104] seq is finished " << finish_reason_;
     return true;
   }
   return false;

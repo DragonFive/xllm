@@ -39,12 +39,14 @@ constexpr size_t kRequestQueueSize = 100000;
 }  // namespace
 
 FixStepsScheduler::FixStepsScheduler(Engine* engine, const Options& options)
-    : ContinuousScheduler(engine, options) {}
+    : ContinuousScheduler(engine, options) {
+  LOG(INFO) << "[debug1104] begin create fixsteps scheduler 2";
+}
 
 bool FixStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
   CHECK(!request->sequences().empty());
-
+  LOG(INFO) << "[debug1104] add_request 0";
   if (request_queue_.write(request)) {  //.get()
     // take over the ownership of the request
     // request.release();
@@ -291,6 +293,7 @@ void FixStepsScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
     std::vector<Batch> batch = schedule_request(timeout);
+    LOG(INFO) << "[debug1104] fix steps scheduler batch size:"  << batch.size();
     bool all_empty =
         std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
           return one_batch.empty();
@@ -299,6 +302,7 @@ void FixStepsScheduler::step(const absl::Duration& timeout) {
       return;
     }
     engine_->step(batch);
+    LOG(INFO) << "[debug1104] fix steps scheduler engine_ step end";
     kv_cache_manager_->reset_copy_content();
   } else {
     LOG(ERROR) << "FixStepsScheduler::step() not supported with "

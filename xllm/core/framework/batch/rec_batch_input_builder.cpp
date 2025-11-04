@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "rec_batch_input_builder.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <cstring>
 #include <future>
@@ -74,6 +76,7 @@ std::vector<Sequence*> RecBatchInputBuilder::extract_sequences_from_groups(
 ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     uint32_t num_decoding_tokens,
     uint32_t min_decoding_batch_size) {
+  LOG(INFO) << "[debug1104] begin build_rec_forward_input 0";
   // ========== Global constant cache ==========
   static const std::vector<int32_t> FIXED_POSITIONS = {0};
   static const torch::Tensor FIXED_ENCODER_POSITIONS =
@@ -117,6 +120,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
     // encoder doesn't use cache key, because encoder doesn't use encoder_tokens
     // in non-first prefill scenarios, only uses encoder_seq_len
+    LOG(INFO) << "[debug1104] begin buildEncoderTokensOptimized "
+              << is_first_prefill;
     if (!is_first_prefill) {
       return cache_data.encoder_tokens;
     }
@@ -138,7 +143,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
         total_tokens += group_encoder_seq_len * group_ptr->sequences().size();
       }
     }
-
+    LOG(INFO) << "[debug1104] end buildEncoderTokensOptimized "
+              << is_first_prefill << " total_tokens " << total_tokens;
     cache_data.encoder_tokens.reserve(total_tokens);
     cache_data.encoder_seq_lens.resize(num_sequences);
     cache_data.encoder_sparse_embeddings.clear();
@@ -161,7 +167,9 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       std::fill_n(&cache_data.encoder_seq_lens[global_seq_idx],
                   group_size,
                   group_encoder_seq_len);
-
+      LOG(INFO) << "[debug1104] after set encoder_seq_lens " << is_first_prefill
+                << " group_size " << group_size << " group_encoder_seq_len "
+                << group_encoder_seq_len;
       // Batch copy tokens by sequence and collect sparse_embedding
       for (const auto& sequence : group.sequences()) {
         const auto& encoder_tokens = sequence->encoder_tokens();
@@ -174,6 +182,9 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
                                            src_ptr,
                                            src_ptr + group_encoder_seq_len);
         }
+        LOG(INFO) << "[debug1104] after encoder_tokens insert "
+                  << is_first_prefill << " group_encoder_seq_len "
+                  << group_encoder_seq_len;
         // Collect sparse_embedding
         auto mm_data = sequence->get_mm_data();
         auto sparse_embedding_optional =
@@ -182,13 +193,18 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
           cache_data.encoder_sparse_embeddings.push_back(
               sparse_embedding_optional.value());
         }
-
+        LOG(INFO) << "[debug1104] after encoder_sparse_embeddings insert "
+                  << is_first_prefill << " group_encoder_seq_len "
+                  << group_encoder_seq_len;
         auto decoder_context_embedding_optional = mm_data.get<torch::Tensor>(
             Sequence::DECODER_CONTEXT_EMBEDDING_NAME);
         if (decoder_context_embedding_optional.has_value()) {
           cache_data.decoder_context_embeddings.push_back(
               decoder_context_embedding_optional.value());
         }
+        LOG(INFO) << "[debug1104] after decoder_context_embeddings insert "
+                  << is_first_prefill << " group_encoder_seq_len "
+                  << group_encoder_seq_len;
       }
 
       global_seq_idx += group_size;
@@ -196,6 +212,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
     return cache_data.encoder_tokens;
   };
+
+  LOG(INFO) << "[debug1104] begin build_rec_forward_input 1";
 
   // ========== High-performance decoder data construction ==========
   auto buildDecoderDataOptimized = [&]() {
@@ -764,7 +782,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
           cache_data.encoder_seq_lens.size() * sizeof(int));
     }
   }
-
+  LOG(INFO) << "[debug1104] begin build_rec_forward_input 3";
   // ========== Parallel processing of independent code blocks ==========
   if (thread_pool_ && num_sequences >= THREADPOOL_THRESHOLD) {
     // Define promise/future for parallel tasks

@@ -41,6 +41,7 @@ AsyncResponseProcessor::AsyncResponseProcessor(
       role_(role.value_or(InstanceRole::DEFAULT)),
       enable_schedule_overlap_(enable_schedule_overlap),
       enable_decode_response_to_service_(enable_decode_response_to_service) {
+  LOG(INFO) << "[debug1104] begin create async response processor";
   if (role_ == InstanceRole::DECODE) {
     enable_batch_response_ =
         util::get_bool_env("ENABLE_PD_DECODE_BATCH_RESPONSE", true);

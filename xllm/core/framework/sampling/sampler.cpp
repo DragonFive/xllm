@@ -56,13 +56,16 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   auto probs = sample_logits;
   torch::Tensor samples;
   if (params.all_random_sample) {
+    LOG(INFO) << "[debug1104] sample begin do all_random_sample";
     // use float32 for probabilities and log probabilities
     probs =
         torch::softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
     samples = random_sample(probs);
   } else if (params.all_greedy_sample) {
+    LOG(INFO) << "[debug1104] sample begin do greedy";
     samples = greedy_sample(probs);
   } else {
+    LOG(INFO) << "[debug1104] sample begin do all sample";
     // use float32 for probabilities and log probabilities
     probs =
         torch::softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
