@@ -768,8 +768,10 @@ class OneRecForConditionalGenerationImpl : public torch::nn::Module {
                         std::vector<KVCache>& kv_caches,
                         const std::vector<ModelInputParams>& input_params) {
     if (input_params[0].rec_params->is_encoder_forward) {
+      LOG(INFO) << "encoder forward";
       return encode_forward(tokens[0], positions[0], input_params[0]);
     }
+    LOG(INFO) << "decoder forward";
     return forward(
         tokens[0], positions[0], kv_caches, input_params[0], encoder_output_);
   }

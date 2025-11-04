@@ -46,6 +46,7 @@ size_t RecTokenizer::vocab_size() const {
 }
 
 std::unique_ptr<Tokenizer> RecTokenizer::clone() const {
+  LOG(INFO) << "[debug1104] begin clone rec tokenizer";
   return std::make_unique<RecTokenizer>(dir_path_, args_);
 }
 

@@ -99,6 +99,8 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
 
 std::optional<ForwardOutput> RecWorkerImpl::step(
     const BatchedForwardInputs& inputs) {
+  LOG(INFO) << "[debug1104] begin step.";
+
   device_.set_device();
 
   // Timer for performance monitoring
@@ -136,12 +138,17 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
   torch::Tensor hidden_states;
   bool has_encoder_inputs = false;
 
+  LOG(INFO) << "[debug1104] begin check encoder_inputs "
+            << input_params_micro_batches.size();
   // Check if this is a rec model with encoder inputs
   if (!input_params_micro_batches.empty() &&
       input_params_micro_batches[0].is_rec_model() &&
       input_params_micro_batches[0].rec_params.has_value()) {
     auto& rec_params = input_params_micro_batches[0].rec_params.value();
-
+    LOG(INFO) << "[debug1104] begin check encoder_inputs 2: "
+              << rec_params.encoder_token_ids.defined() << " "
+              << rec_params.encoder_positions.defined() << " "
+              << rec_params.encoder_sparse_embedding.defined();
     // Check for encoder inputs
     if ((rec_params.encoder_token_ids.defined() &&
          rec_params.encoder_positions.defined()) ||
@@ -208,6 +215,7 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
                                              kv_caches_,
                                              input_params_micro_batches);
   }
+  LOG(INFO) << "[debug1104] after two-stage forward.";
 
   torch::Tensor logits;
   if (sampling_params.selected_token_idxes.defined()) {
@@ -286,12 +294,13 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
       end_time - start_time);
   COUNTER_ADD(execution_latency_seconds_model, duration.count() / 1000000.0);
-
+  LOG(INFO) << "[debug1104] rec worker end step.";
   return output;
 }
 
 ForwardInput RecWorkerImpl::prepare_inputs(Batch& batch) {
   // Use the rec-specific input preparation method
+  LOG(INFO) << "[debug1104] begin prepare_rec_forward_input.";
   return batch.prepare_rec_forward_input(options_.num_decoding_tokens(),
                                          0,  // min_decoding_batch_size
                                          context_.get_model_args());

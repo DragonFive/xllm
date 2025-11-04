@@ -133,6 +133,7 @@ void LogprobState::update_logprob(size_t index,
                                   int64_t num_top_tokens) {
   // CHECK(!logprobs_[index].has_value())
   //     << "logprob at index " << index << " is already set";
+  LOG(INFO) << "[debug1104] begin update_logprob";
   logprobs_[index] = token.logprob;
 
   if (num_top_tokens > 0 && token.top_tokens.size() > 0) {
@@ -146,6 +147,7 @@ void LogprobState::update_logprob(size_t index,
       top_logprobs_[index] = token.top_logprobs;
     }
   }
+  LOG(INFO) << "[debug1104] end update_logprob";
 }
 
 }  // namespace xllm

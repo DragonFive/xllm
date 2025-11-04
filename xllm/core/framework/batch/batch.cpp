@@ -224,8 +224,11 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   for (auto* seq : sequences) {
     if (seq->finished()) {
       output_idx++;
+      LOG(INFO) << "[debug1104] seq finished :" << seq->num_generated_tokens();
       continue;
     }
+    LOG(INFO) << "[debug1104] seq not finished :"
+              << seq->num_generated_tokens();
     if (update_sequence_state(seq, replace_fake_token)) {
       continue;
     }
@@ -242,7 +245,7 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
     append_token_for_sequence(seq, token, 0, replace_fake_token);
   }
   CHECK_EQ(output_idx, num_seqs);
-
+  LOG(INFO) << "[debug1104] after append token.";
   if (!FLAGS_enable_schedule_overlap || replace_fake_token) {
     process_beam_search();
   }
@@ -290,6 +293,7 @@ void Batch::append_token_for_sequence(Sequence* seq,
       seq->pre_scheduled_step_prefill_queue().pop();
     }
   }
+  LOG(INFO) << "[debug1104] end append_token_for_sequence.";
 }
 
 void Batch::process_embedding_output(const torch::Tensor& output_embedding) {
@@ -319,9 +323,11 @@ void Batch::process_embedding_output(const torch::Tensor& output_embedding) {
 }
 
 void Batch::process_beam_search() {
+  LOG(INFO) << "[debug1104] batch begin process beam_serch";
   for (auto* sequence_group : sequence_groups_) {
     sequence_group->process_beam_search();
   }
+  LOG(INFO) << "[debug1104] batch end process beam_serch";
 }
 
 void Batch::process_beam_search_output(const RawForwardOutput& raw_output,

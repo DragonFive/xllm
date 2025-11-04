@@ -76,6 +76,7 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
                              const proto::CompletionRequest* request,
                              proto::CompletionResponse* response,
                              ::google::protobuf::Closure* done) {
+  LOG(INFO) << "[debug1104] get a request";
   xllm::ClosureGuard done_guard(
       done,
       std::bind(request_in_metric, nullptr),

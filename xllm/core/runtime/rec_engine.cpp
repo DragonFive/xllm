@@ -82,7 +82,7 @@ bool RecEngine::init() {
     LOG(ERROR) << "Failed to allocate kv cache";
     return false;
   }
-
+  LOG(INFO) << "[debug1104] end init kv cache";
   return true;
 }
 
@@ -249,7 +249,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
     // empty worker, return
     return {};
   }
-
+  LOG(INFO) <<  "[debug1104] RecEngine::step, begin prepare_inputs";
   Timer timer;
   auto forward_inputs = workers_[0]->prepare_inputs(batches[0]);
   COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
@@ -259,12 +259,13 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
     return {};
   }
 
+  LOG(INFO) <<  "[debug1104] RecEngine::step, begin get_model_output";
   timer.reset();
   // Prefill step: Run the first model execution
   const auto& prefill_output = get_model_output(forward_inputs);
   COUNTER_ADD(rec_first_token_latency_microseconds,
               timer.elapsed_microseconds());
-
+  LOG(INFO) <<  "[debug1104] RecEngine::step, begin process_sample_output";
   timer.reset();
   batches[0].process_sample_output(prefill_output.sample_output, false);
   COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
@@ -274,10 +275,12 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
 
   for (int i = 0; i < 2; ++i) {
     timer.reset();
+    LOG(INFO) <<  "[debug1104] RecEngine::step, begin prepare_inputs " << i;
     forward_inputs = workers_[0]->prepare_inputs(batches[0]);
     COUNTER_ADD(prepare_input_latency_microseconds,
                 timer.elapsed_microseconds());
 
+    LOG(INFO) <<  "[debug1104] RecEngine::step, begin get_model_output " << i;
     timer.reset();
     decode_output = get_model_output(forward_inputs);
     if (i == 0) {
@@ -288,12 +291,13 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
                   timer.elapsed_microseconds());
     }
 
+    LOG(INFO) <<  "[debug1104] RecEngine::step, begin process_sample_output " << i;
     timer.reset();
     batches[0].process_sample_output(decode_output.sample_output, false);
     COUNTER_ADD(rec_sampling_latency_microseconds,
                 timer.elapsed_microseconds());
   }
-
+  LOG(INFO) <<  "[debug1104] RecEngine::step, begin finish ";
   batches[0].finish();
 
   // Return the final model output

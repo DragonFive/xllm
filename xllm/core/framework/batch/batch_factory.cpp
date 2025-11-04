@@ -117,6 +117,7 @@ std::vector<Batch> BatchFactory::create_rec_batches(
   size_t num_generated_tokens = 0;
   std::vector<Batch> batches(dp_size_);
   for (size_t i = 0; i < running_sequences.size(); ++i) {
+    LOG(INFO) << "[debug1104] begin create_rec_batches " << i;
     auto* sequence = running_sequences[i];
     const size_t token_budget = running_sequences_budgets[i];
 
@@ -139,12 +140,15 @@ std::vector<Batch> BatchFactory::create_rec_batches(
           (sequence->kv_state().kv_cache_tokens_num() > 0))) {
       batches[sequence->dp_rank()].set_batch_prefill_status(true);
     }
+    LOG(INFO) << "[debug1104] after create_rec_batches " << i;
   }
   // for rec, only use seq_group to prepare_input.
   for (const auto& request : running_requests) {
+    LOG(INFO) << "[debug1104] begin add seq_group ";
     auto seq_group = request->sequence_group();
     int32_t dp_rank = seq_group->dp_rank();
     batches[dp_rank].add(seq_group);
+    LOG(INFO) << "[debug1104] after add seq_group ";
   }
 
   for (int i = 0; i < dp_size_; i++) {

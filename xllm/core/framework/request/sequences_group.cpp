@@ -174,6 +174,7 @@ void SequencesGroup::process_beam_search() {
   if (!check_beam_search()) {
     return;
   }
+  LOG(INFO) << "[debug1104] SequencesGroup begin process beam_serch";
   Timer timer;
   size_t beam_width = sequence_params_.sampling_param->beam_width;
   size_t seq_size = sequences_.size();
@@ -203,6 +204,7 @@ void SequencesGroup::process_beam_search() {
       }
     }
     sequences_ = std::move(result);
+    LOG(INFO) << "[debug1104] SequencesGroup end process beam_serch";
     return;
   }
 
