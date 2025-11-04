@@ -89,7 +89,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
                               return sum + group->sequences().size();
                             })
           : 0;
-
+  const int32_t THREADPOOL_THRESHOLD = 16;
   if (UNLIKELY(num_sequences == 0)) {
     return ForwardInput{};
   }
@@ -118,12 +118,6 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     // encoder doesn't use cache key, because encoder doesn't use encoder_tokens
     // in non-first prefill scenarios, only uses encoder_seq_len
     if (!is_first_prefill) {
-      return cache_data.encoder_tokens;
-    }
-    // Below is the reconstruction for first prefill stage
-    const auto& encoder_tokens = first_sequence->encoder_tokens();
-    if (encoder_tokens.empty()) {
-      cache_data.encoder_tokens.clear();
       return cache_data.encoder_tokens;
     }
 
@@ -217,7 +211,6 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
     // Multi-threading optimization: Use parallel processing when sequence count
     // exceeds threshold and thread pool is available
-    const int32_t THREADPOOL_THRESHOLD = 16;
     ThreadPool* threadpool = thread_pool_;
     if (num_sequences >= THREADPOOL_THRESHOLD && threadpool != nullptr) {
       // Thread-safe result containers
@@ -377,8 +370,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   std::vector<int32_t> selected_token_idxes;
   std::vector<int32_t> sample_idxes;
   std::vector<std::vector<int32_t>> generated_tokens;
-
-  if (thread_pool_ && num_sequences >= 8) {
+  LOG(INFO) << "[debug1104] begin build_rec_forward_input 2";
+  if (thread_pool_ && num_sequences >= THREADPOOL_THRESHOLD) {
     // Use ThreadPool's schedule method to execute independent tasks in parallel
     // buildDecoderDataOptimized handles multi-threading internally, no external
     // parallel calls
@@ -425,7 +418,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   torch::Tensor result_embedding;
 
   // ========== Parallel tensor construction tasks ==========
-  if (thread_pool_ && num_sequences >= 4) {
+  if (thread_pool_ && num_sequences >= THREADPOOL_THRESHOLD) {
     // Only use parallelization for time-consuming tasks (token_ids and
     // encoder_token_ids)
     std::promise<torch::Tensor> token_ids_promise;
@@ -615,9 +608,6 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     input_params.kv_max_seq_len = seq_len + num_decoder_embeddings;
     input_params.q_max_seq_len = seq_len + num_decoder_embeddings;
     forward_input.positions = perf_cache_.fixed_positions_tensor;
-    if (!encoder_tokens.empty()) {
-      forward_input.positions = perf_cache_.fixed_encoder_positions_tensor;
-    }
 
     // Wait and collect results
     forward_input.token_ids = token_ids_future.get();
@@ -661,6 +651,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
           std::move(encoder_seq_lens_tensor);
       input_params.rec_params->encoder_seq_lens = cache_data.encoder_seq_lens;
     }
+    input_params.rec_params->encoder_positions =
+        perf_cache_.fixed_encoder_positions_tensor;
   } else {
     // Single-threaded execution (original logic)
     // Optimization: Use torch::empty+std::memcpy instead of
@@ -693,10 +685,9 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       std::memcpy(input_params.rec_params->encoder_token_ids.data_ptr<int>(),
                   encoder_tokens.data(),
                   encoder_tokens.size() * sizeof(int));
-      input_params.rec_params->encoder_positions =
-          perf_cache_.fixed_encoder_positions_tensor;
     }
-
+    input_params.rec_params->encoder_positions =
+        perf_cache_.fixed_encoder_positions_tensor;
     // Pre-allocate and batch fill
     std::vector<int32_t> cu_seq_lens, q_cu_seq_lens;
 #ifdef USE_ASCEND
@@ -771,7 +762,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   }
 
   // ========== Parallel processing of independent code blocks ==========
-  if (thread_pool_ && num_sequences >= 4) {
+  if (thread_pool_ && num_sequences >= THREADPOOL_THRESHOLD) {
     // Define promise/future for parallel tasks
     std::promise<void> block_tables_promise;
     auto block_tables_future = block_tables_promise.get_future();

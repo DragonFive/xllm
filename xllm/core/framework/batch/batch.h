@@ -65,7 +65,7 @@ class Batch {
 
   // get the number of sequences in the batch
   size_t size() const { return sequences_.size(); }
-  bool empty() const { return sequences_.empty(); }
+  bool empty() const { return sequences_.empty() && sequence_groups_.empty(); }
 
   Sequence* operator[](size_t i) { return sequences_[i]; }
 

@@ -98,6 +98,8 @@ Sequence::Sequence(size_t index,
     // init logprob state
     logprob_state_ =
         std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
+    // rec only use rank 0 now.
+    set_dp_rank(0);
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
     auto capacity = sequence_params_.seq_capacity;
@@ -399,6 +401,21 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
     }
   }
 
+  SequenceOutput output;
+  output.index = index_;
+
+  if (output_embedding_.defined()) {
+    output.embedding = output_embedding_;
+  }
+
+  if (finish_reason_ != FinishReason::NONE) {
+    output.finish_reason = finish_reason_.to_string();
+  }
+
+  if (is_rec_model()) {
+    output.token_ids = ids.slice(num_prompt_tokens_, size);
+    return output;
+  }
   // record the start index of token ids
   const size_t start = decoder_.output_offset();
 
@@ -415,16 +432,7 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
     ss << decoder_.decode(ids.slice(0, end), tokenizer);
   }
 
-  SequenceOutput output;
-  output.index = index_;
   output.text = ss.str();
-  if (output_embedding_.defined()) {
-    output.embedding = output_embedding_;
-  }
-
-  if (finish_reason_ != FinishReason::NONE) {
-    output.finish_reason = finish_reason_.to_string();
-  }
 
   const size_t end = decoder_.output_offset();
   output.token_ids = ids.slice(start, end);
@@ -464,6 +472,10 @@ bool Sequence::finished() const {
   // return the cached finish status
   if (!finish_status_invalidated_) {
     return finished_;
+  }
+
+  if (is_rec_model() && tokens().empty()) {
+    return false;
   }
 
   // Embedding sequence never be finished until it updates its embeddings

@@ -154,63 +154,62 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
       }
     }
   }
+  LOG(INFO) << "[debug1104] begin two-stage forward.";
 
-  if (has_encoder_inputs) {
-    // Two-stage forward: encoder then decoder
-    auto& rec_params = input_params_micro_batches[0].rec_params.value();
+  // Two-stage forward: encoder then decoder
+  auto& rec_params = input_params_micro_batches[0].rec_params.value();
 
-    if (rec_params.rec_stage == RecModelInputParams::RecStage::PREFILL) {
-      // Check if this is the first prefill or subsequent prefill
-      if (!rec_params.is_first_prefill) {
-        // Subsequent prefill: only run decoder
-        hidden_states =
-            model_executor_->forward(flatten_tokens_micro_batches,
-                                     flatten_positions_micro_batches,
-                                     kv_caches_,
-                                     input_params_micro_batches);
-      } else {
-        // First prefill: run encoder first, then decoder
-
-        // 1. Run encoder forward
-        auto encoder_input_params = input_params_micro_batches;
-        encoder_input_params[0].rec_params->is_encoder_forward = true;
-
-        std::vector<torch::Tensor> encoder_tokens;
-        std::vector<torch::Tensor> encoder_positions;
-
-        if (rec_params.is_hybrid_mode &&
-            rec_params.encoder_sparse_embedding.defined()) {
-          encoder_tokens.push_back(rec_params.encoder_sparse_embedding);
-        } else {
-          encoder_tokens.push_back(rec_params.encoder_token_ids);
-        }
-        encoder_positions.push_back(rec_params.encoder_positions);
-
-        // Run encoder
-        hidden_states = model_executor_->forward(encoder_tokens,
-                                                 encoder_positions,
-                                                 kv_caches_,
-                                                 encoder_input_params);
-
-        // 2. Run decoder forward
-        encoder_input_params[0].rec_params->is_encoder_forward = false;
-        hidden_states =
-            model_executor_->forward(flatten_tokens_micro_batches,
-                                     flatten_positions_micro_batches,
-                                     kv_caches_,
-                                     encoder_input_params);
-      }
-    } else {
-      // Decode stage: only run decoder
+  if (rec_params.rec_stage == RecModelInputParams::RecStage::PREFILL) {
+    // Check if this is the first prefill or subsequent prefill
+    if (!rec_params.is_first_prefill) {
+      // Subsequent prefill: only run decoder
+      input_params_micro_batches[0].rec_params->is_encoder_forward = false;
       hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
                                                flatten_positions_micro_batches,
                                                kv_caches_,
                                                input_params_micro_batches);
+    } else if (has_encoder_inputs) {
+      // First prefill: run encoder first, then decoder
+
+      // 1. Run encoder forward
+      auto encoder_input_params = input_params_micro_batches;
+      encoder_input_params[0].rec_params->is_encoder_forward = true;
+
+      std::vector<torch::Tensor> encoder_tokens;
+      std::vector<torch::Tensor> encoder_positions;
+
+      if (rec_params.is_hybrid_mode &&
+          rec_params.encoder_sparse_embedding.defined()) {
+        encoder_tokens.push_back(rec_params.encoder_sparse_embedding);
+      } else {
+        encoder_tokens.push_back(rec_params.encoder_token_ids);
+      }
+      encoder_positions.push_back(rec_params.encoder_positions);
+
+      // Run encoder
+      hidden_states = model_executor_->forward(
+          encoder_tokens, encoder_positions, kv_caches_, encoder_input_params);
+
+      // 2. Run decoder forward
+      encoder_input_params[0].rec_params->is_encoder_forward = false;
+      hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
+                                               flatten_positions_micro_batches,
+                                               kv_caches_,
+                                               encoder_input_params);
+
+    } else {
+      // Non-rec model or rec model without encoder: use standard forward
+      LOG(ERROR) << "RecWorkerImpl not supports decoder-only model now.";
     }
   } else {
-    // Non-rec model or rec model without encoder: use standard forward
-    LOG(ERROR) << "RecWorkerImpl not supports decoder-only model";
+    // Decode stage: only run decoder, not used now.
+    hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
+                                             flatten_positions_micro_batches,
+                                             kv_caches_,
+                                             input_params_micro_batches);
   }
+
+  LOG(INFO) << "[debug1104] after two-stage forward.";
 
   torch::Tensor logits;
   if (concated_sampling_params.selected_token_idxes.defined()) {
