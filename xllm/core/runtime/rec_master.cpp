@@ -31,7 +31,7 @@ limitations under the License.
 namespace xllm {
 
 RecMaster::RecMaster(const Options& options)
-    : Master(options, EngineType::LLM) {
+    : Master(options, EngineType::REC) {
   // Initialize with Rec engine type
   // The rest of the initialization follows the same pattern as LLMMaster
   CHECK(engine_->init());

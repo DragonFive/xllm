@@ -155,7 +155,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
     auto output_tensor = response.mutable_output_tensors()->Add();
     output_tensor->set_name("omnirec_result");
     // TODO: replace true with flags after converter merge
-    if (true) {
+    if (FLAGS_enable_constrained_decoding) {
       output_tensor->set_datatype(proto::DataType::INT64);
       output_tensor->mutable_shape()->Add(req_output.outputs.size());
       output_tensor->mutable_shape()->Add(1);  // Single item per output

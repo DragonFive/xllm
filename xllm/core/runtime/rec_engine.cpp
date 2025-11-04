@@ -92,7 +92,8 @@ bool RecEngine::init_model() {
   LOG(INFO) << "Initializing model from: " << model_path;
 
   // RecEngine does not use tokenizer
-  tokenizer_ = nullptr;
+  tokenizer_ = model_loader->tokenizer();
+  CHECK(tokenizer_ != nullptr);
 
   args_ = model_loader->model_args();
   quant_args_ = model_loader->quant_args();

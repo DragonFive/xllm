@@ -48,9 +48,6 @@ class RecEngine : public Engine {
   // return the active activation memory
   std::vector<int64_t> get_active_activation_memory() const override;
 
-  // Override tokenizer to return nullptr for rec models
-  const Tokenizer* tokenizer() const override { return nullptr; }
-
  private:
   bool init_model();
   Engine::KVCacheCapacity estimate_kv_cache_capacity();

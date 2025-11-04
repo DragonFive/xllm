@@ -117,7 +117,7 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
     input_params_micro_batches.push_back(
         std::move(inputs.micro_inputs[i].input_params));
   }
-
+  auto sampling_params = inputs.micro_inputs[0].sampling_params;
   // Start async filter mask preparation early for overlap (if beam search is
   // enabled)
   std::future<torch::Tensor> filter_mask_future;
@@ -155,67 +155,63 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
     }
   }
 
-  if (has_encoder_inputs) {
-    // Two-stage forward: encoder then decoder
-    auto& rec_params = input_params_micro_batches[0].rec_params.value();
+  // Two-stage forward: encoder then decoder
+  auto& rec_params = input_params_micro_batches[0].rec_params.value();
 
-    if (rec_params.rec_stage == RecModelInputParams::RecStage::PREFILL) {
-      // Check if this is the first prefill or subsequent prefill
-      if (!rec_params.is_first_prefill) {
-        // Subsequent prefill: only run decoder
-        hidden_states =
-            model_executor_->forward(flatten_tokens_micro_batches,
-                                     flatten_positions_micro_batches,
-                                     kv_caches_,
-                                     input_params_micro_batches);
-      } else {
-        // First prefill: run encoder first, then decoder
-
-        // 1. Run encoder forward
-        auto encoder_input_params = input_params_micro_batches;
-        encoder_input_params[0].rec_params->is_encoder_forward = true;
-
-        std::vector<torch::Tensor> encoder_tokens;
-        std::vector<torch::Tensor> encoder_positions;
-
-        if (rec_params.is_hybrid_mode &&
-            rec_params.encoder_sparse_embedding.defined()) {
-          encoder_tokens.push_back(rec_params.encoder_sparse_embedding);
-        } else {
-          encoder_tokens.push_back(rec_params.encoder_token_ids);
-        }
-        encoder_positions.push_back(rec_params.encoder_positions);
-
-        // Run encoder
-        hidden_states = model_executor_->forward(encoder_tokens,
-                                                 encoder_positions,
-                                                 kv_caches_,
-                                                 encoder_input_params);
-
-        // 2. Run decoder forward
-        encoder_input_params[0].rec_params->is_encoder_forward = false;
-        hidden_states =
-            model_executor_->forward(flatten_tokens_micro_batches,
-                                     flatten_positions_micro_batches,
-                                     kv_caches_,
-                                     encoder_input_params);
-      }
-    } else {
-      // Decode stage: only run decoder
+  if (rec_params.rec_stage == RecModelInputParams::RecStage::PREFILL) {
+    // Check if this is the first prefill or subsequent prefill
+    if (!rec_params.is_first_prefill) {
+      // Subsequent prefill: only run decoder
+      input_params_micro_batches[0].rec_params->is_encoder_forward = false;
       hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
                                                flatten_positions_micro_batches,
                                                kv_caches_,
                                                input_params_micro_batches);
+    } else if (has_encoder_inputs) {
+      // First prefill: run encoder first, then decoder
+
+      // 1. Run encoder forward
+      auto encoder_input_params = input_params_micro_batches;
+      encoder_input_params[0].rec_params->is_encoder_forward = true;
+
+      std::vector<torch::Tensor> encoder_tokens;
+      std::vector<torch::Tensor> encoder_positions;
+
+      if (rec_params.is_hybrid_mode &&
+          rec_params.encoder_sparse_embedding.defined()) {
+        encoder_tokens.push_back(rec_params.encoder_sparse_embedding);
+      } else {
+        encoder_tokens.push_back(rec_params.encoder_token_ids);
+      }
+      encoder_positions.push_back(rec_params.encoder_positions);
+
+      // Run encoder
+      hidden_states = model_executor_->forward(
+          encoder_tokens, encoder_positions, kv_caches_, encoder_input_params);
+
+      // 2. Run decoder forward
+      encoder_input_params[0].rec_params->is_encoder_forward = false;
+      hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
+                                               flatten_positions_micro_batches,
+                                               kv_caches_,
+                                               encoder_input_params);
+
+    } else {
+      // Non-rec model or rec model without encoder: use standard forward
+      LOG(ERROR) << "RecWorkerImpl not supports decoder-only model now.";
     }
   } else {
-    // Non-rec model or rec model without encoder: use standard forward
-    LOG(ERROR) << "RecWorkerImpl not supports decoder-only model";
+    // Decode stage: only run decoder, not used now.
+    hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
+                                             flatten_positions_micro_batches,
+                                             kv_caches_,
+                                             input_params_micro_batches);
   }
 
   torch::Tensor logits;
-  if (concated_sampling_params.selected_token_idxes.defined()) {
-    logits = model_->logits(hidden_states,
-                            concated_sampling_params.selected_token_idxes);
+  if (sampling_params.selected_token_idxes.defined()) {
+    logits =
+        model_->logits(hidden_states, sampling_params.selected_token_idxes);
   }
 
   ForwardOutput output;
@@ -232,35 +228,55 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
   }
 
   // Driver prepare model output
-  if (concated_sampling_params.selected_token_idxes.defined()) {
-    auto sample_logits =
-        logits.index_select(/*dim=*/0, concated_sampling_params.sample_idxes);
+
+  if (sampling_params.selected_token_idxes.defined()) {
+    // auto sample_logits =
+    //     logits.index_select(/*dim=*/0,
+    //     concated_sampling_params.sample_idxes);
 
     // Apply filter mask if available
-    if (filter_mask.defined()) {
-      // Ensure filter_mask has the same batch size as sample_logits
-      if (filter_mask.size(0) == sample_logits.size(0)) {
-        sample_logits = sample_logits + filter_mask;
-      } else {
-        // If dimensions don't match, select the appropriate rows from
-        // filter_mask
-        auto selected_filter_mask = filter_mask.index_select(
-            /*dim=*/0, concated_sampling_params.sample_idxes);
-        sample_logits = sample_logits + selected_filter_mask;
-      }
-    }
+    // TODO: fix filter
+    // if (filter_mask.defined()) {
+    //   // Ensure filter_mask has the same batch size as sample_logits
+    //   if (filter_mask.size(0) == sample_logits.size(0)) {
+    //     sample_logits = sample_logits + filter_mask;
+    //   } else {
+    //     // If dimensions don't match, select the appropriate rows from
+    //     // filter_mask
+    //     auto selected_filter_mask = filter_mask.index_select(
+    //         /*dim=*/0, concated_sampling_params.sample_idxes);
+    //     sample_logits = sample_logits + selected_filter_mask;
+    //   }
+    // }
 
-    auto sample_output =
-        sampler_->forward(sample_logits, concated_sampling_params);
+    auto sample_output = sampler_->forward(logits, sampling_params);
     output.logits = logits;
 
     // Set sample output to output
     output.sample_output = sample_output;
 
     // Carry over the sampling params
-    output.do_sample = concated_sampling_params.do_sample;
-    output.logprobs = concated_sampling_params.logprobs;
-    output.max_top_logprobs = concated_sampling_params.max_top_logprobs;
+    output.do_sample = sampling_params.do_sample;
+    output.logprobs = sampling_params.logprobs;
+    output.max_top_logprobs = sampling_params.max_top_logprobs;
+  }
+
+  // Transfer sample output tensors to CPU for batch.cpp access
+  if (output.sample_output.next_tokens.defined()) {
+    output.sample_output.next_tokens =
+        safe_to(output.sample_output.next_tokens, torch::kCPU, true);
+  }
+  if (output.sample_output.logprobs.defined()) {
+    output.sample_output.logprobs =
+        safe_to(output.sample_output.logprobs, torch::kCPU, true);
+  }
+  if (output.sample_output.top_tokens.defined()) {
+    output.sample_output.top_tokens =
+        safe_to(output.sample_output.top_tokens, torch::kCPU, true);
+  }
+  if (output.sample_output.top_logprobs.defined()) {
+    output.sample_output.top_logprobs =
+        safe_to(output.sample_output.top_logprobs, torch::kCPU, true);
   }
 
   // Synchronize at the end like in llm_worker_impl

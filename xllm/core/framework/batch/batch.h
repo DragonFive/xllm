@@ -65,7 +65,7 @@ class Batch {
 
   // get the number of sequences in the batch
   size_t size() const { return sequences_.size(); }
-  bool empty() const { return sequences_.empty(); }
+  bool empty() const { return sequences_.empty() && sequence_groups_.empty(); }
 
   Sequence* operator[](size_t i) { return sequences_[i]; }
 
@@ -118,6 +118,11 @@ class Batch {
                                          uint32_t min_decoding_batch_size,
                                          const ModelArgs& args,
                                          ThreadPool* thread_pool = nullptr);
+
+ protected:
+  // Get sequences for iteration - returns sequences_ if not empty,
+  // otherwise extracts sequences from sequence_groups_
+  std::vector<Sequence*> get_sequences() const;
 
  private:
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
