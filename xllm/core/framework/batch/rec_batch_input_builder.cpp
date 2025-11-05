@@ -134,7 +134,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
         // Sequences within group have same length, only need to get first
         // sequence's length
         const int32_t group_encoder_seq_len =
-            group_ptr->sequences()[0]->encoder_seq_len();
+            group_ptr->sequences()[0]->encoder_tokens().size();
         total_tokens += group_encoder_seq_len * group_ptr->sequences().size();
       }
     }
@@ -166,11 +166,14 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       for (const auto& sequence : group.sequences()) {
         const auto& encoder_tokens = sequence->encoder_tokens();
         const int32_t* src_ptr = encoder_tokens.data();
+        const int32_t group_encoder_seq_len = encoder_tokens.size();
 
         // Use efficient batch insertion
-        cache_data.encoder_tokens.insert(cache_data.encoder_tokens.end(),
-                                         src_ptr,
-                                         src_ptr + group_encoder_seq_len);
+        if (group_encoder_seq_len > 0) {
+          cache_data.encoder_tokens.insert(cache_data.encoder_tokens.end(),
+                                           src_ptr,
+                                           src_ptr + group_encoder_seq_len);
+        }
         // Collect sparse_embedding
         auto mm_data = sequence->get_mm_data();
         auto sparse_embedding_optional =
@@ -425,7 +428,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     std::promise<torch::Tensor> encoder_token_ids_promise;
 
     auto token_ids_future = token_ids_promise.get_future();
-    auto encoder_token_ids_future = encoder_token_ids_promise.get_future();
+    // auto encoder_token_ids_future = encoder_token_ids_promise.get_future();
 
     // Task 1: Build token_ids tensor -
     // Optimization: Use torch::empty+std::memcpy instead of
@@ -453,6 +456,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     // Task 2: Build encoder_token_ids tensor (if needed) -
     // Optimization: Use torch::empty+std::memcpy instead of
     // torch::from_blob().clone()
+    /*
     thread_pool_->schedule(
         [&encoder_tokens,
          promise = std::move(encoder_token_ids_promise)]() mutable {
@@ -476,7 +480,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
             promise.set_exception(std::current_exception());
           }
         });
-
+    */
     if (!perf_cache_.cache_data.decoder_context_embeddings.empty()) {
       // Task 3: Synchronously process decoder_embedding, inner group dimension
       // parallelization optimization
@@ -611,7 +615,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
     // Wait and collect results
     forward_input.token_ids = token_ids_future.get();
-    auto encoder_token_ids = encoder_token_ids_future.get();
+    // auto encoder_token_ids = encoder_token_ids_future.get();
 
     // seq_lens has been changed to serial execution, use the constructed
     // variable directly
