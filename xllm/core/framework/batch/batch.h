@@ -119,6 +119,11 @@ class Batch {
                                          const ModelArgs& args,
                                          ThreadPool* thread_pool = nullptr);
 
+ protected:
+  // Get sequences for iteration - returns sequences_ if not empty,
+  // otherwise extracts sequences from sequence_groups_
+  std::vector<Sequence*> get_sequences() const;
+
  private:
   bool update_sequence_state(Sequence* seq, bool replace_fake_token);
 

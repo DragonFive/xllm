@@ -121,6 +121,23 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
   return result;
 }
 
+std::vector<Sequence*> Batch::get_sequences() const {
+  // If sequences_ is not empty, return it directly
+  if (!sequences_.empty()) {
+    return sequences_;
+  }
+  
+  // Otherwise, extract sequences from sequence_groups_
+  std::vector<Sequence*> result;
+  for (const auto* seq_group : sequence_groups_) {
+    const auto& sequences = seq_group->sequences();
+    for (const auto& seq_ptr : sequences) {
+      result.push_back(seq_ptr.get());
+    }
+  }
+  return result;
+}
+
 RawForwardInput Batch::prepare_forward_input(uint32_t start_idx,
                                              uint32_t end_idx,
                                              ThreadPool* thread_pool) {
@@ -189,7 +206,8 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   if (sample_output.embeddings.defined()) {
     const int64_t num_seqs = sample_output.embeddings.size(0);
     int64_t output_idx = 0;
-    for (auto* seq : sequences_) {
+    const auto& sequences = get_sequences();
+    for (auto* seq : sequences) {
       CHECK_LT(output_idx, num_seqs);
       auto cur_seq_embed =
           safe_to(sample_output.embeddings[output_idx++], torch::kFloat32);
@@ -202,7 +220,8 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
   // this means all sequences are in prefill stage status.
   const int64_t num_seqs = sample_output.next_tokens.size(0);
   int64_t output_idx = 0;
-  for (auto* seq : sequences_) {
+  const auto& sequences = get_sequences();
+  for (auto* seq : sequences) {
     if (seq->finished()) {
       output_idx++;
       continue;
