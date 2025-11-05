@@ -117,7 +117,7 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
     input_params_micro_batches.push_back(
         std::move(inputs.micro_inputs[i].input_params));
   }
-
+  auto sampling_params = inputs.micro_inputs[0].sampling_params;
   // Start async filter mask preparation early for overlap (if beam search is
   // enabled)
   std::future<torch::Tensor> filter_mask_future;
@@ -209,12 +209,11 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
                                              input_params_micro_batches);
   }
 
-  LOG(INFO) << "[debug1104] after two-stage forward.";
-
   torch::Tensor logits;
-  if (concated_sampling_params.selected_token_idxes.defined()) {
+  if (sampling_params.selected_token_idxes.defined()) {
+    LOG(INFO) << "[debug1104] rec worker do logits";
     logits = model_->logits(hidden_states,
-                            concated_sampling_params.selected_token_idxes);
+                            sampling_params.selected_token_idxes);
   }
 
   ForwardOutput output;
@@ -231,35 +230,38 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
   }
 
   // Driver prepare model output
-  if (concated_sampling_params.selected_token_idxes.defined()) {
-    auto sample_logits =
-        logits.index_select(/*dim=*/0, concated_sampling_params.sample_idxes);
+
+  if (sampling_params.selected_token_idxes.defined()) {
+    // auto sample_logits =
+    //     logits.index_select(/*dim=*/0,
+    //     concated_sampling_params.sample_idxes);
 
     // Apply filter mask if available
-    if (filter_mask.defined()) {
-      // Ensure filter_mask has the same batch size as sample_logits
-      if (filter_mask.size(0) == sample_logits.size(0)) {
-        sample_logits = sample_logits + filter_mask;
-      } else {
-        // If dimensions don't match, select the appropriate rows from
-        // filter_mask
-        auto selected_filter_mask = filter_mask.index_select(
-            /*dim=*/0, concated_sampling_params.sample_idxes);
-        sample_logits = sample_logits + selected_filter_mask;
-      }
-    }
+    // TODO: fix filter
+    // if (filter_mask.defined()) {
+    //   // Ensure filter_mask has the same batch size as sample_logits
+    //   if (filter_mask.size(0) == sample_logits.size(0)) {
+    //     sample_logits = sample_logits + filter_mask;
+    //   } else {
+    //     // If dimensions don't match, select the appropriate rows from
+    //     // filter_mask
+    //     auto selected_filter_mask = filter_mask.index_select(
+    //         /*dim=*/0, concated_sampling_params.sample_idxes);
+    //     sample_logits = sample_logits + selected_filter_mask;
+    //   }
+    // }
 
-    auto sample_output =
-        sampler_->forward(sample_logits, concated_sampling_params);
+    LOG(INFO) << "[debug1104] rec worker do sampler";
+    auto sample_output = sampler_->forward(logits, sampling_params);
     output.logits = logits;
 
     // Set sample output to output
     output.sample_output = sample_output;
 
     // Carry over the sampling params
-    output.do_sample = concated_sampling_params.do_sample;
-    output.logprobs = concated_sampling_params.logprobs;
-    output.max_top_logprobs = concated_sampling_params.max_top_logprobs;
+    output.do_sample = sampling_params.do_sample;
+    output.logprobs = sampling_params.logprobs;
+    output.max_top_logprobs = sampling_params.max_top_logprobs;
   }
 
   // Synchronize at the end like in llm_worker_impl
