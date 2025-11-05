@@ -171,7 +171,7 @@ void Sequence::append_token(const Token& token) {
     // check if the token is the first token after the prompt
     is_first_token_ = num_tokens_ == num_prompt_tokens_;
   }
-
+  LOG(INFO) << "[debug1104] seq in append_token at 0";
   // TODO: not record in non-disagg pd mode.
   if (is_first_token_) {
     RemoteToken t;
@@ -183,7 +183,7 @@ void Sequence::append_token(const Token& token) {
     t.token_top_logprobs = token.top_logprobs;
     first_token_ = std::move(t);
   }
-
+  LOG(INFO) << "[debug1104] seq in append_token at 1";
   // append the token id and update the token count
   const auto cur_idx = num_tokens_++;
   kv_state_.set_kv_cache_tokens_num(cur_idx);
@@ -195,7 +195,7 @@ void Sequence::append_token(const Token& token) {
     finish_status_invalidated_ = true;
     return;
   }
-
+  LOG(INFO) << "[debug1104] seq in append_token at 2";
   token_to_count_map_[token_id]++;
   // update logprobs if needed
   if (sequence_params_.sampling_param->logprobs) {
@@ -205,6 +205,7 @@ void Sequence::append_token(const Token& token) {
 
   // invalidate the finish status once a new token is appended
   finish_status_invalidated_ = true;
+  LOG(INFO) << "[debug1104] seq end append_token " << num_tokens_;
 }
 
 void Sequence::update_last_step_token(const Token& token, size_t token_offset) {

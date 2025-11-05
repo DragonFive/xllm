@@ -293,6 +293,7 @@ void Batch::append_token_for_sequence(Sequence* seq,
       seq->pre_scheduled_step_prefill_queue().pop();
     }
   }
+  LOG(INFO) << "[debug1104] end append_token_for_sequence.";
 }
 
 void Batch::process_embedding_output(const torch::Tensor& output_embedding) {
