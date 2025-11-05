@@ -264,6 +264,20 @@ std::optional<ForwardOutput> RecWorkerImpl::step(
     output.max_top_logprobs = sampling_params.max_top_logprobs;
   }
 
+  // Transfer sample output tensors to CPU for batch.cpp access
+  if (output.sample_output.next_tokens.defined()) {
+    output.sample_output.next_tokens = safe_to(output.sample_output.next_tokens, torch::kCPU, true);
+  }
+  if (output.sample_output.logprobs.defined()) {
+    output.sample_output.logprobs = safe_to(output.sample_output.logprobs, torch::kCPU, true);
+  }
+  if (output.sample_output.top_tokens.defined()) {
+    output.sample_output.top_tokens = safe_to(output.sample_output.top_tokens, torch::kCPU, true);
+  }
+  if (output.sample_output.top_logprobs.defined()) {
+    output.sample_output.top_logprobs = safe_to(output.sample_output.top_logprobs, torch::kCPU, true);
+  }
+
   // Synchronize at the end like in llm_worker_impl
   auto ret = device_.synchronize_default_stream();
 
