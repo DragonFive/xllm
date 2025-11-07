@@ -570,7 +570,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     // Task 4: Build sequence length vector - changed to serial execution (very
     // time-consuming, ~0.001785ms)
     std::vector<int32_t> cu_seq_lens, q_cu_seq_lens;
-#ifdef USE_ASCEND
+#if defined(USE_NPU)
+    // use all prefill;
     cu_seq_lens.assign(num_sequences, seq_len + num_decoder_embeddings);
     q_cu_seq_lens.assign(num_sequences, seq_len + num_decoder_embeddings);
 #else
@@ -693,7 +694,8 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
         perf_cache_.fixed_encoder_positions_tensor;
     // Pre-allocate and batch fill
     std::vector<int32_t> cu_seq_lens, q_cu_seq_lens;
-#ifdef USE_ASCEND
+#if defined(USE_NPU)
+    // use all prefill;
     cu_seq_lens.assign(num_sequences, seq_len + num_decoder_embeddings);
     q_cu_seq_lens.assign(num_sequences, seq_len + num_decoder_embeddings);
 #else
@@ -893,7 +895,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   // Batch set other parameters
   input_params.embedding_ids.assign(num_sequences, 0);
 
-#ifdef USE_ASCEND
+#if defined(USE_NPU)
   auto prefill_indices = util::find_ones_indices(input_params.q_seq_lens_vec);
   input_params.decode_seq_range =
       std::make_pair(0, static_cast<int>(flatten_tokens_vec.size()));

@@ -69,10 +69,11 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
 
 ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size,
-                                          const ModelArgs& args) {
+                                          const ModelArgs& args,
+                                          ThreadPool* thread_pool) {
   if (FLAGS_backend == "rec") {
     return prepare_rec_forward_input(
-        num_decoding_tokens, min_decoding_batch_size, args);
+        num_decoding_tokens, min_decoding_batch_size, args, thread_pool);
   }
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,

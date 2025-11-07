@@ -168,9 +168,6 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
         }
       }
     } else {
-      LOG(INFO) << "[debug1104] rec model output token ids: "
-                << " " << req_output.outputs.size() << " "
-                << req_output.outputs[0].token_ids;
       output_tensor->set_datatype(proto::DataType::INT32);
 
       output_tensor->mutable_shape()->Add(req_output.outputs.size());
