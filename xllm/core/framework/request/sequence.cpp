@@ -415,6 +415,9 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   }
 
   if (is_rec_model()) {
+    LOG(INFO) << "[debug1104] rec model output token ids: "
+              << num_prompt_tokens_ << " : " << size << " "
+              << ids.slice(num_prompt_tokens_, size);
     output.token_ids = ids.slice(num_prompt_tokens_, size);
     return output;
   }
