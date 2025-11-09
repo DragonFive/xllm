@@ -70,6 +70,28 @@ std::vector<std::unique_ptr<StateDict>>& HFModelLoader::get_state_dicts() {
   return state_dicts_;
 }
 
+bool HFModelLoader::load_rec_vocab(const std::string& model_weights_path) {
+  if (!tokenizer_args_.vocab_file().empty()) {
+    std::filesystem::path path = model_weights_path;
+    std::string model_version = path.filename();
+    std::string vocab_full_path =
+        path.append(tokenizer_args_.vocab_file()).string();
+
+    LOG(INFO) << "model_version:" << model_version
+              << ", vocab_full_path:" << vocab_full_path;
+
+    CHECK(nullptr != VersionSingleton<RecVocabDict>::GetInstance(model_version))
+        << "Failed to get vocab dict instance";
+    CHECK(VersionSingleton<RecVocabDict>::GetInstance(model_version)
+              ->initialize(vocab_full_path))
+        << "Failed to initialize vocab dict from " << vocab_full_path;
+  } else {
+    LOG(ERROR) << "vocab file is not set";
+  }
+
+  return true;
+}
+
 bool HFModelLoader::load_args(const std::string& model_weights_path) {
   if (!load_model_args(model_weights_path)) {
     LOG(ERROR) << "Failed to load model args from " << model_weights_path;
