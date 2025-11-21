@@ -68,11 +68,10 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
 
 ForwardInput Batch::prepare_forward_input(uint32_t num_decoding_tokens,
                                           uint32_t min_decoding_batch_size,
-                                          const ModelArgs& args,
-                                          ThreadPool* thread_pool) {
+                                          const ModelArgs& args) {
   if (FLAGS_backend == "rec") {
     return prepare_rec_forward_input(
-        num_decoding_tokens, min_decoding_batch_size, args, thread_pool);
+        num_decoding_tokens, min_decoding_batch_size, args);
   }
   BatchInputBuilder builder(sequences_,
                             allowed_max_tokens_,
@@ -98,16 +97,14 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
     sequence_groups_ptrs.emplace_back(std::unique_ptr<SequencesGroup>(group));
   }
 
-  RecBatchInputBuilder builder(
-      sequence_groups_ptrs,
-      allowed_max_tokens_,
-      input_embeddings_vec_,
-      mm_data_vec_,
-      swap_block_transfer_infos_,
-      batch_id_,
-      &args,
-      thread_pool);  // Temporarily not using thread pool
-
+  RecBatchInputBuilder builder(sequence_groups_ptrs,
+                               allowed_max_tokens_,
+                               input_embeddings_vec_,
+                               mm_data_vec_,
+                               swap_block_transfer_infos_,
+                               batch_id_,
+                               &args,
+                               thread_pool);
   auto result = builder.build_rec_forward_input(num_decoding_tokens,
                                                 min_decoding_batch_size);
 
@@ -115,7 +112,6 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
   for (auto& ptr : sequence_groups_ptrs) {
     ptr.release();
   }
-
   return result;
 }
 

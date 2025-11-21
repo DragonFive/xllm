@@ -136,8 +136,8 @@ std::vector<Batch> BatchFactory::create_rec_batches(
 
   for (int i = 0; i < dp_size_; i++) {
     if (!batches[i].empty()) {
-      if (swap_cache_block_infos != nullptr &&
-          swap_cache_block_infos->size() == dp_size_) {
+      if (swap_block_transfer_infos != nullptr &&
+          swap_block_transfer_infos->size() == dp_size_) {
         batches[i].set_swap_block_transfer_infos(
             &(swap_block_transfer_infos->at(i)));
       }

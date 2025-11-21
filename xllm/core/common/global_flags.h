@@ -212,8 +212,5 @@ DECLARE_bool(enable_prefetch_weight);
 DECLARE_int32(flashinfer_workspace_buffer_size);
 
 DECLARE_bool(enable_rec_prefill_only);
-<<<<<<< HEAD
 
 DECLARE_bool(enable_constrained_decoding);
-=======
->>>>>>> 97354507 (feat: add rec framwork.)
