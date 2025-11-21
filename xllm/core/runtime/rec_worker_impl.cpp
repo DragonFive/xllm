@@ -296,7 +296,7 @@ ForwardInput RecWorkerImpl::prepare_inputs(Batch& batch) {
   return batch.prepare_rec_forward_input(options_.num_decoding_tokens(),
                                          0,  // min_decoding_batch_size
                                          context_.get_model_args(),
-                                         thread_pool_);
+                                         thread_pool_.get());
 }
 
 std::future<torch::Tensor> RecWorkerImpl::prepare_filter_mask_async(

@@ -255,8 +255,8 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
         .host_blocks_factor(options_.host_blocks_factor())
         .enable_kvcache_store(options_.enable_kvcache_store())
         .store_protocol(options_.store_protocol())
-        .store_master_server_entry(options_.store_master_server_entry())
-        .store_metadata_connstring(options_.store_metadata_connstring())
+        .store_master_server_address(options_.store_master_server_address())
+        .store_metadata_server(options_.store_metadata_server())
         .enable_continuous_kvcache(options_.enable_continuous_kvcache());
     engine_ = std::make_unique<RecEngine>(eng_options);
   } else {
