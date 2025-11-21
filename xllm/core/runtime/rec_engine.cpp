@@ -251,6 +251,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
   }
 
   Timer timer;
+  LOG(INFO) << "[debug1121]begin prepare input";
   auto forward_inputs = workers_[0]->prepare_inputs(batches[0]);
   COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
 
@@ -262,6 +263,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
   timer.reset();
   // Prefill step: Run the first model execution
   const auto& prefill_output = get_model_output(forward_inputs);
+  LOG(INFO) << "[debug1121]Prefill step completed";
   COUNTER_ADD(rec_first_token_latency_microseconds,
               timer.elapsed_microseconds());
 
@@ -280,6 +282,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
 
     timer.reset();
     decode_output = get_model_output(forward_inputs);
+    LOG(INFO) << "[debug1121]Decode step " << i << " completed";
     if (i == 0) {
       COUNTER_ADD(rec_second_token_latency_microseconds,
                   timer.elapsed_microseconds());
@@ -295,7 +298,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
   }
 
   batches[0].finish();
-
+  LOG(INFO) << "[debug1121]batch end";
   // Return the final model output
   return decode_output;
 }
