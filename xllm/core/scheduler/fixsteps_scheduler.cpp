@@ -296,7 +296,7 @@ void FixStepsScheduler::step(const absl::Duration& timeout) {
       return;
     }
     engine_->step(batch);
-    kv_cache_manager_->reset_copy_content();
+    kv_cache_manager_->reset_transfer_infos();
   } else {
     LOG(ERROR) << "FixStepsScheduler::step() not supported with "
                   "enable_schedule_overlap";

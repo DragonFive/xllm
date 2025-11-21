@@ -99,7 +99,7 @@ std::vector<Batch> BatchFactory::create_rec_batches(
     const std::vector<std::shared_ptr<Request>>& running_requests,
     const std::vector<Sequence*>& running_sequences,
     const std::vector<size_t>& running_sequences_budgets,
-    std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos)) {
+    std::vector<std::vector<BlockTransferInfo>>* swap_block_transfer_infos) {
   size_t num_prompt_tokens = 0;
   size_t num_generated_tokens = 0;
   std::vector<Batch> batches(dp_size_);
