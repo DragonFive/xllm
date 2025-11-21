@@ -149,6 +149,7 @@ RequestOutput Request::generate_output(const Tokenizer& tokenizer,
   output.finished = finished();
   output.cancelled = cancelled();
   sequences_group_->generate_outputs(output.outputs, tokenizer, thread_pool);
+  LOG(INFO) << "Generated output for request_id: " << request_id_;
   return output;
 }
 
