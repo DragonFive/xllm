@@ -120,6 +120,7 @@ class RecBatchInputBuilder : public BatchInputBuilder {
   };
 
   static HighPerformanceCache perf_cache_;
+  static uint64_t last_batch_id_;
 };
 
 }  // namespace xllm

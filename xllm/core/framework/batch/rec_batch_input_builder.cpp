@@ -33,6 +33,7 @@ namespace xllm {
 
 // Static member definition
 RecBatchInputBuilder::HighPerformanceCache RecBatchInputBuilder::perf_cache_;
+uint64_t RecBatchInputBuilder::last_batch_id_ = 0;
 
 RecBatchInputBuilder::RecBatchInputBuilder(
     const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups,
@@ -53,7 +54,14 @@ RecBatchInputBuilder::RecBatchInputBuilder(
           args,
           thread_pool),
       sequence_groups_(sequence_groups) {
-  // Reset high performance cache
+  // Clear cache only when batch_id changes (new request), preserve within same batch
+  if (batch_id != last_batch_id_) {
+    perf_cache_.cache_data.encoder_tokens.clear();
+    perf_cache_.cache_data.encoder_seq_lens.clear();
+    perf_cache_.cache_data.encoder_sparse_embeddings.clear();
+    perf_cache_.cache_data.decoder_context_embeddings.clear();
+    last_batch_id_ = batch_id;
+  }
   perf_cache_.memory_pool.reset();
 }
 
