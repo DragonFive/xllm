@@ -103,24 +103,35 @@ class RecBatchInputBuilder : public BatchInputBuilder {
       std::vector<torch::Tensor> decoder_context_embeddings;
     };
 
-    // Pre-created constant tensors
+    // Pre-created constant tensors - lazy initialized to avoid static
+    // initialization order issues
     torch::Tensor fixed_positions_tensor;
     torch::Tensor fixed_encoder_positions_tensor;
     torch::Tensor empty_tensor;
+    bool tensors_initialized = false;
 
     MemoryPool memory_pool;
     CacheData cache_data;
 
-    HighPerformanceCache() {
-      // Pre-create commonly used tensors to avoid repeated creation
-      fixed_positions_tensor = torch::tensor({0}, torch::kInt);
-      fixed_encoder_positions_tensor = torch::tensor({0}, torch::kInt);
-      empty_tensor = torch::tensor(std::vector<int32_t>{}, torch::kInt);
+    // Default constructor - does NOT create tensors to avoid static
+    // initialization order fiasco
+    HighPerformanceCache() = default;
+
+    // Lazy initialization of tensors - must be called before first use
+    void ensure_tensors_initialized() {
+      if (!tensors_initialized) {
+        fixed_positions_tensor = torch::tensor({0}, torch::kInt);
+        fixed_encoder_positions_tensor = torch::tensor({0}, torch::kInt);
+        empty_tensor = torch::tensor(std::vector<int32_t>{}, torch::kInt);
+        tensors_initialized = true;
+      }
     }
   };
 
-  static HighPerformanceCache perf_cache_;
-  static uint64_t last_batch_id_;
+  // Use function-local static to ensure proper initialization order
+  // (Meyers' Singleton pattern)
+  static HighPerformanceCache& get_perf_cache();
+  static uint64_t& get_last_batch_id();
 };
 
 }  // namespace xllm

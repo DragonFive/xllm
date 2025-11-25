@@ -31,9 +31,20 @@ limitations under the License.
 
 namespace xllm {
 
-// Static member definition
-RecBatchInputBuilder::HighPerformanceCache RecBatchInputBuilder::perf_cache_;
-uint64_t RecBatchInputBuilder::last_batch_id_ = 0;
+// Use Meyers' Singleton pattern to avoid static initialization order fiasco
+// This ensures the cache is initialized on first use, after all dependencies
+// (like PyTorch runtime) are properly initialized.
+RecBatchInputBuilder::HighPerformanceCache&
+RecBatchInputBuilder::get_perf_cache() {
+  static HighPerformanceCache cache;
+  cache.ensure_tensors_initialized();
+  return cache;
+}
+
+uint64_t& RecBatchInputBuilder::get_last_batch_id() {
+  static uint64_t last_batch_id = 0;
+  return last_batch_id;
+}
 
 RecBatchInputBuilder::RecBatchInputBuilder(
     const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups,
@@ -54,15 +65,20 @@ RecBatchInputBuilder::RecBatchInputBuilder(
           args,
           thread_pool),
       sequence_groups_(sequence_groups) {
-  // Clear cache only when batch_id changes (new request), preserve within same batch
-  if (batch_id != last_batch_id_) {
-    perf_cache_.cache_data.encoder_tokens.clear();
-    perf_cache_.cache_data.encoder_seq_lens.clear();
-    perf_cache_.cache_data.encoder_sparse_embeddings.clear();
-    perf_cache_.cache_data.decoder_context_embeddings.clear();
-    last_batch_id_ = batch_id;
+  // Get references to function-local statics (safe initialization)
+  auto& perf_cache = get_perf_cache();
+  auto& last_batch_id_ref = get_last_batch_id();
+
+  // Clear cache only when batch_id changes (new request), preserve within same
+  // batch
+  if (batch_id != last_batch_id_ref) {
+    perf_cache.cache_data.encoder_tokens.clear();
+    perf_cache.cache_data.encoder_seq_lens.clear();
+    perf_cache.cache_data.encoder_sparse_embeddings.clear();
+    perf_cache.cache_data.decoder_context_embeddings.clear();
+    last_batch_id_ref = batch_id;
   }
-  perf_cache_.memory_pool.reset();
+  perf_cache.memory_pool.reset();
 }
 
 std::vector<Sequence*> RecBatchInputBuilder::extract_sequences_from_groups(
@@ -79,6 +95,9 @@ std::vector<Sequence*> RecBatchInputBuilder::extract_sequences_from_groups(
 ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     uint32_t num_decoding_tokens,
     uint32_t min_decoding_batch_size) {
+  // Get reference to function-local static cache (safe initialization)
+  auto& perf_cache = get_perf_cache();
+
   // ========== Global constant cache ==========
   static const std::vector<int32_t> FIXED_POSITIONS = {0};
   static const torch::Tensor FIXED_ENCODER_POSITIONS =
@@ -118,7 +137,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
   // ========== High-performance encoder tokens construction ==========
   auto buildEncoderTokensOptimized = [&]() -> const std::vector<int32_t>& {
-    auto& cache_data = perf_cache_.cache_data;
+    auto& cache_data = perf_cache.cache_data;
 
     // encoder doesn't use cache key, because encoder doesn't use encoder_tokens
     // in non-first prefill scenarios, only uses encoder_seq_len
@@ -414,7 +433,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   // ========== High-performance ForwardInput construction ==========
   ForwardInput forward_input;
   auto& input_params = forward_input.input_params;
-  auto& cache_data = perf_cache_.cache_data;
+  auto& cache_data = perf_cache.cache_data;
 
   // Initialize key fields for asynchronous tasks
   const int64_t bs = sequence_groups_.size();
@@ -485,14 +504,14 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
           }
         });
     */
-    if (!perf_cache_.cache_data.decoder_context_embeddings.empty()) {
+    if (!perf_cache.cache_data.decoder_context_embeddings.empty()) {
       // Task 3: Synchronously process decoder_embedding, inner group dimension
       // parallelization optimization
 
       // Optimization: Directly get shape information from first embedding to
       // avoid torch::cat
       auto first_embedding =
-          perf_cache_.cache_data.decoder_context_embeddings[0];
+          perf_cache.cache_data.decoder_context_embeddings[0];
       auto original_shape = first_embedding.sizes();
       int64_t context_len = original_shape[0];
       int64_t hidden_size = original_shape[1];
@@ -549,7 +568,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
              batch_stride,
              group_stride,
              context_size,
-             embeddings = perf_cache_.cache_data.decoder_context_embeddings,
+             embeddings = perf_cache.cache_data.decoder_context_embeddings,
              dst_tensor = combined_embedding,
              promise = std::move(promise)]() mutable {
               // Copy context_embedding for specified group range of each batch
@@ -616,7 +635,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     input_params.global_empty_kv_cache = true;
     input_params.kv_max_seq_len = seq_len + num_decoder_embeddings;
     input_params.q_max_seq_len = seq_len + num_decoder_embeddings;
-    forward_input.positions = perf_cache_.fixed_positions_tensor;
+    forward_input.positions = perf_cache.fixed_positions_tensor;
 
     // Wait and collect results
     forward_input.token_ids = token_ids_future.get();
@@ -661,7 +680,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       input_params.rec_params->encoder_seq_lens = cache_data.encoder_seq_lens;
     }
     input_params.rec_params->encoder_positions =
-        perf_cache_.fixed_encoder_positions_tensor;
+        perf_cache.fixed_encoder_positions_tensor;
   } else {
     // Single-threaded execution (original logic)
     // Optimization: Use torch::empty+std::memcpy instead of
@@ -675,7 +694,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     std::memcpy(forward_input.token_ids.data_ptr<int>(),
                 flatten_tokens_vec.data(),
                 flatten_tokens_vec.size() * sizeof(int));
-    forward_input.positions = perf_cache_.fixed_positions_tensor;
+    forward_input.positions = perf_cache.fixed_positions_tensor;
 
     if (!encoder_tokens.empty()) {
       // Set RecModelInputParams encoder data
@@ -696,7 +715,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
                   encoder_tokens.size() * sizeof(int));
     }
     input_params.rec_params->encoder_positions =
-        perf_cache_.fixed_encoder_positions_tensor;
+        perf_cache.fixed_encoder_positions_tensor;
     // Pre-allocate and batch fill
     std::vector<int32_t> cu_seq_lens, q_cu_seq_lens;
 #if defined(USE_NPU)
@@ -781,7 +800,6 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
     // time-consuming)
     thread_pool_->schedule([&input_params,
                             num_sequences,
-                            &perf_cache_,
                             &block_tables_promise]() mutable {
       try {
         std::vector<std::vector<int32_t>> empty_block_tables(num_sequences);
@@ -930,13 +948,13 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   input_params.rec_params->generated_tokens = std::move(generated_tokens);
 
   // Process sparse_embedding: Efficiently concatenate from cache_data
-  if (!perf_cache_.cache_data.encoder_sparse_embeddings.empty()) {
+  if (!perf_cache.cache_data.encoder_sparse_embeddings.empty()) {
     // Use torch::cat for efficient concatenation, concatenate along dim=0
     input_params.rec_params->encoder_sparse_embedding =
-        torch::cat(perf_cache_.cache_data.encoder_sparse_embeddings, /*dim=*/0);
+        torch::cat(perf_cache.cache_data.encoder_sparse_embeddings, /*dim=*/0);
   }
 
-  if (!perf_cache_.cache_data.decoder_context_embeddings.empty()) {
+  if (!perf_cache.cache_data.decoder_context_embeddings.empty()) {
     // Get group_width
     int64_t group_width = input_params.rec_params->group_width;
     if (group_width == 1 && seq_len == 0) {
@@ -944,11 +962,11 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       // unnecessary torch::cat
       if (bs == 1) {
         input_params.rec_params->decoder_context_embedding =
-            perf_cache_.cache_data.decoder_context_embeddings[0];
+            perf_cache.cache_data.decoder_context_embeddings[0];
       } else {
         // Use torch::cat for efficient concatenation, concatenate along dim=0
         auto original_context_embedding = torch::cat(
-            perf_cache_.cache_data.decoder_context_embeddings, /*dim=*/0);
+            perf_cache.cache_data.decoder_context_embeddings, /*dim=*/0);
         input_params.rec_params->decoder_context_embedding =
             original_context_embedding;
       }
@@ -956,7 +974,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       // Handle the scenario where group_width==1 and seq_len>0
       // Get information from the first embedding
       const auto& first_embedding =
-          perf_cache_.cache_data.decoder_context_embeddings[0];
+          perf_cache.cache_data.decoder_context_embeddings[0];
       auto original_shape = first_embedding.sizes();
       int64_t context_len = original_shape[0];
       int64_t hidden_size = original_shape[1];
@@ -981,7 +999,7 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
       // Copy context_embedding for each batch
       for (int64_t b = 0; b < bs; ++b) {
         const void* batch_src =
-            perf_cache_.cache_data.decoder_context_embeddings[b].data_ptr();
+            perf_cache.cache_data.decoder_context_embeddings[b].data_ptr();
         auto* batch_dst = static_cast<char*>(dst_data) + b * batch_stride;
         std::memcpy(batch_dst, batch_src, context_size);
       }

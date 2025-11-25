@@ -135,7 +135,7 @@ std::vector<Batch> BatchFactory::create_rec_batches(
     batches[dp_rank].add(seq_group);
   }
 
-  /*for (int i = 0; i < dp_size_; i++) {
+  for (int i = 0; i < dp_size_; i++) {
     if (!batches[i].empty()) {
       if (swap_block_transfer_infos != nullptr &&
           swap_block_transfer_infos->size() == dp_size_) {
@@ -143,7 +143,7 @@ std::vector<Batch> BatchFactory::create_rec_batches(
             &(swap_block_transfer_infos->at(i)));
       }
     }
-  }*/
+  }
 
   COUNTER_ADD(num_processing_tokens_total_prompt, num_prompt_tokens);
   COUNTER_ADD(num_processing_tokens_total_generated, num_generated_tokens);
