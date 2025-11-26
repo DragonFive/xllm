@@ -41,10 +41,6 @@ RecBatchInputBuilder::get_perf_cache() {
   return cache;
 }
 
-uint64_t& RecBatchInputBuilder::get_last_batch_id() {
-  static uint64_t last_batch_id = 0;
-  return last_batch_id;
-}
 
 RecBatchInputBuilder::RecBatchInputBuilder(
     const std::vector<std::unique_ptr<SequencesGroup>>& sequence_groups,
@@ -67,17 +63,6 @@ RecBatchInputBuilder::RecBatchInputBuilder(
       sequence_groups_(sequence_groups) {
   // Get references to function-local statics (safe initialization)
   auto& perf_cache = get_perf_cache();
-  auto& last_batch_id_ref = get_last_batch_id();
-
-  // Clear cache only when batch_id changes (new request), preserve within same
-  // batch
-  if (batch_id != last_batch_id_ref) {
-    perf_cache.cache_data.encoder_tokens.clear();
-    perf_cache.cache_data.encoder_seq_lens.clear();
-    perf_cache.cache_data.encoder_sparse_embeddings.clear();
-    perf_cache.cache_data.decoder_context_embeddings.clear();
-    last_batch_id_ref = batch_id;
-  }
   perf_cache.memory_pool.reset();
 }
 

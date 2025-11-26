@@ -131,7 +131,6 @@ class RecBatchInputBuilder : public BatchInputBuilder {
   // Use function-local static to ensure proper initialization order
   // (Meyers' Singleton pattern)
   static HighPerformanceCache& get_perf_cache();
-  static uint64_t& get_last_batch_id();
 };
 
 }  // namespace xllm
