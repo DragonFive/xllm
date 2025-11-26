@@ -154,12 +154,12 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
   if (FLAGS_backend == "rec") {
     auto output_tensor = response.mutable_output_tensors()->Add();
     output_tensor->set_name("rec_result");
-    // TODO: replace true with flags after converter merge
     if (FLAGS_enable_constrained_decoding) {
       output_tensor->set_datatype(proto::DataType::INT64);
       output_tensor->mutable_shape()->Add(req_output.outputs.size());
       output_tensor->mutable_shape()->Add(1);  // Single item per output
-
+      // TODO: add following when next pr.
+      /*
       auto context = output_tensor->mutable_contents();
       for (int i = 0; i < req_output.outputs.size(); ++i) {
         if (req_output.outputs[i].item_ids.has_value()) {
@@ -167,6 +167,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
               req_output.outputs[i].item_ids.value());
         }
       }
+      */
     } else {
       output_tensor->set_datatype(proto::DataType::INT32);
 
@@ -349,8 +350,11 @@ void RecCompletionServiceImpl::process_async_impl(
   auto saved_request_id = request_params.request_id;
   master_->handle_request(std::move(rpc_request.prompt()),
                           std::move(prompt_tokens),
-                          std::move(mm_data),
+                          // TODO. add following when next pr.
+                          // std::move(mm_data),
                           std::move(request_params),
+                          // TODO. delete this when next pr.
+                          call.get(),
                           request_callback(call,
                                            model,
                                            master_,

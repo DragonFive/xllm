@@ -70,10 +70,10 @@ APIService::APIService(Master* master,
         std::make_unique<ImageGenerationServiceImpl>(
             dynamic_cast<DiTMaster*>(master), model_names);
   } else if (FLAGS_backend == "rec") {
+    // TODO. delete this when next pr.
+    using RecMaster = LLMMaster;
     rec_completion_service_impl_ = std::make_unique<RecCompletionServiceImpl>(
-        dynamic_cast<LLMMaster*>(master),
-    // TODO. add following when next pr.
-    // dynamic_cast<RecMaster*>(master), model_names);
+        dynamic_cast<RecMaster*>(master), model_names);
   }
   models_service_impl_ =
       ServiceImplFactory<ModelsServiceImpl>::create_service_impl(
