@@ -28,7 +28,8 @@ limitations under the License.
 #include "core/framework/request/mm_data.h"
 #include "core/framework/request/request_output.h"
 #include "core/runtime/llm_master.h"
-#include "core/runtime/rec_master.h"
+// TODO. add following when next pr.
+// #include "core/runtime/rec_master.h"
 #include "core/util/utils.h"
 
 #define likely(x) __builtin_expect(!!(x), 1)
@@ -152,7 +153,7 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
 
   if (FLAGS_backend == "rec") {
     auto output_tensor = response.mutable_output_tensors()->Add();
-    output_tensor->set_name("omnirec_result");
+    output_tensor->set_name("rec_result");
     // TODO: replace true with flags after converter merge
     if (FLAGS_enable_constrained_decoding) {
       output_tensor->set_datatype(proto::DataType::INT64);

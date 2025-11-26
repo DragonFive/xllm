@@ -41,8 +41,9 @@ class CompletionServiceImpl final : public APIServiceImpl<CompletionCall> {
   DISALLOW_COPY_AND_ASSIGN(CompletionServiceImpl);
   LLMMaster* master_ = nullptr;
 };
-
-class RecMaster;
+// TODO. add following when next pr.
+// class RecMaster;
+using RecMaster = LLMMaster;
 // a class to handle completion requests
 class RecCompletionServiceImpl final : public APIServiceImpl<CompletionCall> {
  public:
