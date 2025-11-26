@@ -99,9 +99,10 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
   auto& perf_cache = get_perf_cache();
 
   // ========== Global constant cache ==========
+  // Note: FIXED_POSITIONS is a simple vector, safe for static initialization
   static const std::vector<int32_t> FIXED_POSITIONS = {0};
-  static const torch::Tensor FIXED_ENCODER_POSITIONS =
-      torch::tensor({0}, torch::kInt);
+  // Note: FIXED_ENCODER_POSITIONS is now obtained from perf_cache to avoid
+  // static initialization order issues with torch::Tensor
 
   // ========== Fast sequence information extraction ==========
   const int32_t num_sequences =
@@ -670,11 +671,11 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
 
     // encoder_seq_lens_tensor has been changed to serial execution, use the
     // constructed variable directly
+    // Ensure rec_params is initialized before accessing
+    if (!input_params.rec_params.has_value()) {
+      input_params.rec_params = RecModelInputParams{};
+    }
     if (encoder_seq_lens_tensor.defined()) {
-      // Set RecModelInputParams encoder data
-      if (!input_params.rec_params.has_value()) {
-        input_params.rec_params = RecModelInputParams{};
-      }
       input_params.rec_params->encoder_seq_lens_tensor =
           std::move(encoder_seq_lens_tensor);
       input_params.rec_params->encoder_seq_lens = cache_data.encoder_seq_lens;
@@ -696,12 +697,11 @@ ForwardInput RecBatchInputBuilder::build_rec_forward_input(
                 flatten_tokens_vec.size() * sizeof(int));
     forward_input.positions = perf_cache.fixed_positions_tensor;
 
+    // Ensure rec_params is initialized before accessing
+    if (!input_params.rec_params.has_value()) {
+      input_params.rec_params = RecModelInputParams{};
+    }
     if (!encoder_tokens.empty()) {
-      // Set RecModelInputParams encoder data
-      if (!input_params.rec_params.has_value()) {
-        input_params.rec_params = RecModelInputParams{};
-      }
-
       // Optimization: Use torch::empty+std::memcpy instead of
       // torch::from_blob().clone()
       input_params.rec_params->encoder_token_ids =
