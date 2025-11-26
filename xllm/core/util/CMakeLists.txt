@@ -31,8 +31,8 @@ cc_library(
   SRCS
     device_name_utils.cpp
     env_var.cpp
-    // TODO. add following at next pr.
-    // hash_util.cpp
+    # TODO. add following at next pr.
+    # hash_util.cpp
     json_reader.cpp
     net.cpp
     pretty_print.cpp
