@@ -389,19 +389,12 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
     : NpuBaseLayer(context), is_decoder_(is_decoder), layer_id_(layer_id) {
   // LOG(INFO) << "ONERECBlockLayerImpl constructor: " << layer_id_ << ":"
   //           << is_decoder_;
-  param_from_args(
-      prefill_param_, context.get_model_args(), parallel_args_, true);
+  auto& args = context.get_model_args();
+  param_from_args(prefill_param_, args, parallel_args_, true);
   prefill_param_.isDecoder = is_decoder;
-  // param_from_args(decode_param_, args, parallel_args, false);
-  // decode_param_.isDecoder = is_decoder;
+  param_from_args(decode_param_, args, parallel_args, false);
+  decode_param_.isDecoder = is_decoder;
 
-  // Initialize decoder_prefill_only_decode_param_ if enable_onerec_prefill_only
-  // is true if (FLAGS_enable_rec_prefill_only && is_decoder) {
-  //   param_from_args(
-  //       decoder_prefill_only_decode_param_, args, parallel_args, true);
-  //   decoder_prefill_only_decode_param_.isDecoder = is_decoder;
-  //   decoder_prefill_only_decode_param_.emptyCrossAttn = false;
-  // }
   // Choose correct weight count based on use_moe
   int weight_count = prefill_param_.use_moe ? ONEREC_MOE_WEIGHT_COUNT_PER_LAYER
                                             : ONEREC_WEIGHT_COUNT_PER_LAYER;
@@ -442,6 +435,8 @@ void NpuOneRecBlockLayerImpl::param_from_args(
     bool isPrefill,
     const ModelInputParams* input_params) {
   LOG(INFO) << "begin param_from_args";
+  // only open two param in decoder.
+  param.use_xattn = is_decoder_;
   param.isFA = false;  // need page
   param.isPrefill = isPrefill;
   param.isBF16 = args.dtype() == "bfloat16";
@@ -955,24 +950,9 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
   LOG(INFO) << "begin init prefill param: " << prefill_param_.isPrefill
             << " is_decoder_: " << is_decoder_ << " layer_id_: " << layer_id_;
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
-  // LOG(INFO) << "after init prefill param: " << decode_param_.isPrefill
-  //           << " is_decoder_: " << is_decoder_;
-  // For ONEREC decoder, only use prefill_node_ for both prefill and decode
-  // stages if (is_decoder_) {
-  //   LOG(INFO) << "begin init decode param: " << decode_param_.isPrefill;
-
-  //   // Initialize decoder_prefill_only_decode_node if
-  //   enable_onerec_prefill_only is
-  //   // true
-  //   if (FLAGS_enable_rec_prefill_only) {
-  //     LOG(INFO) << "begin init decoder_prefill_only_decode_param";
-  //     CHECK_OPERATION_STATUS_RETURN(
-  //         init_node(decoder_prefill_only_decode_node_,
-  //                   decoder_prefill_only_decode_param_));
-  //   } else {
-  //     CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
-  //   }
-  // }
+  if (is_decoder_ && !FLAGS_enable_rec_prefill_only) {
+    CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
+  }
   return atb::NO_ERROR;
 }
 
@@ -1018,11 +998,16 @@ int64_t NpuOneRecBlockLayerImpl::init_node(
   uint32_t required_tensors;
   if (is_decoder_) {
     // For decoder: check if using MoE variant
+    auto extra_data = 13;
+    if (prefill_param_.use_xattn) {
+      extra_data += 4;
+    }
     if (param.use_moe) {
-      required_tensors =
-          ONEREC_MOE_WEIGHT_COUNT_PER_LAYER + 18;  // 97 + 4 + 14 = 115
+      required_tensors = ONEREC_MOE_WEIGHT_COUNT_PER_LAYER + 4 +
+                         extra_data;  // 97 + 4 + 13 = 114
     } else {
-      required_tensors = ONEREC_WEIGHT_COUNT_PER_LAYER + 14;  // 79 + 14 = 93
+      required_tensors =
+          ONEREC_WEIGHT_COUNT_PER_LAYER + extra_data;  // 79 + 13 = 92
     }
   } else {
     required_tensors = 84;  // Encoder: 79 weights + 5 non-weights
@@ -1076,35 +1061,32 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   // prefill_param_.inputParams = &input_params;
   // decode_param_.inputParams = &input_params;
 
-  if (input_params.rec_params && input_params.rec_params->rec_stage ==
-                                     RecModelInputParams::RecStage::PREFILL) {
+  if (input_params.rec_params && input_params[0].is_prefill) {
     // Prefill stage
     if (is_decoder_) {
-      if (FLAGS_enable_rec_prefill_only) {
-        if (prefill_param_.use_moe) {
-          build_decoder_moe_node_variant_pack(prefill_node_,
-                                              x,
-                                              attn_mask,
-                                              kv_cache,
-                                              input_params,
-                                              true,
-                                              encoder_output,
-                                              node_id,
-                                              expert_array);
-        } else {
-          build_decoder_node_variant_pack(prefill_node_,
-                                          x,
-                                          attn_mask,
-                                          kv_cache,
-                                          input_params,
-                                          true,
-                                          encoder_output,
-                                          node_id);
-        }
-        st = execute_node(prefill_node_, node_id, event, event_flag);
-        LOG_IF(FATAL, st != 0)
-            << modelName_ << " execute prefill layer fail, error code: " << st;
+      if (prefill_param_.use_moe) {
+        build_decoder_moe_node_variant_pack(prefill_node_,
+                                            x,
+                                            attn_mask,
+                                            kv_cache,
+                                            input_params,
+                                            true,
+                                            encoder_output,
+                                            node_id,
+                                            expert_array);
+      } else {
+        build_decoder_node_variant_pack(prefill_node_,
+                                        x,
+                                        attn_mask,
+                                        kv_cache,
+                                        input_params,
+                                        true,
+                                        encoder_output,
+                                        node_id);
       }
+      st = execute_node(prefill_node_, node_id, event, event_flag);
+      LOG_IF(FATAL, st != 0)
+          << modelName_ << " execute prefill layer fail, error code: " << st;
     } else {
       // Encoder prefill
       build_encoder_node_variant_pack(
@@ -1256,10 +1238,11 @@ void NpuOneRecBlockLayerImpl::build_decoder_moe_node_variant_pack(
   setup_common_decoder_tensors(node,
                                x,
                                attn_mask,
+                               kv_cache,
                                input_params,
                                encoder_output,
-                               ONEREC_MOE_WEIGHT_COUNT_PER_LAYER + 4);
-
+                               ONEREC_MOE_WEIGHT_COUNT_PER_LAYER + 4,
+                               node_id);
   // Add MoE-specific tensors (expert_array, expert_group, one_hot, zero_hot)
   // These tensors are required by ONEREC MoE kernel implementation
   // They should directly follow the weight tensors as defined in kernel
@@ -1292,9 +1275,11 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     atb_speed::Model::Node& node,
     torch::Tensor& x,
     at::Tensor& attn_mask,
+    KVCache& kv_cache,
     ModelInputParams& input_params,
     torch::Tensor* encoder_output,
-    int start_tensor_idx) {
+    int start_tensor_idx,
+    int node_id) {
   // Create internal tensor from input
   internalTensors = atb_speed::Utils::AtTensor2Tensor(x);
 
@@ -1308,8 +1293,15 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
       atb_speed::Utils::AtTensor2Tensor(attn_mask);
 
   // KV cache placeholders
-  node.variantPack.inTensors.at(idx++) = placeholder;
-  node.variantPack.inTensors.at(idx++) = placeholder;
+  if (FLAGS_enable_rec_prefill_only) {
+    node.variantPack.inTensors.at(idx++) = placeholder;
+    node.variantPack.inTensors.at(idx++) = placeholder;
+  } else {
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
+  }
 
   // Sequence length
   if (input_params.kv_seq_lens.defined()) {
@@ -1369,10 +1361,11 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   idx++;
 
   // Cross attention placeholders
-  for (int i = 0; i < 3; i++) {
-    node.variantPack.inTensors.at(idx) = placeholder;
-    node.variantPack.inTensors.at(idx++).hostData = placeholder_vec_.data();
-  }
+  // "in_cross_k_cache", "in_cross_v_cache"
+  node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+      input_params.rec_params->shared_k_caches[node_id]);
+  node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+      input_params.rec_params->shared_v_caches[node_id]);
 
   // Encoder sequence length
   if (input_params.rec_params) {
@@ -1380,6 +1373,16 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
         input_params.rec_params->encoder_seq_lens_tensor);
     node.variantPack.inTensors.at(idx++).hostData =
         input_params.rec_params->encoder_seq_lens.data();
+  }
+  if (prefill_param_.use_xattn) {
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        input_params.shared_v_caches[node_id]);
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        input_params.shared_v_caches[node_id]);
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.beam_width_tensor);
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(input_params.current_round_tensor);
   }
 
   // Setup output tensor
@@ -1415,10 +1418,11 @@ void NpuOneRecBlockLayerImpl::build_decoder_node_variant_pack(
   int tensor_idx = setup_common_decoder_tensors(node,
                                                 x,
                                                 attn_mask,
+                                                kv_cache,
                                                 input_params,
                                                 encoder_output,
-                                                ONEREC_WEIGHT_COUNT_PER_LAYER);
-
+                                                ONEREC_WEIGHT_COUNT_PER_LAYER,
+                                                node_id);
   // Fill remaining tensors with placeholders (for optional features like lora,
   // kv_quant, etc.)
   // Record the number of filled placeholders

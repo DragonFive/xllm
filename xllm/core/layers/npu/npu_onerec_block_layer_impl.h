@@ -96,9 +96,11 @@ class NpuOneRecBlockLayerImpl : public NpuBaseLayer {
   int setup_common_decoder_tensors(atb_speed::Model::Node& node,
                                    torch::Tensor& x,
                                    at::Tensor& attn_mask,
+                                   KVCache& kv_cache,
                                    ModelInputParams& input_params,
                                    torch::Tensor* encoder_output = nullptr,
-                                   int start_tensor_idx = 0);
+                                   int start_tensor_idx = 0,
+                                   int node_id = 0);
 
   // Expert weights processing functions
   void resize_experts_weights(int num_of_device_experts);

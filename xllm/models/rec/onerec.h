@@ -489,8 +489,7 @@ class OneRecStackImpl : public torch::nn::Module {
     auto seq_length = input_params.q_max_seq_len;
 
     // Determine stage based on input_params
-    bool is_prefill = input_params.rec_params->rec_stage ==
-                      RecModelInputParams::RecStage::PREFILL;
+    bool is_prefill = input_params.is_prefill;
 
     // Compute sequence lengths for position bias calculation
     auto [query_length, key_length] =
