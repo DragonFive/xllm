@@ -30,6 +30,7 @@ limitations under the License.
 #include "llm/qwen3_embedding.h"  // IWYU pragma: keep
 #include "vlm/minicpmv.h"         // IWYU pragma: keep
 #include "vlm/qwen2_5_vl.h"       // IWYU pragma: keep
+#include "rec/onerec.h"
 #endif
 
 #include "llm/llm_model_base.h"  // IWYU pragma: keep
