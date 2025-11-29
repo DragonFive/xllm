@@ -34,6 +34,15 @@ limitations under the License.
 
 namespace xllm {
 
+// Number of decoder BOS tokens to add for rec models
+static constexpr size_t kDecoderBosTokenCount = 1;
+static constexpr size_t kDecoderMaxTokenCount = 4;
+
+// rec model specific: static constants for embedding names
+const std::string Sequence::ENCODER_SPARSE_EMBEDDING_NAME = "sparse_embedding";
+const std::string Sequence::DECODER_CONTEXT_EMBEDDING_NAME =
+    "decoder_context_embedding";
+
 Sequence::Sequence(size_t index,
                    const std::vector<int32_t>& prompt_token_ids,
                    torch::Tensor input_embedding,
@@ -44,25 +53,30 @@ Sequence::Sequence(size_t index,
       mm_data_(mm_data),
       latest_generate_time_(absl::Now()),
       sequence_params_(seq_params),
-      decoder_(std::move(decoder)) {
-  CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
-  auto capacity = sequence_params_.seq_capacity;
-  CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
+      decoder_(std::move(decoder)),
+      is_rec_model_(seq_params.is_rec_model) {
+  if (is_rec_model_) {
+  } else {
+    CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
+    auto capacity = sequence_params_.seq_capacity;
+    CHECK_GT(capacity, prompt_token_ids.size()) << "capacity too small";
 
-  num_prompt_tokens_ = prompt_token_ids.size();
-  volatile_num_prompt_tokens_ = num_prompt_tokens_;
-  tokens_.resize(capacity);
+    num_prompt_tokens_ = prompt_token_ids.size();
+    volatile_num_prompt_tokens_ = num_prompt_tokens_;
+    tokens_.resize(capacity);
 
-  // init logprob state
-  logprob_state_ = std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
+    // init logprob state
+    logprob_state_ =
+        std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
 
-  // add the prompt tokens
-  for (const auto token_id : prompt_token_ids) {
-    tokens_[num_tokens_++] = token_id;
-    token_to_count_map_[token_id]++;
+    // add the prompt tokens
+    for (const auto token_id : prompt_token_ids) {
+      tokens_[num_tokens_++] = token_id;
+      token_to_count_map_[token_id]++;
+    }
+    input_embedding_ = input_embedding;
+    cur_generated_token_idx_ = num_prompt_tokens_;
   }
-  input_embedding_ = input_embedding;
-  cur_generated_token_idx_ = num_prompt_tokens_;
 }
 
 Sequence::Sequence(const Sequence& other)
@@ -84,6 +98,10 @@ Sequence::Sequence(const Sequence& other)
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
+      num_encoder_tokens_(other.num_encoder_tokens_),
+      num_decoder_embeddings_(other.num_decoder_embeddings_),
+      encoder_tokens_(other.encoder_tokens_),
+      is_rec_model_(other.is_rec_model_),
       volatile_num_prompt_tokens_(other.volatile_num_prompt_tokens_),
       embedding_id_(other.embedding_id_),
       finished_(other.finished_),
@@ -104,8 +122,10 @@ void Sequence::append_token(const Token& token) {
   if (!in_step_decode_round_) {
     CHECK(!finished_) << "cannot append token to a finished sequence";
   }
-  CHECK(kv_state_.kv_cache_tokens_num() > 0 && !is_prefill_stage())
-      << "cannot append token to a prefill sequence";
+  if (!is_rec_model()) {
+    CHECK(kv_state_.kv_cache_tokens_num() > 0 && !is_prefill_stage())
+        << "cannot append token to a prefill sequence";
+  }
 
   if (!sequence_params_.enable_schedule_overlap) {
     // check if the token is the first token after the prompt
@@ -340,7 +360,21 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
       break;
     }
   }
+  SequenceOutput output;
+  output.index = index_;
 
+  if (output_embedding_.defined()) {
+    output.embedding = output_embedding_;
+  }
+
+  if (finish_reason_ != FinishReason::NONE) {
+    output.finish_reason = finish_reason_.to_string();
+  }
+
+  if (is_rec_model()) {
+    output.token_ids = ids.slice(num_prompt_tokens_, size);
+    return output;
+  }
   // record the start index of token ids
   const size_t start = decoder_.output_offset();
 
@@ -357,16 +391,7 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
     ss << decoder_.decode(ids.slice(0, end), tokenizer);
   }
 
-  SequenceOutput output;
-  output.index = index_;
   output.text = ss.str();
-  if (output_embedding_.defined()) {
-    output.embedding = output_embedding_;
-  }
-
-  if (finish_reason_ != FinishReason::NONE) {
-    output.finish_reason = finish_reason_.to_string();
-  }
 
   const size_t end = decoder_.output_offset();
   output.token_ids = ids.slice(start, end);
@@ -413,7 +438,9 @@ bool Sequence::finished() const {
   if (in_step_decode_round_) {
     return false;
   }
-
+  if (is_rec_model() && num_tokens_ == num_prompt_tokens_) {
+    return false;
+  }
   // Embedding sequence never be finished until it updates its embeddings
   if (finish_status_invalidated_ &&
       sequence_params_.sampling_param->is_embeddings) {

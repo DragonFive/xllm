@@ -206,3 +206,5 @@ DECLARE_int64(buffer_size_per_seq);
 DECLARE_int64(max_token_per_req);
 
 DECLARE_bool(enable_beam_search_kernel);
+
+DECLARE_bool(enable_rec_prefill_only);

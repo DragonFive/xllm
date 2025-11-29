@@ -350,6 +350,17 @@ struct ModelArgs {
   PROPERTY(int64_t, relative_attention_num_buckets) = 0;
   PROPERTY(int64_t, relative_attention_max_distance) = 0;
 
+  PROPERTY(int64_t, n_encoder_layers) = 0;
+  PROPERTY(int64_t, decoder_head_dim) = 0;
+  PROPERTY(int64_t, decoder_n_heads) = 0;
+  PROPERTY(std::optional<int64_t>, decoder_n_kv_heads);
+  PROPERTY(bool, use_absolute_position_embedding) = false;
+
+  PROPERTY(bool, use_moe) = false;
+  PROPERTY(std::string, moe_score_func);
+  PROPERTY(float, moe_route_scale) = 1.0f;
+  PROPERTY(bool, moe_use_shared_experts) = false;
+
   // scheduler related args
   PROPERTY(int64_t, num_train_timesteps) = 0;
   PROPERTY(int64_t, shift) = 0;

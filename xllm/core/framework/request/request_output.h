@@ -74,6 +74,8 @@ struct SequenceOutput {
 
   // the embeddings of the prompt token
   std::optional<std::vector<float>> embeddings;
+  // item_id for rec.
+  std::optional<int64_t> item_ids;
 };
 
 struct RequestOutput {

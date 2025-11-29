@@ -11,6 +11,7 @@ proto_library(
     multimodal.proto
     embedding.proto
     rerank.proto
+    rec.proto
     models.proto
     worker.proto
     disagg_pd.proto

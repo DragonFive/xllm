@@ -2,7 +2,7 @@ syntax = "proto3";
 
 option go_package = "jd.com/jd-infer/xllm;xllm";
 package xllm.proto;
-
+import "rec.proto";
 import "common.proto";
 
 // Next ID: 26
@@ -95,6 +95,8 @@ message CompletionRequest {
   optional Priority priority = 28;
 
   optional int32 beam_width = 29;
+  // tensor for rec embedding.
+  repeated InferInputTensor input_tensors = 30;
 }
 
 message LogProbs {
@@ -142,5 +144,7 @@ message CompletionResponse {
 
   // usage statistics for the completion request.
   Usage usage = 6;
+  // for rec output
+  repeated InferOutputTensor output_tensors = 7;
 }
 

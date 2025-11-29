@@ -14,6 +14,7 @@ cc_library(
     rerank_service_impl.h
     non_stream_call.h
     service_impl_factory.h
+    rec_completion_service_impl.h
     stream_call.h
     models_service_impl.h
   SRCS
@@ -23,6 +24,7 @@ cc_library(
     chat_service_impl.cpp
     embedding_service_impl.cpp
     image_generation_service_impl.cpp
+    rec_completion_service_impl.cpp
     models_service_impl.cpp
     rerank_service_impl.cpp
   DEPS

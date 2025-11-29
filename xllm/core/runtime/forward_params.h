@@ -35,6 +35,7 @@ class WorkerType {
     LLM,   // LLM
     VLM,   // VLM
     DIT,   // DIT
+    REC,   // Rec
     ELM,   // Embedding LM
     EVLM,  // Embedding VLM
   };
@@ -47,6 +48,8 @@ class WorkerType {
       value_ = VLM;
     } else if (str == "DIT") {
       value_ = DIT;
+    } else if (str == "REC") {
+      value_ = REC;
     } else if (str == "ELM") {
       value_ = ELM;
     } else if (str == "EVLM") {
@@ -73,6 +76,8 @@ class WorkerType {
       return "VLM";
     } else if (this->value_ == DIT) {
       return "DIT";
+    } else if (this->value_ == REC) {
+      return "REC";
     } else if (this->value_ == ELM) {
       return "ELM";
     } else if (this->value_ == EVLM) {

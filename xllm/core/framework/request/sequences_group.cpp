@@ -185,7 +185,7 @@ void SequencesGroup::process_beam_search() {
   if (!check_beam_search()) {
     return;
   }
-
+  Timer timer;
   if (sequences_.size() == 1) {
     auto* base = sequences_[0].get();
     if (base->has_beam_result()) {
@@ -328,6 +328,8 @@ void SequencesGroup::process_beam_search() {
 
   CHECK_EQ(sequences_.size(), beam_width);
   update_for_sequence(0, beam_width);
+  HISTOGRAM_OBSERVE(expand_beam_latency_microseconds,
+                    timer.elapsed_microseconds());
 }
 
 }  // namespace xllm

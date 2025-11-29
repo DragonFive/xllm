@@ -392,3 +392,9 @@ DEFINE_int32(beam_width, 1, "Beam width for beam search.");
 DEFINE_int32(max_decode_rounds,
              0,
              "Maximum number of decode rounds for multi-step decoding. 0 means disabled.");
+
+// rec prefill-only mode
+DEFINE_bool(enable_rec_prefill_only,
+            false,
+            "Enable rec prefill-only mode (no decoder self-attention blocks "
+            "allocation)");
