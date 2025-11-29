@@ -34,7 +34,6 @@ limitations under the License.
 #include "runtime/dit_master.h"
 #include "runtime/llm_engine.h"
 #include "runtime/llm_master.h"
-#include "runtime/rec_engine.h"
 #include "runtime/rec_master.h"
 #include "runtime/speculative_engine.h"
 #include "runtime/vlm_engine.h"
@@ -177,7 +176,7 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
         .devices(devices)
-        .block_size(options_.block_size())
+        .block_size(opt_block_size)
         .max_cache_size(options_.max_cache_size())
         .max_memory_utilization(options_.max_memory_utilization())
         .enable_prefix_cache(options_.enable_prefix_cache())
@@ -216,7 +215,7 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
         .devices(devices)
-        .block_size(options_.block_size())
+        .block_size(opt_block_size)
         .max_cache_size(options_.max_cache_size())
         .max_memory_utilization(options_.max_memory_utilization())
         .enable_prefix_cache(options_.enable_prefix_cache())
@@ -244,7 +243,7 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
         .store_master_server_entry(options_.store_master_server_entry())
         .store_metadata_connstring(options_.store_metadata_connstring())
         .enable_continuous_kvcache(options_.enable_continuous_kvcache());
-    engine_ = std::make_unique<RecEngine>(eng_options);
+    engine_ = std::make_unique<LLMEngine>(eng_options);
   } else {
     LOG(WARNING) << "Not supported llm engine type: "
                  << static_cast<size_t>(type);

@@ -218,6 +218,48 @@ struct RawForwardInput {
   // decode kv cache shape planned by engine: [batch_size * beam_width,
   // n_kv_heads, step_rounds, head_dim]
   std::vector<int64_t> shared_kv_shape;
+
+  // ==== Rec specific fields (for onerec multi-step) ====
+  bool is_rec = false;
+
+  // encoder side
+  std::vector<int32_t> rec_encoder_seq_lens;
+  std::vector<int32_t> rec_encoder_seq_lens_tensor_data;
+  std::vector<int64_t> rec_encoder_seq_lens_tensor_shape;
+
+  std::vector<int32_t> rec_encoder_token_ids_data;
+  std::vector<int64_t> rec_encoder_token_ids_shape;
+
+  std::vector<int32_t> rec_encoder_positions_data;
+  std::vector<int64_t> rec_encoder_positions_shape;
+
+  std::vector<float> rec_encoder_sparse_embedding_data;
+  std::vector<int64_t> rec_encoder_sparse_embedding_shape;
+
+  // decoder context
+  std::vector<float> rec_decoder_context_embedding_data;
+  std::vector<int64_t> rec_decoder_context_embedding_shape;
+
+  // multi-round generated tokens (per sequence)
+  std::vector<std::vector<int32_t>> rec_generated_tokens;
+
+  // encoder-specific stats (bs, seq_len etc. use existing multi_step fields)
+  int32_t rec_encoder_max_seq_len = 0;
+
+  // Cross-attention KV cache shape: [batch_size * encoder_max_seq_len, n_kv_heads, head_dim]
+  std::vector<int64_t> rec_shared_cross_kv_shape;
+
+  // cross-attn placeholders (align with current single-step placeholder
+  // behavior)
+  std::vector<int32_t> rec_cross_attn_kv_cu_seq_lens_data;
+  std::vector<int64_t> rec_cross_attn_kv_cu_seq_lens_shape;
+  std::vector<int32_t> rec_cross_attn_kv_cu_seq_lens_vec;
+
+  std::vector<int32_t> rec_cross_attn_block_tables_data;
+  std::vector<int64_t> rec_cross_attn_block_tables_shape;
+
+  std::vector<int32_t> rec_cross_attn_new_cache_slots_data;
+  std::vector<int64_t> rec_cross_attn_new_cache_slots_shape;
 };
 
 struct RawSampleOutput {

@@ -59,6 +59,30 @@ class MultiStepBatchInputBuilder : public BatchInputBuilder {
       std::unordered_set<int32_t>* write_block_ids_ptr = nullptr) override;
 
  private:
+  // Rec-specific state for multi-step
+  struct RecMultiStepState {
+    // encoder side
+    std::vector<int32_t> encoder_seq_lens;
+    std::vector<int32_t> encoder_tokens_vec;  // Raw encoder tokens from all sequences
+    torch::Tensor encoder_seq_lens_tensor;
+    torch::Tensor encoder_token_ids;
+    torch::Tensor encoder_positions;
+    torch::Tensor encoder_sparse_embedding;
+    torch::Tensor decoder_context_embedding;
+
+    // multi-round generated tokens per sequence
+    std::vector<std::vector<int32_t>> generated_tokens;
+
+    // stats
+    int32_t bs = 0;
+    int32_t group_width = 0;
+    int32_t seq_len = 0;
+    int32_t encoder_max_seq_len = 0;
+
+    // flag to indicate rec model
+    bool is_rec = false;
+  };
+
   // State management for MultiStep
   struct MultiStepBuilderState {
     // Base state from parent class
@@ -91,6 +115,9 @@ class MultiStepBatchInputBuilder : public BatchInputBuilder {
 
     // Multi-step specific metadata
     uint32_t total_steps = 0;
+
+    // Rec-specific state for multi-step
+    RecMultiStepState rec_state;
   };
 
   // Enhanced state

@@ -18,7 +18,6 @@ limitations under the License.
 #include "framework/chat_template/jinja_chat_template.h"
 #include "framework/model/model_args.h"
 #include "runtime/master.h"
-#include "runtime/rec_engine.h"
 #include "scheduler/continuous_scheduler.h"
 #include "scheduler/fixsteps_scheduler.h"
 #include "util/threadpool.h"

@@ -472,6 +472,99 @@ void proto_to_forward_input(const proto::ForwardInput* pb_forward_input,
   forward_inputs.shared_kv_shape =
       std::vector<int64_t>(pb_forward_input->shared_kv_shape().begin(),
                            pb_forward_input->shared_kv_shape().end());
+
+  // ==== Rec specific fields ====
+  if (pb_forward_input->has_rec_input() &&
+      pb_forward_input->rec_input().is_rec()) {
+    const auto& rec_input = pb_forward_input->rec_input();
+
+    // Helper lambdas to restore tensors from raw data
+    auto make_int_tensor = [&tensor_options](
+                               const auto& data,
+                               const auto& shape) -> torch::Tensor {
+      if (data.empty() || shape.empty()) {
+        return torch::Tensor();
+      }
+      std::vector<int64_t> shape_vec(shape.begin(), shape.end());
+      auto t = torch::empty(shape_vec, tensor_options);
+      std::memcpy(t.data_ptr<int>(), data.data(), data.size() * sizeof(int));
+      return t;
+    };
+
+    auto make_float_tensor = [](const auto& data,
+                                const auto& shape) -> torch::Tensor {
+      if (data.empty() || shape.empty()) {
+        return torch::Tensor();
+      }
+      std::vector<int64_t> shape_vec(shape.begin(), shape.end());
+      auto options = torch::TensorOptions()
+                         .dtype(torch::kFloat)
+                         .device(torch::kCPU)
+                         .pinned_memory(true);
+      auto t = torch::empty(shape_vec, options);
+      std::memcpy(
+          t.data_ptr<float>(), data.data(), data.size() * sizeof(float));
+      return t;
+    };
+
+    RecModelInputParams rec_params;
+
+    rec_params.is_hybrid_mode = false;
+    rec_params.is_encoder_forward = false;
+    rec_params.has_encoder_output = true;
+
+    // Note: bs, group_width, seq_len are not needed here as they use
+    // existing multi_step fields: num_sequences, max_seq_len, q_max_seq_len
+    rec_params.encoder_max_seq_len = rec_input.rec_encoder_max_seq_len();
+
+    // Cross-attention KV cache shape
+    rec_params.shared_cross_kv_shape = std::vector<int64_t>(
+        rec_input.rec_shared_cross_kv_shape().begin(),
+        rec_input.rec_shared_cross_kv_shape().end());
+
+    // encoder_seq_lens
+    rec_params.encoder_seq_lens = std::vector<int32_t>(
+        rec_input.rec_encoder_seq_lens().begin(),
+        rec_input.rec_encoder_seq_lens().end());
+    rec_params.encoder_seq_lens_tensor = make_int_tensor(
+        rec_input.rec_encoder_seq_lens_tensor_data(),
+        rec_input.rec_encoder_seq_lens_tensor_shape());
+
+    rec_params.encoder_token_ids = make_int_tensor(
+        rec_input.rec_encoder_token_ids_data(),
+        rec_input.rec_encoder_token_ids_shape());
+
+    rec_params.encoder_positions = make_int_tensor(
+        rec_input.rec_encoder_positions_data(),
+        rec_input.rec_encoder_positions_shape());
+
+    rec_params.encoder_sparse_embedding = make_float_tensor(
+        rec_input.rec_encoder_sparse_embedding_data(),
+        rec_input.rec_encoder_sparse_embedding_shape());
+
+    rec_params.decoder_context_embedding = make_float_tensor(
+        rec_input.rec_decoder_context_embedding_data(),
+        rec_input.rec_decoder_context_embedding_shape());
+
+    // cross-attn placeholders
+    rec_params.cross_attn_kv_cu_seq_lens = make_int_tensor(
+        rec_input.rec_cross_attn_kv_cu_seq_lens_data(),
+        rec_input.rec_cross_attn_kv_cu_seq_lens_shape());
+    rec_params.cross_attn_kv_cu_seq_lens_vec = std::vector<int32_t>(
+        rec_input.rec_cross_attn_kv_cu_seq_lens_vec().begin(),
+        rec_input.rec_cross_attn_kv_cu_seq_lens_vec().end());
+
+    rec_params.cross_attn_block_tables = make_int_tensor(
+        rec_input.rec_cross_attn_block_tables_data(),
+        rec_input.rec_cross_attn_block_tables_shape());
+
+    rec_params.cross_attn_new_cache_slots = make_int_tensor(
+        rec_input.rec_cross_attn_new_cache_slots_data(),
+        rec_input.rec_cross_attn_new_cache_slots_shape());
+
+    input_params.rec_params = std::move(rec_params);
+  }
+
   COUNTER_ADD(proto_latency_seconds_proto2i, timer.elapsed_seconds());
 }
 
@@ -700,6 +793,72 @@ void forward_input_to_proto(const RawForwardInput& inputs,
   pb_forward_input->set_total_round(inputs.total_round);
   ADD_VECTOR_TO_PROTO(pb_forward_input->mutable_shared_kv_shape(),
                       inputs.shared_kv_shape);
+
+  // ==== Rec specific fields ====
+  if (inputs.is_rec) {
+    auto* rec_input = pb_forward_input->mutable_rec_input();
+    rec_input->set_is_rec(true);
+
+    // encoder side
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_seq_lens(),
+                        inputs.rec_encoder_seq_lens);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_seq_lens_tensor_data(),
+                        inputs.rec_encoder_seq_lens_tensor_data);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_seq_lens_tensor_shape(),
+                        inputs.rec_encoder_seq_lens_tensor_shape);
+
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_token_ids_data(),
+                        inputs.rec_encoder_token_ids_data);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_token_ids_shape(),
+                        inputs.rec_encoder_token_ids_shape);
+
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_positions_data(),
+                        inputs.rec_encoder_positions_data);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_positions_shape(),
+                        inputs.rec_encoder_positions_shape);
+
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_sparse_embedding_data(),
+                        inputs.rec_encoder_sparse_embedding_data);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_encoder_sparse_embedding_shape(),
+                        inputs.rec_encoder_sparse_embedding_shape);
+
+    // decoder context
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_decoder_context_embedding_data(),
+                        inputs.rec_decoder_context_embedding_data);
+    ADD_VECTOR_TO_PROTO(
+        rec_input->mutable_rec_decoder_context_embedding_shape(),
+        inputs.rec_decoder_context_embedding_shape);
+
+    // encoder stats (bs, group_width, seq_len use existing multi_step fields)
+    rec_input->set_rec_encoder_max_seq_len(inputs.rec_encoder_max_seq_len);
+
+    // Cross-attention KV cache shape
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_shared_cross_kv_shape(),
+                        inputs.rec_shared_cross_kv_shape);
+
+    // cross-attn placeholders
+    ADD_VECTOR_TO_PROTO(
+        rec_input->mutable_rec_cross_attn_kv_cu_seq_lens_data(),
+        inputs.rec_cross_attn_kv_cu_seq_lens_data);
+    ADD_VECTOR_TO_PROTO(
+        rec_input->mutable_rec_cross_attn_kv_cu_seq_lens_shape(),
+        inputs.rec_cross_attn_kv_cu_seq_lens_shape);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_cross_attn_kv_cu_seq_lens_vec(),
+                        inputs.rec_cross_attn_kv_cu_seq_lens_vec);
+
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_cross_attn_block_tables_data(),
+                        inputs.rec_cross_attn_block_tables_data);
+    ADD_VECTOR_TO_PROTO(rec_input->mutable_rec_cross_attn_block_tables_shape(),
+                        inputs.rec_cross_attn_block_tables_shape);
+
+    ADD_VECTOR_TO_PROTO(
+        rec_input->mutable_rec_cross_attn_new_cache_slots_data(),
+        inputs.rec_cross_attn_new_cache_slots_data);
+    ADD_VECTOR_TO_PROTO(
+        rec_input->mutable_rec_cross_attn_new_cache_slots_shape(),
+        inputs.rec_cross_attn_new_cache_slots_shape);
+  }
+
   COUNTER_ADD(proto_latency_seconds_i2proto, timer.elapsed_seconds());
 }
 

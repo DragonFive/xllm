@@ -19,7 +19,6 @@ cc_library(
     worker_impl.h
     llm_worker_impl.h
     vlm_worker_impl.h
-    rec_worker_impl.h
     dit_worker.h
     embed_worker_impl.h
     embed_vlm_worker_impl.h
@@ -27,7 +26,6 @@ cc_library(
     llm_engine.h
     vlm_engine.h
     dit_engine.h
-    rec_engine.h
     worker_client.h
     xservice_client.h
     speculative_engine.h
@@ -42,13 +40,11 @@ cc_library(
     llm_worker_impl.cpp
     vlm_worker_impl.cpp
     dit_worker.cpp
-    rec_worker_impl.cpp
     embed_worker_impl.cpp
     embed_vlm_worker_impl.cpp
     llm_engine.cpp
     vlm_engine.cpp
     dit_engine.cpp
-    rec_engine.cpp
     worker_client.cpp
     xservice_client.cpp
     params_utils.cpp

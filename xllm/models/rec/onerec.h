@@ -45,7 +45,9 @@ namespace xllm {
 // max_seq_len, hidden_size]
 inline torch::Tensor pad_encoder_output(const torch::Tensor& encoder_output,
                                         const ModelInputParams& input_params) {
-  const int64_t bs = input_params.rec_params->bs;
+  // Use num_sequences from input_params (already configured in
+  // multi_step_batch_builder)
+  const int64_t bs = input_params.num_sequences;
   const int64_t hidden_size = encoder_output.size(1);
 
   // Get actual sequence lengths and max sequence length from input_params
@@ -416,7 +418,17 @@ class OneRecStackImpl : public torch::nn::Module {
     if (input_params.rec_params->is_hybrid_mode && !is_decoder_) {
       h = tokens;
     } else {
-      if (input_params.rec_params->decoder_context_embedding.defined()) {
+      // Prefill-only mode: concatenate decoder_context_embedding with token
+      // embeddings Prefill+decode mode: only use decoder_context_embedding in
+      // prefill stage
+      const bool is_prefill = input_params.is_prefill;
+      const bool should_concat_context =
+          FLAGS_enable_rec_prefill_only ||
+          (is_prefill &&
+           input_params.rec_params->decoder_context_embedding.defined());
+
+      if (should_concat_context &&
+          input_params.rec_params->decoder_context_embedding.defined()) {
         // use context embedding replacing bos + prompt tokens
         if (tokens.sizes() == 0) {
           h = input_params.rec_params->decoder_context_embedding;
@@ -430,16 +442,17 @@ class OneRecStackImpl : public torch::nn::Module {
               input_params.rec_params->decoder_context_embedding;
           auto& token_emb = h;
           const int64_t hidden_size = context_emb.size(3);
-          const int64_t bs = input_params.rec_params->bs;
-          const int64_t group_width = input_params.rec_params->group_width;
+          // Use num_sequences and beam_width from input_params
+          const int64_t bs = input_params.num_sequences;
+          const int64_t group_width = input_params.beam_width;
 
           const int64_t context_total_tokens = context_emb.size(2);
           const int64_t token_total_tokens = token_emb.size(0);
 
           // Assume bs * group_width is the same for both tensors
           // We need to determine seq_len1 and seq_len2 from the tensor shapes
-          // For now, assume seq_len2 is provided via input_params.seq_len or
-          // can be inferred
+          // For now, assume seq_len2 is provided via input_params.q_max_seq_len
+          // or can be inferred
           const int64_t bs_group = bs * group_width;
           const int64_t seq_len1 = token_total_tokens / bs_group;
 
@@ -468,8 +481,9 @@ class OneRecStackImpl : public torch::nn::Module {
         if (!h.is_contiguous()) {
           h = h.contiguous();
         }
-
       } else {
+        // Decode stage in prefill+decode mode: just use token embeddings
+        // directly
         h = embed_tokens_(tokens, 0);
       }
     }
@@ -745,6 +759,7 @@ class OneRecForConditionalGenerationImpl : public torch::nn::Module {
         encoder_tokens, encoder_positions, encoder_kv_caches, input_params);
     encoder_output = pad_encoder_output(encoder_output, input_params);
     encoder_output_ = encoder_output;
+    LOG(INFO) << "[onerec debug] encoder_forward end";
     return encoder_output;
   }
 
@@ -764,8 +779,10 @@ class OneRecForConditionalGenerationImpl : public torch::nn::Module {
                         std::vector<KVCache>& kv_caches,
                         const std::vector<ModelInputParams>& input_params) {
     if (input_params[0].rec_params->is_encoder_forward) {
+      LOG(INFO) << "[onerec debug] begin run encode";
       return encode_forward(tokens[0], positions[0], input_params[0]);
     }
+    LOG(INFO) << "[onerec debug] begin run decoder forward";
     return forward(
         tokens[0], positions[0], kv_caches, input_params[0], encoder_output_);
   }
@@ -997,14 +1014,6 @@ inline torch::Tensor OneRecStackImpl::preprocess_attention_mask(
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(onerec, OneRecForConditionalGeneration);
-Collaborator
-@XuZhang99
-XuZhang99
-2 weeks ago
-add REGISTER_REC_MODEL and related code.
-
-@DragonFive	Reply...
-
 // register the model args
 REGISTER_MODEL_ARGS(onerec, [&] {
   LOAD_ARG_OR(model_type, "model_type", "onerec");

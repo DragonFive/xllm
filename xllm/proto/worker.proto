@@ -146,6 +146,52 @@ message BlockPair {
   int32 host_block_id = 2;
 }
 
+message GeneratedTokens {
+  repeated int32 tokens = 1;
+}
+
+message RecForwardInput {
+  bool is_rec = 1;
+
+  // encoder side
+  repeated int32 rec_encoder_seq_lens = 2;
+  repeated int32 rec_encoder_seq_lens_tensor_data = 3;
+  repeated int64 rec_encoder_seq_lens_tensor_shape = 4;
+
+  repeated int32 rec_encoder_token_ids_data = 5;
+  repeated int64 rec_encoder_token_ids_shape = 6;
+
+  repeated int32 rec_encoder_positions_data = 7;
+  repeated int64 rec_encoder_positions_shape = 8;
+
+  repeated float rec_encoder_sparse_embedding_data = 9;
+  repeated int64 rec_encoder_sparse_embedding_shape = 10;
+
+  // decoder context
+  repeated float rec_decoder_context_embedding_data = 11;
+  repeated int64 rec_decoder_context_embedding_shape = 12;
+
+  // multi-round generated tokens (per sequence)
+  repeated GeneratedTokens rec_generated_tokens = 13;
+
+  // encoder-specific stats (bs, seq_len etc. use existing multi_step fields)
+  int32 rec_encoder_max_seq_len = 18;
+
+  // Cross-attention KV cache shape: [batch_size * encoder_max_seq_len, n_kv_heads, head_dim]
+  repeated int64 rec_shared_cross_kv_shape = 26;
+
+  // cross-attn placeholders
+  repeated int32 rec_cross_attn_kv_cu_seq_lens_data = 19;
+  repeated int64 rec_cross_attn_kv_cu_seq_lens_shape = 20;
+  repeated int32 rec_cross_attn_kv_cu_seq_lens_vec = 21;
+
+  repeated int32 rec_cross_attn_block_tables_data = 22;
+  repeated int64 rec_cross_attn_block_tables_shape = 23;
+
+  repeated int32 rec_cross_attn_new_cache_slots_data = 24;
+  repeated int64 rec_cross_attn_new_cache_slots_shape = 25;
+}
+
   message ForwardInput {
   // flatten the token ids and positions
   repeated int32 flatten_tokens_vec = 1;
@@ -211,6 +257,9 @@ message BlockPair {
   repeated UniqueTokenIds decode_unique_token_ids_vec = 45;
   repeated UniqueTokenCounts decode_unique_token_counts_vec = 46;
   repeated int32 decode_unique_token_lens_vec = 47;
+
+  // rec specific input
+  RecForwardInput rec_input = 52;
 }
 
  message BatchedForwardInputs {

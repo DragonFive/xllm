@@ -18,7 +18,6 @@ limitations under the License.
 
 #include "absl/time/time.h"
 #include "models/model_registry.h"
-#include "runtime/rec_engine.h"
 #include "runtime/xservice_client.h"
 #include "scheduler/scheduler_factory.h"
 #include "util/scope_guard.h"
@@ -70,7 +69,7 @@ RecMaster::RecMaster(const Options& options)
   chat_template_ = nullptr;
   tokenizer_ = nullptr;
   threadpool_ =
-      std::make_unique<ThreadPool>(options_.num_request_handling_threads());
+      std::make_unique<ThreadPool>(options_.num_handling_threads());
 }
 
 void RecMaster::run() {

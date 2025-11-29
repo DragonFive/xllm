@@ -56,6 +56,47 @@ Sequence::Sequence(size_t index,
       decoder_(std::move(decoder)),
       is_rec_model_(seq_params.is_rec_model) {
   if (is_rec_model_) {
+    // For rec model, treat prompt_token_ids as encoder_tokens
+    if (prompt_token_ids.size() > 0) {
+      encoder_tokens_.resize(prompt_token_ids.size());
+      for (size_t i = 0; i < prompt_token_ids.size(); ++i) {
+        encoder_tokens_[i] = prompt_token_ids[i];
+      }
+      num_encoder_tokens_ = prompt_token_ids.size();
+    } else {
+      // If no prompt tokens, check for encoder sparse embedding in mm_data
+      auto encoder_sparse_embedding =
+          mm_data_.get<torch::Tensor>(ENCODER_SPARSE_EMBEDDING_NAME);
+      CHECK(encoder_sparse_embedding.has_value())
+          << "encoder sparse embedding not found in mm_data";
+      num_encoder_tokens_ = encoder_sparse_embedding.value().size(0);
+    }
+    // Check if decoder context embedding exists in mm_data
+    auto decoder_context_embedding =
+        mm_data_.get<torch::Tensor>(DECODER_CONTEXT_EMBEDDING_NAME);
+    auto capacity = kDecoderMaxTokenCount;
+    if (decoder_context_embedding.has_value()) {
+      // Use context embedding replacing bos + prompt
+      num_prompt_tokens_ = 0;
+      num_decoder_embeddings_ = decoder_context_embedding.value().size(0);
+      capacity = num_decoder_embeddings_ + capacity - kDecoderBosTokenCount;
+    } else {
+      // Only BOS token for decoder
+      num_prompt_tokens_ = kDecoderBosTokenCount;  // kDecoderBosTokenCount
+    }
+    tokens_.resize(capacity);
+    for (size_t i = 0; i < num_prompt_tokens_; ++i) {
+      tokens_[num_tokens_++] = sequence_params_.bos_token_id;
+      token_to_count_map_[sequence_params_.bos_token_id]++;
+    }
+    volatile_num_prompt_tokens_ = num_prompt_tokens_;
+    input_embedding_ = input_embedding;
+    cur_generated_token_idx_ = num_prompt_tokens_;
+    // init logprob state
+    logprob_state_ =
+        std::make_unique<LogprobState>(num_prompt_tokens_, capacity);
+    // rec only use rank 0 now.
+    set_dp_rank(0);
   } else {
     CHECK(!prompt_token_ids.empty()) << "empty prompt token ids";
     auto capacity = sequence_params_.seq_capacity;

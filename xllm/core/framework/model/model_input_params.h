@@ -43,11 +43,7 @@ struct RecModelInputParams {
   // max encoder seq len
   int32_t encoder_max_seq_len = 0;
 
-  // Additional parameters needed by rec_batch_input_builder
-  bool is_first_prefill = true;
-  int32_t bs = 0;  // batch size
-  int32_t group_width = 0;
-  int32_t seq_len = 0;
+  // multi-round generated tokens per sequence
   std::vector<std::vector<int32_t>> generated_tokens;
   torch::Tensor encoder_sparse_embedding;
   torch::Tensor decoder_context_embedding;
@@ -62,6 +58,13 @@ struct RecModelInputParams {
   torch::Tensor encoder_token_ids;
   // Rec encoder positions
   torch::Tensor encoder_positions;
+
+  // Shared KV caches for cross-attention (used by decoder layers)
+  std::vector<torch::Tensor> shared_k_caches;
+  std::vector<torch::Tensor> shared_v_caches;
+
+  // Shape for cross-attention KV cache: [batch_size * max_token_per_req, n_kv_heads, head_dim]
+  std::vector<int64_t> shared_cross_kv_shape;
 
   RecModelInputParams to(const c10::Device& device) const {
     RecModelInputParams result = *this;
@@ -99,6 +102,10 @@ struct RecModelInputParams {
       result.encoder_positions = encoder_positions.to(device);
     }
 
+    // Shared KV caches for cross-attention (copy references, already on device)
+    result.shared_k_caches = shared_k_caches;
+    result.shared_v_caches = shared_v_caches;
+
     return result;
   }
 
@@ -108,8 +115,6 @@ struct RecModelInputParams {
               << "  is_encoder_forward: " << is_encoder_forward
               << "  has_encoder_output: " << has_encoder_output
               << "  encoder_max_seq_len: " << encoder_max_seq_len
-              << "  is_first_prefill: " << is_first_prefill << "  bs: " << bs
-              << "  group_width: " << group_width << "  seq_len: " << seq_len
               << "  encoder_seq_lens size: " << encoder_seq_lens.size()
               << "  cross_attn_kv_cu_seq_lens_vec size: "
               << cross_attn_kv_cu_seq_lens_vec.size()

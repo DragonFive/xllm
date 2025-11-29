@@ -296,10 +296,8 @@ class Sequence final {
   // finish the sequence by setting finished status and reason
   void finish();
 
-  / rec model specific : get encoder tokens const std::vector<int32_t>&
-                         encoder_tokens() const {
-    return encoder_tokens_;
-  }
+  // rec model specific : get encoder tokens
+  const std::vector<int32_t>& encoder_tokens() const { return encoder_tokens_; }
 
   // rec model specific: get encoder sequence length
   size_t encoder_seq_len() const { return num_encoder_tokens_; }

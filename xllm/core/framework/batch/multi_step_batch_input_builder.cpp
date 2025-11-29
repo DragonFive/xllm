@@ -38,6 +38,13 @@ limitations under the License.
 
 namespace xllm {
 
+// Helper function to check if sequence is rec model
+static bool is_rec_sequence(const Sequence* sequence) {
+  if (!sequence) return false;
+  // Check if sequence is rec model (supports both token mode and hybrid/sparse embedding mode)
+  return sequence->is_rec_model();
+}
+
 MultiStepBatchInputBuilder::MultiStepBatchInputBuilder(
     const std::vector<Sequence*>& sequences,
     const std::vector<uint32_t>& allowed_max_tokens,
@@ -59,6 +66,13 @@ MultiStepBatchInputBuilder::MultiStepBatchInputBuilder(
                         thread_pool) {
   // Initialize MultiStep specific state
   multi_step_state_.total_steps = FLAGS_max_decode_rounds;
+
+  // Check if this is a rec model by examining the first sequence
+  // Only enable rec logic when FLAGS_backend == "rec"
+  if (FLAGS_backend == "rec" && !sequences.empty() &&
+      is_rec_sequence(sequences[0])) {
+    multi_step_state_.rec_state.is_rec = true;
+  }
   // multi_step_state_.step_tokens_vec.reserve(1000);
   // multi_step_state_.step_positions_vec.reserve(1000);
   // TODO: Add multi-step specific initialization
@@ -148,6 +162,77 @@ void MultiStepBatchInputBuilder::process_single_sequence(
   // }
 
   // Multi-step specific processing
+
+  // Collect rec-specific data if this is a rec model
+  if (state.rec_state.is_rec) {
+    // Collect encoder seq lens
+    size_t enc_seq_len = sequence->encoder_seq_len();
+    state.rec_state.encoder_seq_lens.push_back(enc_seq_len);
+    LOG(INFO) << "[REC DEBUG] process_single_sequence seq_index=" << seq_index
+              << ", encoder_seq_len=" << enc_seq_len;
+
+    // Collect encoder tokens from all sequences
+    const auto& encoder_tokens = sequence->encoder_tokens();
+    LOG(INFO) << "[REC DEBUG] encoder_tokens.size()=" << encoder_tokens.size();
+    if (!encoder_tokens.empty()) {
+      state.rec_state.encoder_tokens_vec.insert(
+          state.rec_state.encoder_tokens_vec.end(),
+          encoder_tokens.begin(),
+          encoder_tokens.end());
+    }
+
+    // Collect sparse embedding and decoder context embedding (once per batch)
+    if (seq_index == 0) {
+      // Get sparse embedding from mm_data
+      auto mm_data = sequence->get_mm_data();
+      auto sparse_embedding_optional =
+          mm_data.get<torch::Tensor>(Sequence::ENCODER_SPARSE_EMBEDDING_NAME);
+      LOG(INFO) << "[REC DEBUG] sparse_embedding_optional.has_value()="
+                << sparse_embedding_optional.has_value();
+      if (sparse_embedding_optional.has_value()) {
+        if (!state.rec_state.encoder_sparse_embedding.defined()) {
+          state.rec_state.encoder_sparse_embedding =
+              sparse_embedding_optional.value();
+          LOG(INFO) << "[REC DEBUG] encoder_sparse_embedding set, sizes="
+                    << state.rec_state.encoder_sparse_embedding.sizes();
+        }
+      }
+
+      // Get decoder context embedding
+      auto decoder_context_embedding_optional =
+          mm_data.get<torch::Tensor>(Sequence::DECODER_CONTEXT_EMBEDDING_NAME);
+      LOG(INFO) << "[REC DEBUG] decoder_context_embedding_optional.has_value()="
+                << decoder_context_embedding_optional.has_value();
+      if (decoder_context_embedding_optional.has_value()) {
+        if (!state.rec_state.decoder_context_embedding.defined()) {
+          state.rec_state.decoder_context_embedding =
+              decoder_context_embedding_optional.value();
+          LOG(INFO) << "[REC DEBUG] decoder_context_embedding set, sizes="
+                    << state.rec_state.decoder_context_embedding.sizes();
+        }
+      }
+
+      // Set stats
+      state.rec_state.seq_len = sequence->num_tokens();
+    }
+
+    // Collect generated tokens for this sequence
+    const auto& token_ids = sequence->tokens();
+    uint32_t n_prompt_tokens = sequence->num_prompt_tokens();
+    uint32_t num_tokens = sequence->num_tokens();
+    std::vector<int32_t> seq_generated_tokens;
+    seq_generated_tokens.reserve(num_tokens - n_prompt_tokens);
+    for (uint32_t j = n_prompt_tokens; j < num_tokens; ++j) {
+      seq_generated_tokens.push_back(token_ids[j]);
+    }
+    state.rec_state.generated_tokens.push_back(std::move(seq_generated_tokens));
+
+    // Update encoder_max_seq_len
+    int32_t encoder_seq_len = sequence->encoder_seq_len();
+    if (encoder_seq_len > state.rec_state.encoder_max_seq_len) {
+      state.rec_state.encoder_max_seq_len = encoder_seq_len;
+    }
+  }
 }
 
 void MultiStepBatchInputBuilder::extract_tokens_and_positions(
@@ -359,6 +444,129 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
         multi_step_state.decode_sampling_params.begin(),
         multi_step_state.decode_sampling_params.end());
   }
+
+  // ========== Serialize rec_state to RawForwardInput ==========
+  // Note: rec mode uses existing multi_step fields (num_sequences, max_seq_len, etc.)
+  // Only encoder-specific fields are added here
+  if (multi_step_state.rec_state.is_rec) {
+    auto& rec_state = multi_step_state.rec_state;
+    raw_forward_input.is_rec = true;
+
+    // Encoder-specific: max encoder seq len and encoder seq lens
+    raw_forward_input.rec_encoder_max_seq_len = rec_state.encoder_max_seq_len;
+
+    // Set cross-attention KV cache shape: [batch_size * encoder_max_seq_len, decoder_n_kv_heads, decoder_head_dim]
+    // Cross-attention is part of decoder, so use decoder's head configuration
+    // Fallback to encoder configuration if decoder config is 0
+    int64_t batch_size = static_cast<int64_t>(sequences_.size());
+    int64_t decoder_n_kv_heads = 0;
+    int64_t decoder_head_dim = 0;
+    if (args_) {
+      // Try decoder config first
+      decoder_n_kv_heads = args_->decoder_n_kv_heads().value_or(args_->decoder_n_heads());
+      decoder_head_dim = args_->decoder_head_dim();
+      // Fallback to encoder config if decoder config is 0
+      if (decoder_n_kv_heads == 0) {
+        decoder_n_kv_heads = args_->n_kv_heads().value_or(args_->n_heads());
+      }
+      if (decoder_head_dim == 0) {
+        decoder_head_dim = args_->head_dim();
+      }
+    }
+    raw_forward_input.rec_shared_cross_kv_shape = {
+        batch_size * rec_state.encoder_max_seq_len, decoder_n_kv_heads, decoder_head_dim};
+    LOG(INFO) << "[REC DEBUG] Setting cross-attn KV shape: batch_size=" << batch_size
+              << ", encoder_max_seq_len=" << rec_state.encoder_max_seq_len
+              << ", decoder_n_kv_heads=" << decoder_n_kv_heads
+              << ", decoder_head_dim=" << decoder_head_dim
+              << ", final shape=[" << batch_size * rec_state.encoder_max_seq_len
+              << ", " << decoder_n_kv_heads << ", " << decoder_head_dim << "]";
+
+    // Copy encoder seq lens
+    raw_forward_input.rec_encoder_seq_lens = rec_state.encoder_seq_lens;
+
+    // Serialize encoder_seq_lens_tensor if defined
+    if (rec_state.encoder_seq_lens_tensor.defined()) {
+      auto tensor = rec_state.encoder_seq_lens_tensor.contiguous().cpu();
+      auto* data = tensor.data_ptr<int32_t>();
+      int64_t numel = tensor.numel();
+      raw_forward_input.rec_encoder_seq_lens_tensor_data.assign(
+          data, data + numel);
+      for (auto s : tensor.sizes()) {
+        raw_forward_input.rec_encoder_seq_lens_tensor_shape.push_back(s);
+      }
+    } else if (!rec_state.encoder_seq_lens.empty()) {
+      // Build tensor data from encoder_seq_lens
+      raw_forward_input.rec_encoder_seq_lens_tensor_data =
+          rec_state.encoder_seq_lens;
+      raw_forward_input.rec_encoder_seq_lens_tensor_shape = {
+          static_cast<int64_t>(rec_state.encoder_seq_lens.size())};
+    }
+
+    // encoder_token_ids and sparse_embedding are mutually exclusive
+    // Serialize encoder_sparse_embedding if defined (hybrid mode)
+    LOG(INFO) << "[REC DEBUG] state_to_raw_forward_input: "
+              << "encoder_sparse_embedding.defined()="
+              << rec_state.encoder_sparse_embedding.defined()
+              << ", encoder_tokens_vec.size()="
+              << rec_state.encoder_tokens_vec.size();
+    if (rec_state.encoder_sparse_embedding.defined()) {
+      auto tensor = rec_state.encoder_sparse_embedding.contiguous().to(
+          torch::kFloat32).cpu();
+      auto* data = tensor.data_ptr<float>();
+      int64_t numel = tensor.numel();
+      raw_forward_input.rec_encoder_sparse_embedding_data.assign(
+          data, data + numel);
+      for (auto s : tensor.sizes()) {
+        raw_forward_input.rec_encoder_sparse_embedding_shape.push_back(s);
+      }
+      LOG(INFO) << "[REC DEBUG] Serialized encoder_sparse_embedding: numel="
+                << numel << ", shape_size="
+                << raw_forward_input.rec_encoder_sparse_embedding_shape.size();
+    } else if (!rec_state.encoder_tokens_vec.empty()) {
+      // Non-hybrid mode: serialize encoder_token_ids from encoder_tokens_vec
+      raw_forward_input.rec_encoder_token_ids_data = rec_state.encoder_tokens_vec;
+      raw_forward_input.rec_encoder_token_ids_shape = {
+          static_cast<int64_t>(rec_state.encoder_tokens_vec.size())};
+
+      // Also need encoder_positions (same shape as encoder_token_ids)
+      // Build positions: [0, 1, 2, ..., n-1] for each sequence
+      std::vector<int32_t> positions_vec;
+      positions_vec.reserve(rec_state.encoder_tokens_vec.size());
+      for (size_t i = 0; i < rec_state.encoder_seq_lens.size(); ++i) {
+        int32_t seq_len = rec_state.encoder_seq_lens[i];
+        for (int32_t pos = 0; pos < seq_len; ++pos) {
+          positions_vec.push_back(pos);
+        }
+      }
+      raw_forward_input.rec_encoder_positions_data = std::move(positions_vec);
+      raw_forward_input.rec_encoder_positions_shape = {
+          static_cast<int64_t>(raw_forward_input.rec_encoder_positions_data.size())};
+    }
+
+    // Serialize decoder_context_embedding if defined
+    if (rec_state.decoder_context_embedding.defined()) {
+      auto tensor = rec_state.decoder_context_embedding.contiguous().to(
+          torch::kFloat32).cpu();
+      auto* data = tensor.data_ptr<float>();
+      int64_t numel = tensor.numel();
+      raw_forward_input.rec_decoder_context_embedding_data.assign(
+          data, data + numel);
+      for (auto s : tensor.sizes()) {
+        raw_forward_input.rec_decoder_context_embedding_shape.push_back(s);
+      }
+    }
+
+    // Initialize cross-attn placeholder data
+    raw_forward_input.rec_cross_attn_kv_cu_seq_lens_data = {0};
+    raw_forward_input.rec_cross_attn_kv_cu_seq_lens_shape = {1};
+    raw_forward_input.rec_cross_attn_kv_cu_seq_lens_vec = {0};
+    raw_forward_input.rec_cross_attn_block_tables_data = {0};
+    raw_forward_input.rec_cross_attn_block_tables_shape = {1, 1};
+    raw_forward_input.rec_cross_attn_new_cache_slots_data = {0};
+    raw_forward_input.rec_cross_attn_new_cache_slots_shape = {1};
+  }
+
   return raw_forward_input;
 }
 

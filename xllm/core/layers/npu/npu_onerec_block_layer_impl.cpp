@@ -392,7 +392,7 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
   auto& args = context.get_model_args();
   param_from_args(prefill_param_, args, parallel_args_, true);
   prefill_param_.isDecoder = is_decoder;
-  param_from_args(decode_param_, args, parallel_args, false);
+  param_from_args(decode_param_, args, parallel_args_, false);
   decode_param_.isDecoder = is_decoder;
 
   // Choose correct weight count based on use_moe
@@ -1061,7 +1061,7 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   // prefill_param_.inputParams = &input_params;
   // decode_param_.inputParams = &input_params;
 
-  if (input_params.rec_params && input_params[0].is_prefill) {
+  if (input_params.rec_params && input_params.is_prefill) {
     // Prefill stage
     if (is_decoder_) {
       if (prefill_param_.use_moe) {
@@ -1242,7 +1242,7 @@ void NpuOneRecBlockLayerImpl::build_decoder_moe_node_variant_pack(
                                input_params,
                                encoder_output,
                                ONEREC_MOE_WEIGHT_COUNT_PER_LAYER + 4,
-                               node_id);
+                               layer_id);
   // Add MoE-specific tensors (expert_array, expert_group, one_hot, zero_hot)
   // These tensors are required by ONEREC MoE kernel implementation
   // They should directly follow the weight tensors as defined in kernel
@@ -1422,7 +1422,7 @@ void NpuOneRecBlockLayerImpl::build_decoder_node_variant_pack(
                                                 input_params,
                                                 encoder_output,
                                                 ONEREC_WEIGHT_COUNT_PER_LAYER,
-                                                node_id);
+                                                layer_id);
   // Fill remaining tensors with placeholders (for optional features like lora,
   // kv_quant, etc.)
   // Record the number of filled placeholders

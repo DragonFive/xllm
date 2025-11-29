@@ -30,6 +30,9 @@ class Timer final {
   // get the elapsed time in seconds
   double elapsed_seconds() const;
 
+  // get the elapsed time in microseconds
+  double elapsed_microseconds() const;
+
  private:
   // the start time of the timer
   absl::Time start_;
