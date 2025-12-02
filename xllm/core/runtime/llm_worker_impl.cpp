@@ -247,10 +247,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
   device_.set_device();
   Timer timer;
 
-  LOG(INFO) << "[REC DEBUG] step_multi_round entered, micro_inputs.size()="
-            << inputs.micro_inputs.size()
-            << ", FLAGS_backend=" << FLAGS_backend;
-
   std::vector<torch::Tensor> flatten_tokens_micro_batches;
   std::vector<torch::Tensor> flatten_positions_micro_batches;
   std::vector<ModelInputParams> input_params_micro_batches;
@@ -265,12 +261,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         std::move(inputs.micro_inputs[i].input_params));
   }
 
-  LOG(INFO) << "[REC DEBUG] input_params_micro_batches.size()="
-            << input_params_micro_batches.size();
-  if (!input_params_micro_batches.empty()) {
-    LOG(INFO) << "[REC DEBUG] rec_params.has_value()="
-              << input_params_micro_batches[0].rec_params.has_value();
-  }
 
   int32_t total_rounds = inputs.micro_inputs[0].total_round;
   ForwardOutput output;
@@ -312,12 +302,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
     auto& rec_params = input_params_micro_batches[0].rec_params.value();
 
     // Debug: print encoder input status
-    LOG(INFO) << "[REC DEBUG] encoder_token_ids.defined()="
-              << rec_params.encoder_token_ids.defined()
-              << ", encoder_positions.defined()="
-              << rec_params.encoder_positions.defined()
-              << ", encoder_sparse_embedding.defined()="
-              << rec_params.encoder_sparse_embedding.defined();
 
     // Check for encoder inputs
     if ((rec_params.encoder_token_ids.defined() &&
@@ -330,7 +314,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         input_params_micro_batches[0].rec_params->is_hybrid_mode = true;
       }
     }
-    LOG(INFO) << "[REC DEBUG] has_encoder_inputs=" << has_encoder_inputs;
 
     // Setup shared cross-attention k/v caches for rec model
     // These are used in decoder's cross-attention layers
@@ -338,21 +321,11 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
     if (input_params_micro_batches[0].rec_params->shared_k_caches.empty()) {
       const auto& shape =
           input_params_micro_batches[0].rec_params->shared_cross_kv_shape;
-      LOG(INFO) << "[REC DEBUG] shared_cross_kv_shape size: " << shape.size();
-      if (!shape.empty()) {
-        LOG(INFO) << "[REC DEBUG] shared_cross_kv_shape values: [";
-        for (size_t i = 0; i < shape.size(); ++i) {
-          LOG(INFO) << "  " << shape[i];
-        }
-        LOG(INFO) << "]";
-      }
+      // Shape format: [batch_size, encoder_max_seq_len, n_kv_heads * head_dim]
       if (shape.size() == 3) {
-        int64_t num_tokens = shape[0];
-        int64_t head_num = shape[1];
-        int64_t head_dim = shape[2];
-        LOG(INFO) << "[REC DEBUG] Creating cross-attn KV cache: num_tokens="
-                  << num_tokens << ", head_num=" << head_num
-                  << ", head_dim=" << head_dim << ", layer_num=" << layer_num;
+        int64_t batch_size = shape[0];
+        int64_t encoder_max_seq_len = shape[1];
+        int64_t kv_hidden_size = shape[2];  // n_kv_heads * head_dim
         auto fp_options = torch::TensorOptions().dtype(dtype_).device(device_);
         input_params_micro_batches[0].rec_params->shared_k_caches.reserve(
             layer_num);
@@ -360,22 +333,15 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
             layer_num);
         for (int32_t layer_id = 0; layer_id < layer_num; ++layer_id) {
           input_params_micro_batches[0]
-              .rec_params->shared_k_caches.emplace_back(
-                  torch::zeros({num_tokens, head_num, head_dim}, fp_options));
+              .rec_params->shared_k_caches.emplace_back(torch::zeros(
+                  {batch_size, encoder_max_seq_len, kv_hidden_size},
+                  fp_options));
           input_params_micro_batches[0]
-              .rec_params->shared_v_caches.emplace_back(
-                  torch::zeros({num_tokens, head_num, head_dim}, fp_options));
+              .rec_params->shared_v_caches.emplace_back(torch::zeros(
+                  {batch_size, encoder_max_seq_len, kv_hidden_size},
+                  fp_options));
         }
-        LOG(INFO) << "[REC DEBUG] Created " << layer_num
-                  << " cross-attn KV cache layers";
-      } else {
-        LOG(WARNING) << "[REC DEBUG] shared_cross_kv_shape size is not 3, "
-                        "skipping cross-attn KV cache creation";
       }
-    } else {
-      LOG(INFO)
-          << "[REC DEBUG] shared_k_caches already initialized, size="
-          << input_params_micro_batches[0].rec_params->shared_k_caches.size();
     }
   }
 
@@ -420,10 +386,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
             {sparse_embedding.size(0)},
             torch::TensorOptions().dtype(torch::kInt32).device(device_));
         encoder_positions.push_back(positions_placeholder);
-        LOG(INFO) << "[REC DEBUG] Hybrid mode: using sparse embedding, "
-                  << "size=" << sparse_embedding.size(0)
-                  << ", dtype=" << sparse_embedding.dtype()
-                  << ", device=" << sparse_embedding.device();
       } else if (rec_params.encoder_token_ids.defined()) {
         encoder_tokens.push_back(rec_params.encoder_token_ids);
         if (rec_params.encoder_positions.defined()) {
@@ -433,18 +395,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
 
       // Run encoder
       if (!encoder_tokens.empty() && !encoder_positions.empty()) {
-        LOG(INFO) << "[REC DEBUG] Running encoder forward with "
-                  << "encoder_tokens.size()=" << encoder_tokens.size()
-                  << ", encoder_positions.size()=" << encoder_positions.size();
         hidden_states = model_executor_->forward(encoder_tokens,
                                                  encoder_positions,
                                                  kv_caches_,
                                                  encoder_input_params);
-        LOG(INFO) << "[REC DEBUG] Encoder forward completed";
-      } else {
-        LOG(WARNING) << "[REC DEBUG] Skipping encoder forward: "
-                     << "encoder_tokens.empty()=" << encoder_tokens.empty()
-                     << ", encoder_positions.empty()=" << encoder_positions.empty();
       }
 
       // 2. Run decoder forward
@@ -455,6 +409,21 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                                                encoder_input_params);
     } else {
       // Standard LLM forward or rec decode rounds (round > 0)
+
+      // For rec model decode rounds: ensure positions are available
+      if (is_rec_backend && round > 0 && flatten_positions_micro_batches.empty()) {
+        int32_t num_seqs = batch * beam_width_init;
+        std::vector<int32_t> positions_vec(num_seqs);
+        for (int32_t s = 0; s < num_seqs; ++s) {
+          // rec model decoder: position = prompt_len (1 for BOS) + round
+          positions_vec[s] = 1 + round;
+        }
+        auto positions_tensor = torch::tensor(
+            positions_vec,
+            torch::TensorOptions().dtype(torch::kInt32).device(device_));
+        flatten_positions_micro_batches.push_back(positions_tensor);
+      }
+
       hidden_states = model_executor_->forward(flatten_tokens_micro_batches,
                                                flatten_positions_micro_batches,
                                                kv_caches_,
@@ -537,9 +506,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
             positions_vec,
             torch::TensorOptions().dtype(torch::kInt32).device(device_));
         flatten_positions_micro_batches.push_back(positions_tensor);
-        LOG(INFO) << "[REC DEBUG] Generated decode positions for round "
-                  << next_round << ", num_seqs=" << num_seqs
-                  << ", positions[0]=" << positions_vec[0];
       }
       // update output at the last round.
       if (round == total_rounds - 1) {

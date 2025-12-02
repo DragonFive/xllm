@@ -168,12 +168,9 @@ void MultiStepBatchInputBuilder::process_single_sequence(
     // Collect encoder seq lens
     size_t enc_seq_len = sequence->encoder_seq_len();
     state.rec_state.encoder_seq_lens.push_back(enc_seq_len);
-    LOG(INFO) << "[REC DEBUG] process_single_sequence seq_index=" << seq_index
-              << ", encoder_seq_len=" << enc_seq_len;
 
     // Collect encoder tokens from all sequences
     const auto& encoder_tokens = sequence->encoder_tokens();
-    LOG(INFO) << "[REC DEBUG] encoder_tokens.size()=" << encoder_tokens.size();
     if (!encoder_tokens.empty()) {
       state.rec_state.encoder_tokens_vec.insert(
           state.rec_state.encoder_tokens_vec.end(),
@@ -187,28 +184,20 @@ void MultiStepBatchInputBuilder::process_single_sequence(
       auto mm_data = sequence->get_mm_data();
       auto sparse_embedding_optional =
           mm_data.get<torch::Tensor>(Sequence::ENCODER_SPARSE_EMBEDDING_NAME);
-      LOG(INFO) << "[REC DEBUG] sparse_embedding_optional.has_value()="
-                << sparse_embedding_optional.has_value();
       if (sparse_embedding_optional.has_value()) {
         if (!state.rec_state.encoder_sparse_embedding.defined()) {
           state.rec_state.encoder_sparse_embedding =
               sparse_embedding_optional.value();
-          LOG(INFO) << "[REC DEBUG] encoder_sparse_embedding set, sizes="
-                    << state.rec_state.encoder_sparse_embedding.sizes();
         }
       }
 
       // Get decoder context embedding
       auto decoder_context_embedding_optional =
           mm_data.get<torch::Tensor>(Sequence::DECODER_CONTEXT_EMBEDDING_NAME);
-      LOG(INFO) << "[REC DEBUG] decoder_context_embedding_optional.has_value()="
-                << decoder_context_embedding_optional.has_value();
       if (decoder_context_embedding_optional.has_value()) {
         if (!state.rec_state.decoder_context_embedding.defined()) {
           state.rec_state.decoder_context_embedding =
               decoder_context_embedding_optional.value();
-          LOG(INFO) << "[REC DEBUG] decoder_context_embedding set, sizes="
-                    << state.rec_state.decoder_context_embedding.sizes();
         }
       }
 
@@ -473,14 +462,10 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
         decoder_head_dim = args_->head_dim();
       }
     }
+    // Shape format: [batch_size, encoder_max_seq_len, n_kv_heads * head_dim]
     raw_forward_input.rec_shared_cross_kv_shape = {
-        batch_size * rec_state.encoder_max_seq_len, decoder_n_kv_heads, decoder_head_dim};
-    LOG(INFO) << "[REC DEBUG] Setting cross-attn KV shape: batch_size=" << batch_size
-              << ", encoder_max_seq_len=" << rec_state.encoder_max_seq_len
-              << ", decoder_n_kv_heads=" << decoder_n_kv_heads
-              << ", decoder_head_dim=" << decoder_head_dim
-              << ", final shape=[" << batch_size * rec_state.encoder_max_seq_len
-              << ", " << decoder_n_kv_heads << ", " << decoder_head_dim << "]";
+        batch_size, rec_state.encoder_max_seq_len,
+        decoder_n_kv_heads * decoder_head_dim};
 
     // Copy encoder seq lens
     raw_forward_input.rec_encoder_seq_lens = rec_state.encoder_seq_lens;
@@ -505,11 +490,6 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
 
     // encoder_token_ids and sparse_embedding are mutually exclusive
     // Serialize encoder_sparse_embedding if defined (hybrid mode)
-    LOG(INFO) << "[REC DEBUG] state_to_raw_forward_input: "
-              << "encoder_sparse_embedding.defined()="
-              << rec_state.encoder_sparse_embedding.defined()
-              << ", encoder_tokens_vec.size()="
-              << rec_state.encoder_tokens_vec.size();
     if (rec_state.encoder_sparse_embedding.defined()) {
       auto tensor = rec_state.encoder_sparse_embedding.contiguous().to(
           torch::kFloat32).cpu();
@@ -520,9 +500,6 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
       for (auto s : tensor.sizes()) {
         raw_forward_input.rec_encoder_sparse_embedding_shape.push_back(s);
       }
-      LOG(INFO) << "[REC DEBUG] Serialized encoder_sparse_embedding: numel="
-                << numel << ", shape_size="
-                << raw_forward_input.rec_encoder_sparse_embedding_shape.size();
     } else if (!rec_state.encoder_tokens_vec.empty()) {
       // Non-hybrid mode: serialize encoder_token_ids from encoder_tokens_vec
       raw_forward_input.rec_encoder_token_ids_data = rec_state.encoder_tokens_vec;

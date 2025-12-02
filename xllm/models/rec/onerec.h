@@ -166,20 +166,12 @@ inline torch::Tensor compute_onerec_position_bias(
 
   // Ensure minimum valid dimensions to avoid empty tensors
   if (actual_query_length <= 0) {
-    LOG(WARNING) << "[ONEREC DEBUG] actual_query_length <= 0 ("
-                 << actual_query_length << "), using 1";
     actual_query_length = 1;
   }
   if (key_length <= 0) {
-    LOG(WARNING) << "[ONEREC DEBUG] key_length <= 0 (" << key_length
-                 << "), using 1";
     key_length = 1;
   }
 
-  // LOG(INFO) << "[ONEREC DEBUG] compute_onerec_position_bias - query_length: "
-  //           << query_length << ", key_length: " << key_length
-  //           << ", actual_query_length: " << actual_query_length
-  //           << ", is_decode_stage: " << is_decode_stage;
 
   // Create position indices
   auto context_position =
@@ -243,11 +235,8 @@ inline torch::Tensor compute_onerec_position_bias(
       // key_length, num_heads]
       values =
           values.view({original_shape[0], original_shape[1], values.size(1)});
-      // LOG(INFO) << "[ONEREC DEBUG] Reshaped 2D values from embedding: "
-      //           << values.sizes();
     } else {
-      LOG(FATAL) << "[ONEREC DEBUG] Unexpected 2D values size: "
-                 << values.sizes()
+      LOG(FATAL) << "Unexpected 2D values size: " << values.sizes()
                  << ", expected first dim: " << flattened_buckets.size(0);
     }
   } else if (values.dim() == 1) {
@@ -255,34 +244,20 @@ inline torch::Tensor compute_onerec_position_bias(
     values =
         values.unsqueeze(-1).expand({flattened_buckets.size(0), num_heads});
     values = values.view({original_shape[0], original_shape[1], num_heads});
-    // LOG(INFO) << "[ONEREC DEBUG] Expanded and reshaped 1D values: "
-    //           << values.sizes();
   } else {
-    LOG(FATAL) << "[ONEREC DEBUG] Unexpected values tensor dimension: "
-               << values.dim() << ", sizes: " << values.sizes();
+    LOG(FATAL) << "Unexpected values tensor dimension: " << values.dim()
+               << ", sizes: " << values.sizes();
   }
 
   // Debug: Log tensor dimensions before permute
-  // LOG(INFO) << "[ONEREC DEBUG] Before permute - values.sizes(): " <<
-  // values.sizes()
-  //           << ", relative_buckets.sizes(): " << relative_buckets.sizes()
-  //           << ", query_length: " << query_length
-  //           << ", key_length: " << key_length << ", num_heads: " << num_heads
-  //           << ", is_decoder: " << is_decoder;
 
   // Now values should be [query_length, key_length, num_heads] after reshaping
-  // LOG(INFO) << "[ONEREC DEBUG] After embedding reshape - values.sizes(): "
-  //           << values.sizes() << ", expected: [" << actual_query_length <<
-  //           ","
-  //           << key_length << ", " << num_heads << "]";
 
   if (values.dim() == 3) {
     // values is [query_length, key_length, num_heads], permute to [num_heads,
     // query_length, key_length] ATB ALIBI mask type requires 3D tensor, not
     // 4D, so we don't add batch dimension
     values = values.permute({2, 0, 1});
-    // LOG(INFO) << "[ONEREC DEBUG] 3D values after permute - values.sizes(): "
-    //               << values.sizes();
     // LOG(INFO) << "position bias after permute " << values
     //               << ", value device: " << values.device();
   } else if (values.dim() == 2) {
@@ -291,11 +266,9 @@ inline torch::Tensor compute_onerec_position_bias(
     values = values.unsqueeze(-1).expand(
         {values.size(0), values.size(1), num_heads});
     values = values.permute({2, 0, 1});
-    // LOG(INFO) << "[ONEREC DEBUG] Fallback 2D handling - values.sizes(): "
-    //           << values.sizes();
   } else {
-    LOG(FATAL) << "[ONEREC DEBUG] Unexpected values tensor dimension: "
-               << values.dim() << ", sizes: " << values.sizes();
+    LOG(FATAL) << "Unexpected values tensor dimension: " << values.dim()
+               << ", sizes: " << values.sizes();
   }
 
   // For decoder decode stage, handle batch with different sequence progress
@@ -759,7 +732,6 @@ class OneRecForConditionalGenerationImpl : public torch::nn::Module {
         encoder_tokens, encoder_positions, encoder_kv_caches, input_params);
     encoder_output = pad_encoder_output(encoder_output, input_params);
     encoder_output_ = encoder_output;
-    LOG(INFO) << "[onerec debug] encoder_forward end";
     return encoder_output;
   }
 
@@ -779,10 +751,8 @@ class OneRecForConditionalGenerationImpl : public torch::nn::Module {
                         std::vector<KVCache>& kv_caches,
                         const std::vector<ModelInputParams>& input_params) {
     if (input_params[0].rec_params->is_encoder_forward) {
-      LOG(INFO) << "[onerec debug] begin run encode";
       return encode_forward(tokens[0], positions[0], input_params[0]);
     }
-    LOG(INFO) << "[onerec debug] begin run decoder forward";
     return forward(
         tokens[0], positions[0], kv_caches, input_params[0], encoder_output_);
   }

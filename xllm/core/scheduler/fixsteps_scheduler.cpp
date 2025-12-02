@@ -106,6 +106,15 @@ void FixStepsScheduler::handle_prefill_requests(
       }
 
       size_t num_tokens = prefill_sequence->num_need_compute_tokens();
+      // Decoder context embeddings don't contribute prompt tokens, so fall
+      // back to embedding count to avoid zero-sized batches.
+      if (num_tokens == 0 &&
+          prefill_sequence->num_decoder_embeddings() > 0) {
+        num_tokens = prefill_sequence->num_decoder_embeddings();
+      }
+      if (num_tokens == 0) {
+        num_tokens = 1;
+      }
       if (remaining_token_budget < allocated_tokens + num_tokens ||
           remaining_seq_budget < allocated_seqs + 1) {
         can_schedule = false;

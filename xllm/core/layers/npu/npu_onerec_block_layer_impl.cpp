@@ -407,8 +407,9 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
   device_id_ = context.get_tensor_options().device().index();
 
   // Create placeholder tensors with proper dimensions for ONEREC operations
-  auto placeholder_tensor = torch::empty({1, 1}, torch::kInt32).to(device_);
-  placeholder = atb_speed::Utils::AtTensor2Tensor(placeholder_tensor);
+  // Use member variable to keep tensor alive for ATB operations
+  placeholder_tensor_ = torch::empty({1, 1}, torch::kInt32).to(device_);
+  placeholder = atb_speed::Utils::AtTensor2Tensor(placeholder_tensor_);
   at_placeholder =
       torch::empty({1, context.get_model_args().hidden_size()}, dtype_)
           .to(device_);
@@ -621,8 +622,6 @@ void NpuOneRecBlockLayerImpl::verify_loaded_weights(
     }
 
     // if (is_relative_bias && is_placeholder) {
-    //   LOG(INFO) << "[ONEREC DEBUG] Weight " << prefix << name
-    //             << " is placeholder (expected for non-first layers)";
     // }
   }
 }
@@ -630,13 +629,6 @@ void NpuOneRecBlockLayerImpl::verify_loaded_weights(
 void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
   // Debug: Print shapes before merging
   /*
-  LOG(INFO) << "[ONEREC DEBUG] Before merging QKV weights:";
-  LOG(INFO) << "[ONEREC DEBUG]   Q weight shape: ["
-            << at_weight_tensors_[IN_Q_WEIGHT].sizes() << "]";
-  LOG(INFO) << "[ONEREC DEBUG]   K weight shape: ["
-            << at_weight_tensors_[IN_K_WEIGHT].sizes() << "]";
-  LOG(INFO) << "[ONEREC DEBUG]   V weight shape: ["
-            << at_weight_tensors_[IN_V_WEIGHT].sizes() << "]";
   */
   // Check if weights were properly loaded (not placeholders)
   bool q_loaded = !(at_weight_tensors_[IN_Q_WEIGHT].sizes().size() == 2 &&
@@ -646,10 +638,6 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
   bool v_loaded = !(at_weight_tensors_[IN_V_WEIGHT].sizes().size() == 2 &&
                     at_weight_tensors_[IN_V_WEIGHT].sizes()[0] == 1);
   /*
-  LOG(INFO) << "[ONEREC DEBUG] Weight loading status: Q="
-            << (q_loaded ? "loaded" : "placeholder")
-            << ", K=" << (k_loaded ? "loaded" : "placeholder")
-            << ", V=" << (v_loaded ? "loaded" : "placeholder");
   */
   if (!q_loaded || !k_loaded || !v_loaded) {
     LOG(ERROR)
@@ -697,10 +685,6 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
                                   at_weight_tensors_[IN_V_WEIGHT]},
                                  0);
   /*
-  LOG(INFO) << "[ONEREC DEBUG] After merging QKV weights:";
-  LOG(INFO) << "[ONEREC DEBUG]   Merged Q weight shape: [" <<
-  new_q_weight.sizes()
-            << "]";
   */
 
   at_weight_tensors_[IN_Q_WEIGHT] = new_q_weight;
@@ -745,7 +729,6 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
             .to(dtype_);
   } else {
     // MoE mode: Merge expert weights similar to Qwen3 and DeepseekV2
-    LOG(INFO) << "[ONEREC DEBUG] MoE mode: merging expert weights";
 
     // Call merge_experts_weights to process the loaded expert weights
     merge_experts_weights();
@@ -754,26 +737,16 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
     merge_shared_experts_weights();
 
     if (at_weight_tensors_[IN_MOE_EXPERT_W1_WEIGHT].numel() > 1) {
-      LOG(INFO) << "[ONEREC DEBUG] Expert W1 weights shape: ["
-                << at_weight_tensors_[IN_MOE_EXPERT_W1_WEIGHT].sizes() << "]";
     }
     if (at_weight_tensors_[IN_MOE_EXPERT_W2_WEIGHT].numel() > 1) {
-      LOG(INFO) << "[ONEREC DEBUG] Expert W2 weights shape: ["
-                << at_weight_tensors_[IN_MOE_EXPERT_W2_WEIGHT].sizes() << "]";
     }
     if (at_weight_tensors_[IN_MOE_EXPERT_W3_WEIGHT].numel() > 1) {
-      LOG(INFO) << "[ONEREC DEBUG] Expert W3 weights shape: ["
-                << at_weight_tensors_[IN_MOE_EXPERT_W3_WEIGHT].sizes() << "]";
     }
 
     // Log shared expert weights if they exist
     if (at_weight_tensors_[IN_MOE_SHARED_W1_WEIGHT].numel() > 1) {
-      LOG(INFO) << "[ONEREC DEBUG] Shared Expert W1 weights shape: ["
-                << at_weight_tensors_[IN_MOE_SHARED_W1_WEIGHT].sizes() << "]";
     }
     if (at_weight_tensors_[IN_MOE_SHARED_W2_WEIGHT].numel() > 1) {
-      LOG(INFO) << "[ONEREC DEBUG] Shared Expert W2 weights shape: ["
-                << at_weight_tensors_[IN_MOE_SHARED_W2_WEIGHT].sizes() << "]";
     }
   }
 
@@ -806,8 +779,6 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
     }
   }
   // if (fixed_placeholders > 0) {
-  //   LOG(INFO) << "[ONEREC DEBUG] Fixed " << fixed_placeholders
-  //             << " placeholder tensors with invalid deviceData";
   // }
 
   c10_npu::NPUCachingAllocator::emptyCache();
@@ -834,26 +805,17 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
   }();
 
   // Debug: Print all available weights in StateDict
-  LOG(INFO) << "[ONEREC DEBUG] Available weights in StateDict for "
-            << (is_decoder_ ? "decoder" : "encoder") << ":";
   for (const auto& [key, tensor] : state_dict) {
-    LOG(INFO) << "[ONEREC DEBUG]   " << key << " -> shape: [" << tensor.sizes()
-              << "]";
   }
 
   // Debug: Print expected weight mappings
-  LOG(INFO) << "[ONEREC DEBUG] Expected weight mappings:";
   for (const auto& [name, index] : weight_mapping) {
-    LOG(INFO) << "[ONEREC DEBUG]   " << name << " -> index: " << index;
   }
 
   // Debug: Check actual weight name matching
-  LOG(INFO) << "[ONEREC DEBUG] Checking weight name matching:";
   for (const auto& [state_key, tensor] : state_dict) {
     for (const auto& [mapping_name, index] : weight_mapping) {
       if (absl::EndsWith(state_key, mapping_name)) {
-        LOG(INFO) << "[ONEREC DEBUG] MATCH: " << state_key << " matches "
-                  << mapping_name;
       }
     }
   }
@@ -882,10 +844,6 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
         if (state_key.find(".down_proj.weight") != std::string::npos ||
             state_key.find(".w2.weight") != std::string::npos) {
           at_weight_tensors_[IN_MLP_DOWN_WEIGHT_SHARED_EXPERT] = tensor;
-          LOG(INFO)
-              << "[ONEREC DEBUG] Also stored shared expert down weight in "
-                 "at_weight_tensors_, shape: ["
-              << tensor.sizes() << "]";
         }
       }
 
@@ -893,16 +851,11 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
       // if (state_key.find(".shared_expert_gate.weight") != std::string::npos)
       // {
       //   at_weight_tensors_[IN_SHARED_EXPERT_GATE_WEIGHT] = tensor;
-      //   LOG(INFO) << "[ONEREC DEBUG] Loaded shared expert gate weight, shape:
-      //   ["
-      //             << tensor.sizes() << "]";
       // }
     }
   }
 
   for (const auto& [name, index] : weight_mapping) {
-    LOG(INFO) << "[ONEREC DEBUG] Loading weight: " << name << " (index "
-              << index << ")" << ", " << at_weight_tensors_.size();
     auto initial_shape = at_weight_tensors_[index].sizes();
 
     // Special handling for relative_attention_bias - it's optional and only
@@ -919,9 +872,6 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
     }
 
     if (is_relative_bias && !weight_exists) {
-      LOG(INFO) << "[ONEREC DEBUG] Weight " << name << " (index " << index
-                << ") SKIPPED: not present in this layer (expected for "
-                   "non-first layers)";
       continue;
     }
 
@@ -935,9 +885,6 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
     // Debug: Check if weight was actually loaded
     bool was_loaded = !(final_shape.size() == 2 && final_shape[0] == 1 &&
                         initial_shape == final_shape);
-    LOG(INFO) << "[ONEREC DEBUG] Weight " << name << " (index " << index
-              << ") loaded: " << (was_loaded ? "YES" : "NO") << ", shape: ["
-              << final_shape << "]" << ", weight exists: " << weight_exists;
   }
   LOG(INFO) << "ONERECBlockLayerImpl end load state dict";
 }
@@ -950,7 +897,11 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
   LOG(INFO) << "begin init prefill param: " << prefill_param_.isPrefill
             << " is_decoder_: " << is_decoder_ << " layer_id_: " << layer_id_;
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
-  if (is_decoder_ && !FLAGS_enable_rec_prefill_only) {
+  // Initialize decode_node if:
+  // 1. Not in prefill-only mode, OR
+  // 2. Using multi-round decode (step_multi_round needs decode capability)
+  if (is_decoder_ &&
+      (!FLAGS_enable_rec_prefill_only || FLAGS_max_decode_rounds > 0)) {
     CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
   }
   return atb::NO_ERROR;
@@ -983,9 +934,6 @@ int64_t NpuOneRecBlockLayerImpl::init_node(
   uint32_t outputNum = node.operation->GetOutputNum();
 
   // Debug logging for ONEREC tensor count issue
-  LOG(INFO) << "[ONEREC DEBUG] " << modelName_
-            << " - ATB operation inputNum: " << inputNum
-            << ", outputNum: " << outputNum << ", is_decoder: " << is_decoder_;
 
   if (inputNum < 1) {
     LOG(ERROR) << "Invalid input number: " << inputNum;
@@ -1013,10 +961,6 @@ int64_t NpuOneRecBlockLayerImpl::init_node(
     required_tensors = 84;  // Encoder: 79 weights + 5 non-weights
   }
   if (inputNum < required_tensors) {
-    LOG(WARNING) << "[ONEREC DEBUG] " << modelName_
-                 << " - ATB operation provides only " << inputNum
-                 << " input tensors, but we need at least " << required_tensors
-                 << " tensors. This may cause out_of_range errors.";
   }
 
   node.inTensors.resize(inputNum);
@@ -1060,6 +1004,10 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   //@TODO: delete
   // prefill_param_.inputParams = &input_params;
   // decode_param_.inputParams = &input_params;
+
+  // Debug log for tracking decode stage
+  if (input_params.rec_params.has_value()) {
+  }
 
   if (input_params.rec_params && input_params.is_prefill) {
     // Prefill stage
@@ -1145,11 +1093,6 @@ void NpuOneRecBlockLayerImpl::build_encoder_node_variant_pack(
 
   // Debug logging for tensor array sizes
   /*
-  LOG(INFO) << "[ONEREC DEBUG] build_encoder_node_variant_pack - "
-               "variantPack.inTensors.size(): "
-            << node.variantPack.inTensors.size()
-            << ", ONEREC_WEIGHT_COUNT_PER_LAYER: " <<
-  ONEREC_WEIGHT_COUNT_PER_LAYER;
   */
 
   // Weight tensors (indices 0-78)
@@ -1327,8 +1270,9 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   node.variantPack.inTensors.at(idx) = placeholder;
   node.variantPack.inTensors.at(idx++).hostData = placeholder_vec_.data();
 
-  // Block tables
-  if (!FLAGS_enable_rec_prefill_only && input_params.block_tables.defined()) {
+  // Block tables - check both defined() and numel() > 0 to avoid empty tensor
+  if (!FLAGS_enable_rec_prefill_only && input_params.block_tables.defined() &&
+      input_params.block_tables.numel() > 0) {
     node.variantPack.inTensors.at(idx) =
         atb_speed::Utils::AtTensor2Tensor(input_params.block_tables);
   } else {
@@ -1337,9 +1281,10 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   }
   idx++;
 
-  // Cache slots
+  // Cache slots - check both defined() and numel() > 0 to avoid empty tensor
   if (!FLAGS_enable_rec_prefill_only &&
-      input_params.new_cache_slots.defined()) {
+      input_params.new_cache_slots.defined() &&
+      input_params.new_cache_slots.numel() > 0) {
     node.variantPack.inTensors.at(idx) =
         atb_speed::Utils::AtTensor2Tensor(input_params.new_cache_slots);
   } else {
@@ -1435,9 +1380,6 @@ void NpuOneRecBlockLayerImpl::build_decoder_node_variant_pack(
     placeholder_count++;
   }
   /*
-  LOG(INFO) << "[ONEREC DEBUG] total fill " << placeholder_count << "
-  placeholders "
-            << tensor_idx << ":" << node.variantPack.inTensors.size();
   */
 
   // Final validation: Check for tensors without deviceData
@@ -1534,35 +1476,24 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
   // Use 2D indexing like Qwen3 and DeepSeek V2
   experts_weights_[suffix][local_index] = tensor.clone();
 
-  LOG(INFO) << "[ONEREC DEBUG] Stored expert " << expert_id
-            << " (local_index: " << local_index << ") weight: " << suffix
-            << ", shape: [" << tensor.sizes() << "]";
 }
 
 void NpuOneRecBlockLayerImpl::process_shared_expert_weights(
     const StateDict& state_dict,
     const std::string& name,
     const torch::Tensor& tensor) {
-  LOG(INFO) << "[ONEREC DEBUG] Processing shared expert weight: " << name
-            << ", shape: [" << tensor.sizes() << "]";
 
   torch::Tensor tmp_tensor = tensor.to(device_);
 
   // Determine which shared expert weight this is
   if (absl::StrContains(name, "gate_proj") || absl::StrContains(name, "w1")) {
     shared_expert_gate_weights_.push_back(tmp_tensor);
-    LOG(INFO) << "[ONEREC DEBUG] Added shared expert gate weight, total: "
-              << shared_expert_gate_weights_.size();
   } else if (absl::StrContains(name, "up_proj") ||
              absl::StrContains(name, "w3")) {
     shared_expert_up_weights_.push_back(tmp_tensor);
-    LOG(INFO) << "[ONEREC DEBUG] Added shared expert up weight, total: "
-              << shared_expert_up_weights_.size();
   } else if (absl::StrContains(name, "down_proj") ||
              absl::StrContains(name, "w2")) {
     shared_expert_down_weights_.push_back(tmp_tensor);
-    LOG(INFO) << "[ONEREC DEBUG] Added shared expert down weight, total: "
-              << shared_expert_down_weights_.size();
   } else {
     LOG(WARNING) << "[ONEREC WARNING] Unknown shared expert weight type: "
                  << name;
@@ -1585,8 +1516,6 @@ int NpuOneRecBlockLayerImpl::extract_expert_index(const std::string& name) {
   try {
     return std::stoi(name.substr(start_pos, end_pos - start_pos));
   } catch (const std::exception& e) {
-    LOG(WARNING) << "[ONEREC DEBUG] Failed to extract expert index from: "
-                 << name;
     return -1;
   }
 }
@@ -1612,21 +1541,14 @@ std::string NpuOneRecBlockLayerImpl::extract_endswith(
 
 // Implementation of merge_experts_weights functions - reference from Qwen3
 void NpuOneRecBlockLayerImpl::merge_experts_weights() {
-  LOG(INFO) << "[ONEREC DEBUG] merge_experts_weights begin";
 
   // Check if required weights exist
   if (experts_weights_.count("gate_proj.weight") == 0 ||
       experts_weights_.count("up_proj.weight") == 0 ||
       experts_weights_.count("down_proj.weight") == 0) {
-    LOG(WARNING)
-        << "[ONEREC DEBUG] Missing required expert weights, skipping merge";
     return;
   }
 
-  LOG(INFO) << "[ONEREC DEBUG] merge gate_proj "
-            << experts_weights_["gate_proj.weight"].size()
-            << " and up_proj weights: "
-            << experts_weights_["up_proj.weight"].size();
   try {
     // Convert 2D experts_weights_ to 1D vectors for merging
     std::vector<torch::Tensor> gate_weights_1d;
@@ -1644,8 +1566,6 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
       }
     }
 
-    LOG(INFO) << "[ONEREC DEBUG] Extracted " << gate_weights_1d.size()
-              << " gate weights and " << up_weights_1d.size() << " up weights";
 
     torch::Tensor mlp_gateup_weight;
     if (quantize_type_.compare("w8a8_dynamic") == 0) {
@@ -1690,8 +1610,6 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
     throw;
   }
 
-  LOG(INFO) << "[ONEREC DEBUG] merge down_proj "
-            << experts_weights_["down_proj.weight"].size();
   try {
     // Convert 2D down_proj weights to 1D vector
     std::vector<torch::Tensor> down_weights_1d;
@@ -1701,8 +1619,6 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
       }
     }
 
-    LOG(INFO) << "[ONEREC DEBUG] Extracted " << down_weights_1d.size()
-              << " down weights";
 
     torch::Tensor mlp_down_weight =
         merge_experts_weights(down_weights_1d, /*transpose=*/false);
@@ -1734,14 +1650,11 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
     LOG(ERROR) << "[ERROR] Exception in down weight processing: " << e.what();
     throw;
   }
-  LOG(INFO) << "[ONEREC DEBUG] end merge_experts_weights()";
 }
 
 torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
     std::vector<torch::Tensor>& experts,
     bool transpose) {
-  LOG(INFO) << "[ONEREC DEBUG] merge_experts_weights, experts size: "
-            << experts.size();
   torch::Tensor merged_tensor = torch::stack(experts, 0).to(device_);
   // Bypass torch::stack operation, generate random tensor with correct shape
   // torch::Tensor merged_tensor;
@@ -1758,8 +1671,6 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
   //                                    .dtype(experts[0].dtype())
   //                                    .device(experts[0].device()))
   //                       .to(device_);
-  //   LOG(INFO) << "[ONEREC DEBUG] Generated random merged tensor with shape: "
-  //             << merged_tensor.sizes();
   // }
 
   if (transpose) {
@@ -1767,8 +1678,6 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
   }
   merged_tensor = merged_tensor.contiguous();
   experts.clear();
-  LOG(INFO) << "[ONEREC DEBUG] merge_experts_weights, return tensor size: "
-            << merged_tensor.sizes();
   return merged_tensor;
 }
 
@@ -1776,8 +1685,6 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
     std::vector<torch::Tensor>& experts_gate,
     std::vector<torch::Tensor>& experts_up,
     bool transpose) {
-  LOG(INFO) << "[ONEREC DEBUG] merge_experts_weights, gate size: "
-            << experts_gate.size() << " up size: " << experts_up.size();
   for (size_t i = 0; i < experts_up.size(); ++i) {
     experts_gate[i] = torch::cat({experts_gate[i], experts_up[i]}, 0);
   }
@@ -1807,8 +1714,6 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
   //       final_shape, torch::TensorOptions().dtype(dtype).device(device_));
   // }
 
-  LOG(INFO) << "[ONEREC DEBUG] Generated random tensor with shape: "
-            << merged_tensor.sizes();
 
   if (transpose) {
     merged_tensor = merged_tensor.transpose(1, 2);
@@ -1816,58 +1721,42 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
   merged_tensor = merged_tensor.contiguous();
   experts_gate.clear();
   experts_up.clear();
-  LOG(INFO) << "[ONEREC DEBUG] merge_experts_weights, return tensor size: "
-            << merged_tensor.sizes();
   return merged_tensor;
 }
 
 void NpuOneRecBlockLayerImpl::merge_shared_experts_weights() {
-  LOG(INFO) << "[ONEREC DEBUG] merge_shared_experts_weights called";
 
   // Check if we have shared expert weights to merge
   if (shared_expert_gate_weights_.empty() &&
       shared_expert_up_weights_.empty() &&
       shared_expert_down_weights_.empty()) {
-    LOG(INFO) << "[ONEREC DEBUG] No shared expert weights to merge";
     return;
   }
 
   // Merge shared expert gate and up weights (similar to regular experts)
   if (!shared_expert_gate_weights_.empty() &&
       !shared_expert_up_weights_.empty()) {
-    LOG(INFO) << "[ONEREC DEBUG] Merging shared expert gate and up weights, "
-                 "gate size: "
-              << shared_expert_gate_weights_.size()
-              << ", up size: " << shared_expert_up_weights_.size();
 
     // Concatenate gate and up weights for shared expert
     auto merged_gate_up = merge_experts_weights(
         shared_expert_gate_weights_, shared_expert_up_weights_, false);
     at_weight_tensors_[IN_MLP_GATEUP_WEIGHT_SHARED_EXPERT] = merged_gate_up;
 
-    LOG(INFO) << "[ONEREC DEBUG] Shared expert gate+up merged tensor shape: "
-              << merged_gate_up.sizes();
   } else if (!shared_expert_gate_weights_.empty()) {
     // Only gate weights available
     auto merged_gate =
         merge_experts_weights(shared_expert_gate_weights_, false);
     at_weight_tensors_[IN_MLP_GATEUP_WEIGHT_SHARED_EXPERT] = merged_gate;
 
-    LOG(INFO) << "[ONEREC DEBUG] Shared expert gate merged tensor shape: "
-              << merged_gate.sizes();
   }
 
   // Merge shared expert down weights
   if (!shared_expert_down_weights_.empty()) {
-    LOG(INFO) << "[ONEREC DEBUG] Merging shared expert down weights, size: "
-              << shared_expert_down_weights_.size();
 
     auto merged_down =
         merge_experts_weights(shared_expert_down_weights_, false);
     at_weight_tensors_[IN_MLP_DOWN_WEIGHT_SHARED_EXPERT] = merged_down;
 
-    LOG(INFO) << "[ONEREC DEBUG] Shared expert down merged tensor shape: "
-              << merged_down.sizes();
   }
 
   // Clear the temporary storage vectors
@@ -1875,7 +1764,6 @@ void NpuOneRecBlockLayerImpl::merge_shared_experts_weights() {
   shared_expert_up_weights_.clear();
   shared_expert_down_weights_.clear();
 
-  LOG(INFO) << "[ONEREC DEBUG] merge_shared_experts_weights completed";
 }
 }  // namespace layer
 }  // namespace xllm

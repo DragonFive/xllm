@@ -133,6 +133,7 @@ class NpuOneRecBlockLayerImpl : public NpuBaseLayer {
   at::Tensor encoder_output_contiguous_;  // Cache contiguous encoder_output to
                                           // avoid repeated contiguous() calls
   at::Tensor at_placeholder;
+  at::Tensor placeholder_tensor_;  // Keep placeholder tensor alive for ATB
   std::vector<int32_t> seq_lens_vec_;     // Store sequence lengths for hostData
   std::vector<int32_t> placeholder_vec_;  // Store placeholder data for hostData
   std::vector<int32_t> encoder_seq_lens_vec_;
