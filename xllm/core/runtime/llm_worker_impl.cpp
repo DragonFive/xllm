@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "common/device_monitor.h"
 #include "common/metrics.h"
+#include "common/mspti_helper.h"
 #include "common/types.h"
 #include "core/common/global_flags.h"
 #include "framework/kv_cache/kv_cache.h"
@@ -261,7 +262,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         std::move(inputs.micro_inputs[i].input_params));
   }
 
-
   int32_t total_rounds = inputs.micro_inputs[0].total_round;
   ForwardOutput output;
 
@@ -285,13 +285,11 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       torch::zeros({batch, beam_width_init, total_rounds}, int_options);
   // preallocate outputs and cached inputs
   int64_t num_seq = batch * beam_width_init;
-  torch::Tensor acc_logprob = torch::empty({num_seq, 1}, fp32_options);
-  torch::Tensor out_log_probs = torch::empty({num_seq, 1}, fp32_options);
+  torch::Tensor acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
   torch::Tensor out_token_ids = torch::empty({num_seq, 1}, int_options);
   torch::Tensor out_token_index = torch::empty({num_seq, 1}, int_options);
   torch::Tensor out_beam_count_prefix_sums =
       torch::empty({num_seq, 1}, int_options);
-  auto out_seqgroup = sequence_group.clone();
 
   // ========== Rec backend: detect and setup ==========
   const bool is_rec_backend = (FLAGS_backend == "rec");
@@ -312,35 +310,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       // Set hybrid mode if sparse embedding is defined
       if (rec_params.encoder_sparse_embedding.defined()) {
         input_params_micro_batches[0].rec_params->is_hybrid_mode = true;
-      }
-    }
-
-    // Setup shared cross-attention k/v caches for rec model
-    // These are used in decoder's cross-attention layers
-    // Build continuous tensors from shape passed from CPU
-    if (input_params_micro_batches[0].rec_params->shared_k_caches.empty()) {
-      const auto& shape =
-          input_params_micro_batches[0].rec_params->shared_cross_kv_shape;
-      // Shape format: [batch_size, encoder_max_seq_len, n_kv_heads * head_dim]
-      if (shape.size() == 3) {
-        int64_t batch_size = shape[0];
-        int64_t encoder_max_seq_len = shape[1];
-        int64_t kv_hidden_size = shape[2];  // n_kv_heads * head_dim
-        auto fp_options = torch::TensorOptions().dtype(dtype_).device(device_);
-        input_params_micro_batches[0].rec_params->shared_k_caches.reserve(
-            layer_num);
-        input_params_micro_batches[0].rec_params->shared_v_caches.reserve(
-            layer_num);
-        for (int32_t layer_id = 0; layer_id < layer_num; ++layer_id) {
-          input_params_micro_batches[0]
-              .rec_params->shared_k_caches.emplace_back(torch::zeros(
-                  {batch_size, encoder_max_seq_len, kv_hidden_size},
-                  fp_options));
-          input_params_micro_batches[0]
-              .rec_params->shared_v_caches.emplace_back(torch::zeros(
-                  {batch_size, encoder_max_seq_len, kv_hidden_size},
-                  fp_options));
-        }
       }
     }
   }
@@ -377,8 +346,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         // Hybrid mode: use sparse embedding, positions not needed
         // Convert sparse embedding to model dtype and move to device
         // (serialization converts to fp32, need to restore to model dtype)
-        auto sparse_embedding = rec_params.encoder_sparse_embedding
-            .to(dtype_).to(device_);
+        auto sparse_embedding =
+            rec_params.encoder_sparse_embedding.to(dtype_).to(device_);
         encoder_tokens.push_back(sparse_embedding);
         // Create a placeholder positions tensor for hybrid mode
         // The model will ignore this in hybrid mode
@@ -411,7 +380,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       // Standard LLM forward or rec decode rounds (round > 0)
 
       // For rec model decode rounds: ensure positions are available
-      if (is_rec_backend && round > 0 && flatten_positions_micro_batches.empty()) {
+      if (is_rec_backend && round > 0 &&
+          flatten_positions_micro_batches.empty()) {
         int32_t num_seqs = batch * beam_width_init;
         std::vector<int32_t> positions_vec(num_seqs);
         for (int32_t s = 0; s < num_seqs; ++s) {
@@ -455,18 +425,19 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                          .reshape({-1, beam_width});
         top_logprobs = sample_output.top_logprobs.reshape({-1, beam_width});
       }
-      xllm_ops::beam_search(acc_logprob,
-                            top_tokens,
-                            top_logprobs,
-                            sequence_group,
-                            round,
-                            out_token_ids,
-                            out_token_index,
-                            out_log_probs,
-                            out_beam_count_prefix_sums,
-                            out_seqgroup);
-      sequence_group.copy_(out_seqgroup);
-      acc_logprob.copy_(out_log_probs);
+      {
+        LLM_MSTX_RANGE();
+        xllm_ops::beam_search(acc_logprob,
+                              top_tokens,
+                              top_logprobs,
+                              sequence_group,
+                              round,
+                              out_token_ids,
+                              out_token_index,
+                              acc_logprob,
+                              out_beam_count_prefix_sums,
+                              sequence_group);
+      }
       // keep group offset contiguous across rounds (already in out_* tensors)
       // update next round tokens.
       if (round == 0) {
@@ -487,11 +458,12 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
               mip.decode_positions_tensor_list[round]);
         }
       }
-      // For rec model: if decode_positions_tensor_list is empty, generate positions
-      // based on prompt_len + round + 1 (next round's position)
+      // For rec model: if decode_positions_tensor_list is empty, generate
+      // positions based on prompt_len + round + 1 (next round's position)
       if (is_rec_backend && flatten_positions_micro_batches.empty() &&
           round < total_rounds - 1) {
-        // Get prompt length from decode_positions_vec (stored prompt_len values)
+        // Get prompt length from decode_positions_vec (stored prompt_len
+        // values)
         int32_t next_round = round + 1;
         int32_t num_seqs = batch * beam_width_init;
         // Position for decode round is prompt_len + round
@@ -516,14 +488,15 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         output.max_top_logprobs = concated_sampling_params.max_top_logprobs;
         output.beam_search_output.src_seq_idxes = out_token_index.reshape({-1});
         output.beam_search_output.out_tokens = out_token_ids.reshape({-1});
-        output.beam_search_output.out_logprobs = out_log_probs.reshape({-1});
+        output.beam_search_output.out_logprobs = acc_logprob.reshape({-1});
         output.beam_search_output.group_offset =
             out_beam_count_prefix_sums.reshape({-1});
         output.beam_sequence_group = sequence_group;
       }
 
 #if defined(USE_NPU)
-      if (beam_width > 1 && round > 0) {
+      if (beam_width > 1 && round > 0 && round < total_rounds - 1) {
+        LLM_MSTX_RANGE();
         xllm_ops::cache_select(out_token_index,
                                unshared_k_cache,
                                unshared_v_cache,
