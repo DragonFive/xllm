@@ -465,18 +465,27 @@ void WorkerImpl::prepare_work_before_execute(
         int32_t total_round = fwd_inputs_on_device.total_round;
         const auto& shape = fwd_inputs_on_device.shared_kv_shape;
 
+        const auto& args = context_.get_model_args();
+        const int32_t decoder_layers = static_cast<int32_t>(args.n_layers());
+        const int32_t encoder_layers =
+            static_cast<int32_t>(args.n_encoder_layers());
+        (void)encoder_layers;  // encoder layers are used only on encoder path
+        const int32_t shared_kv_layers = decoder_layers;  // decode self-attn
+        const int32_t rec_cross_layers = decoder_layers;  // cross-attn per decoder layer
+
+        auto fp_options =
+            torch::TensorOptions().dtype(dtype_).device(device_);
+
         if (shape.size() == 3) {
           int64_t num_tokens = shape[0];
           int64_t head_num = shape[1];
           int64_t head_dim = shape[2];
-          auto fp_options =
-              torch::TensorOptions().dtype(dtype_).device(device_);
-          int32_t num_layers = context_.get_model_args().n_layers();
           mip.shared_k_caches.clear();
           mip.shared_v_caches.clear();
-          mip.shared_k_caches.reserve(num_layers);
-          mip.shared_v_caches.reserve(num_layers);
-          for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+          mip.shared_k_caches.reserve(shared_kv_layers);
+          mip.shared_v_caches.reserve(shared_kv_layers);
+          for (int32_t layer_id = 0; layer_id < shared_kv_layers;
+               ++layer_id) {
             mip.shared_k_caches.emplace_back(
                 torch::zeros({num_tokens, head_num, head_dim}, fp_options));
             mip.shared_v_caches.emplace_back(
@@ -493,9 +502,10 @@ void WorkerImpl::prepare_work_before_execute(
             int64_t batch_size = cross_shape[0];
             int64_t encoder_max_seq_len = cross_shape[1];
             int64_t kv_hidden_size = cross_shape[2];
-            mip.rec_params->shared_k_caches.reserve(num_layers);
-            mip.rec_params->shared_v_caches.reserve(num_layers);
-            for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+            mip.rec_params->shared_k_caches.reserve(rec_cross_layers);
+            mip.rec_params->shared_v_caches.reserve(rec_cross_layers);
+            for (int32_t layer_id = 0; layer_id < rec_cross_layers;
+                 ++layer_id) {
               mip.rec_params->shared_k_caches.emplace_back(torch::zeros(
                   {batch_size, encoder_max_seq_len, kv_hidden_size},
                   fp_options));
