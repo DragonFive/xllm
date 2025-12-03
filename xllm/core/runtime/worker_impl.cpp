@@ -483,6 +483,28 @@ void WorkerImpl::prepare_work_before_execute(
                 torch::zeros({num_tokens, head_num, head_dim}, fp_options));
           }
         }
+        // Setup shared cross-attention k/v caches for rec model
+        // These are used in decoder's cross-attention layers
+        if (mip.rec_params.has_value() &&
+            mip.rec_params->shared_k_caches.empty()) {
+          const auto& cross_shape = mip.rec_params->shared_cross_kv_shape;
+          // Shape format: [batch_size, encoder_max_seq_len, n_kv_heads * head_dim]
+          if (cross_shape.size() == 3) {
+            int64_t batch_size = cross_shape[0];
+            int64_t encoder_max_seq_len = cross_shape[1];
+            int64_t kv_hidden_size = cross_shape[2];
+            mip.rec_params->shared_k_caches.reserve(num_layers);
+            mip.rec_params->shared_v_caches.reserve(num_layers);
+            for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+              mip.rec_params->shared_k_caches.emplace_back(torch::zeros(
+                  {batch_size, encoder_max_seq_len, kv_hidden_size},
+                  fp_options));
+              mip.rec_params->shared_v_caches.emplace_back(torch::zeros(
+                  {batch_size, encoder_max_seq_len, kv_hidden_size},
+                  fp_options));
+            }
+          }
+        }
         // scalar metadata tensors (int32 on device)
         {
           auto int_options =
