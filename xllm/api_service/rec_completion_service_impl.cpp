@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <sstream>
 #include <string>
 
 #include "common/global_flags.h"
@@ -161,10 +162,9 @@ void RecCompletionServiceImpl::process_async_impl(
 
   const auto& rpc_request_ref = call->request();
   std::optional<MMData> mm_data = std::nullopt;
-  if (rpc_request_ref.input_tensors_size()) {
-    // HISTOGRAM_OBSERVE(rec_input_first_dim,
-    //                  rpc_request_ref.input_tensors(0).shape(0));
 
+  
+  if (rpc_request_ref.input_tensors_size()) {
     MMDict mm_dict;
     for (int i = 0; i < rpc_request_ref.input_tensors_size(); ++i) {
       const auto& tensor = rpc_request_ref.input_tensors(i);
@@ -207,8 +207,9 @@ void RecCompletionServiceImpl::process_async_impl(
           master->get_rate_limiter()->decrease_one_request();
         }
 
-        return send_result_to_client_brpc_rec(
+        auto result = send_result_to_client_brpc_rec(
             call, request_id, created_time, model, req_output);
+        return result;
       });
 }
 

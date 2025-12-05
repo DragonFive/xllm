@@ -391,73 +391,30 @@ class OneRecStackImpl : public torch::nn::Module {
     if (input_params.rec_params->is_hybrid_mode && !is_decoder_) {
       h = tokens;
     } else {
-      // Prefill-only mode: concatenate decoder_context_embedding with token
-      // embeddings Prefill+decode mode: only use decoder_context_embedding in
-      // prefill stage
-      const bool is_prefill = input_params.is_prefill;
-      const bool should_concat_context =
-          FLAGS_enable_rec_prefill_only ||
-          (is_prefill &&
-           input_params.rec_params->decoder_context_embedding.defined());
-
-      if (should_concat_context &&
-          input_params.rec_params->decoder_context_embedding.defined()) {
-        // use context embedding replacing bos + prompt tokens
-        if (tokens.sizes() == 0) {
+      // Handle decoder embeddings based on mode
+      if (FLAGS_enable_rec_prefill_only) {
+        // Mode 1: Prefill-only mode
+        // Always use decoder_context_embedding if available
+        if (input_params.rec_params->decoder_context_embedding.defined()) {
           h = input_params.rec_params->decoder_context_embedding;
         } else {
           h = embed_tokens_(tokens, 0);
-
-          // Reshape tensors for interleaving
-          // decoder_context_embedding: [bs * group_width * seq_len2,
-          // hidden_size] h: [bs * group_width * seq_len1, hidden_size]
-          auto& context_emb =
-              input_params.rec_params->decoder_context_embedding;
-          auto& token_emb = h;
-          const int64_t hidden_size = context_emb.size(3);
-          // Use num_sequences and beam_width from input_params
-          const int64_t bs = input_params.num_sequences;
-          const int64_t group_width = input_params.beam_width;
-
-          const int64_t context_total_tokens = context_emb.size(2);
-          const int64_t token_total_tokens = token_emb.size(0);
-
-          // Assume bs * group_width is the same for both tensors
-          // We need to determine seq_len1 and seq_len2 from the tensor shapes
-          // For now, assume seq_len2 is provided via input_params.q_max_seq_len
-          // or can be inferred
-          const int64_t bs_group = bs * group_width;
-          const int64_t seq_len1 = token_total_tokens / bs_group;
-
-          // Use pre-allocated combined space from batch.cpp
-          // context_emb is already in shape [bs, group_width, total_len,
-          // hidden_size] The first seq_len2 part has been filled with
-          // context_embedding
-          const int64_t total_len = context_total_tokens;
-          const int64_t seq_len2 = total_len - seq_len1;
-
-          // token_emb shape is [bs * group_width * seq_len1, hidden_size]
-          // Need to reshape to [bs, group_width, seq_len1,
-          // hidden_size] for corresponding copying
-          auto token_embedding_reshaped =
-              token_emb.view({bs, group_width, seq_len1, hidden_size});
-
-          // Copy token_embedding to the last seq_len1 part of context_emb
-          // Use narrow to slice from seq_len2 position in dimension 2, taking
-          // seq_len1 length
-          context_emb.narrow(2, seq_len2, seq_len1)
-              .copy_(token_embedding_reshaped);
-
-          // Reshape to final shape
-          h = context_emb.view({-1, hidden_size}).clone();
-        }
-        if (!h.is_contiguous()) {
-          h = h.contiguous();
         }
       } else {
-        // Decode stage in prefill+decode mode: just use token embeddings
-        // directly
-        h = embed_tokens_(tokens, 0);
+        // Mode 2: Prefill+decode mode
+        const bool is_prefill = input_params.is_prefill;
+        if (is_prefill &&
+            input_params.rec_params->decoder_context_embedding.defined()) {
+          // Prefill stage: use decoder_context_embedding directly
+          // Shape: [seq_len, hidden_size]
+          h = input_params.rec_params->decoder_context_embedding;
+        } else {
+          // Decode stage: use token embeddings
+          h = embed_tokens_(tokens, 0);
+        }
+      }
+      if (!h.is_contiguous()) {
+        h = h.contiguous();
       }
     }
 

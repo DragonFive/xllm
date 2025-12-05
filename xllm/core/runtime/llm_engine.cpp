@@ -667,11 +667,13 @@ ForwardOutput LLMEngine::step_multi_round(std::vector<Batch>& batch) {
   DCHECK(dp_size_ == batch.size())
       << "Split DP batch failed with dp_size as " << dp_size_
       << " and actual batch size as " << batch.size() << ".";
+
   auto batched_raw_forward_inputs = prepare_inputs(batch);
   DCHECK(dp_size_ == batched_raw_forward_inputs.size())
       << "The processed raw forward inputs size "
       << batched_raw_forward_inputs.size() << " is not equal to dp size "
       << dp_size_ << ".";
+
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
   for (auto worker_rank = 0; worker_rank < worker_clients_num_; ++worker_rank) {
@@ -701,8 +703,8 @@ ForwardOutput LLMEngine::step_multi_round(std::vector<Batch>& batch) {
   }
   COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
   // finish all sequences in the batch
-  for (auto& b : batch) {
-    b.finish();
+  for (size_t i = 0; i < batch.size(); ++i) {
+    batch[i].finish();
   }
   return {};
 }

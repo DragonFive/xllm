@@ -84,6 +84,8 @@ void APIService::Completions(::google::protobuf::RpcController* controller,
     LOG(ERROR) << "brpc request | respose | controller is null.";
     return;
   }
+
+  
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
   auto arena = response->GetArena();
   std::shared_ptr<Call> call = std::make_shared<CompletionCall>(

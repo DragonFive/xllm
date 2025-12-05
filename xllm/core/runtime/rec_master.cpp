@@ -161,10 +161,6 @@ std::shared_ptr<Request> RecMaster::generate_request(
 
   if (prompt_tokens.has_value()) {
     local_prompt_tokens = std::move(prompt_tokens.value());
-    LOG(INFO)
-        << "[Rec DEBUG] generate_request - received prompt_tokens.size(): "
-        << local_prompt_tokens.size()
-        << ", prompt.length(): " << prompt.length();
   } else if (!mm_data.has_value()) {
     // sparse LLM
     LOG(ERROR) << "Rec model requires prompt_tokens/embedding to be provided";

@@ -248,6 +248,13 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
   device_.set_device();
   Timer timer;
 
+  if (!inputs.micro_inputs.empty()) {
+    const auto& first_micro = inputs.micro_inputs[0];
+    if (!first_micro.token_ids.defined() || !first_micro.positions.defined()) {
+      LOG(FATAL) << "Empty token_ids or positions in multi-step input";
+    }
+  }
+
   std::vector<torch::Tensor> flatten_tokens_micro_batches;
   std::vector<torch::Tensor> flatten_positions_micro_batches;
   std::vector<ModelInputParams> input_params_micro_batches;
@@ -299,8 +306,6 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
       input_params_micro_batches[0].rec_params.has_value()) {
     auto& rec_params = input_params_micro_batches[0].rec_params.value();
 
-    // Debug: print encoder input status
-
     // Check for encoder inputs
     if ((rec_params.encoder_token_ids.defined() &&
          rec_params.encoder_positions.defined()) ||
@@ -312,12 +317,21 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
         input_params_micro_batches[0].rec_params->is_hybrid_mode = true;
       }
     }
+    // Convert decoder_context_embedding to model dtype if defined
+    // (serialization converts to fp32, need to restore to model dtype)
+    if (rec_params.decoder_context_embedding.defined()) {
+      input_params_micro_batches[0].rec_params->decoder_context_embedding =
+          rec_params.decoder_context_embedding.to(dtype_).to(device_);
+    }
+  } else {
+    // no rec params present
   }
 
   for (int32_t round = 0; round < total_rounds; ++round) {
     const auto& concated_sampling_params =
         round > 0 ? inputs.concated_decoder_sampling_params
                   : inputs.concated_sampling_params;
+
     for (auto i = 0; i < input_params_micro_batches.size(); ++i) {
       auto& mip = input_params_micro_batches[i];
       mip.is_prefill = round == 0;

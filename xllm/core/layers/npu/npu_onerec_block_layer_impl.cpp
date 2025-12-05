@@ -1235,15 +1235,19 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   node.variantPack.inTensors.at(idx++) =
       atb_speed::Utils::AtTensor2Tensor(attn_mask);
 
-  // KV cache placeholders
-  if (FLAGS_enable_rec_prefill_only) {
-    node.variantPack.inTensors.at(idx++) = placeholder;
-    node.variantPack.inTensors.at(idx++) = placeholder;
-  } else {
+  // KV cache: use real cache for decode rounds even if prefill_only is enabled
+  // When FLAGS_max_decode_rounds > 0, we need KV cache for multi-round decode
+  const bool need_kv_cache =
+      !FLAGS_enable_rec_prefill_only || FLAGS_max_decode_rounds > 0;
+  if (need_kv_cache && kv_cache.get_k_cache().defined() &&
+      kv_cache.get_k_cache().numel() > 0) {
     node.variantPack.inTensors.at(idx++) =
         atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
     node.variantPack.inTensors.at(idx++) =
         atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
+  } else {
+    node.variantPack.inTensors.at(idx++) = placeholder;
+    node.variantPack.inTensors.at(idx++) = placeholder;
   }
 
   // Sequence length

@@ -87,7 +87,12 @@ void MultiStepBatchInputBuilder::process_single_sequence(
 
   auto* sequence = sequences_[seq_index];
   const auto token_ids = sequence->tokens();
-  const uint32_t n_tokens = token_ids.size();
+  // For rec model with decoder_context_embedding, fallback to decoder embeddings
+  // count since tokens may be empty
+  uint32_t n_tokens = token_ids.size();
+  if (n_tokens == 0 && sequence->num_decoder_embeddings() > 0) {
+    n_tokens = sequence->num_decoder_embeddings();
+  }
   const uint32_t n_kv_cache_tokens = sequence->kv_state().kv_cache_tokens_num();
 
   // Validate and calculate sequence lengths
@@ -229,9 +234,48 @@ void MultiStepBatchInputBuilder::extract_tokens_and_positions(
     uint32_t n_kv_cache_tokens,
     uint32_t seq_len,
     MultiStepBuilderState* state_ptr) {
-  // First call the base class implementation with in_step_decode=false
-  BatchInputBuilder::extract_tokens_and_positions(
-      sequence, n_kv_cache_tokens, seq_len, &state_ptr->base_state, false);
+  // Check if using decoder_context_embedding (tokens empty but has embeddings)
+  const auto& token_ids = sequence->tokens();
+  const bool use_decoder_embedding =
+      token_ids.size() == 0 && sequence->num_decoder_embeddings() > 0;
+
+  if (use_decoder_embedding) {
+    // Special handling for rec model with decoder_context_embedding:
+    // Don't call base class since it would access empty tokens array.
+    // Instead, directly set up the sampling parameters for prefill.
+    auto& base_state = state_ptr->base_state;
+
+    // Set up tokens and positions for decoder embeddings
+    // IMPORTANT: We must fill flatten_tokens_vec with placeholder tokens (-1)
+    // because base class state_to_raw_forward_input() returns empty RawForwardInput
+    // when flatten_tokens_vec is empty, which would cause num_sequences=0
+    for (uint32_t j = n_kv_cache_tokens; j < seq_len; ++j) {
+      base_state.flatten_tokens_vec.push_back(-1);  // Placeholder token
+      base_state.flatten_positions_vec.push_back(static_cast<int32_t>(j));
+    }
+
+    // Set up sampling parameters for the last position (prefill output)
+    // This is needed for beam search to work
+    const int32_t sel_idx =
+        static_cast<int32_t>(base_state.flatten_positions_vec.size()) - 1;
+    if (sel_idx >= 0) {
+      base_state.selected_token_idxes.push_back(sel_idx);
+      base_state.sampling_params.push_back(sequence->sampling_param());
+      base_state.unique_token_ids_vec.emplace_back();
+      base_state.unique_token_counts_vec.emplace_back();
+      base_state.unique_token_lens_vec.push_back(0);
+      base_state.sample_idxes.push_back(
+          static_cast<int32_t>(base_state.selected_token_idxes.size() - 1));
+    }
+
+    // Set extra token id and embedding id
+    base_state.extra_token_ids.push_back(-1);
+    base_state.embedding_ids.push_back(sequence->get_embedding_id());
+  } else {
+    // Normal case: call base class implementation
+    BatchInputBuilder::extract_tokens_and_positions(
+        sequence, n_kv_cache_tokens, seq_len, &state_ptr->base_state, false);
+  }
   // begin process decode data
   seq_len = n_kv_cache_tokens + 1;
   // std::unordered_map<int32_t, int32_t> adjusted_token_to_count_map;
@@ -254,7 +298,11 @@ void MultiStepBatchInputBuilder::extract_tokens_and_positions(
   // 以下需要配套构造 sample_params ，在param_utils.cpp 中
   // proto_to_forward_input 中使用 因为每个 request 的 每个 sequence
   // 都一样，所以decode 可以只传一份，在 worker 端进行broadcast.
+  // For decoder_context_embedding, use num_decoder_embeddings as prompt length
   uint32_t prompt_len = sequence->num_prompt_tokens();
+  if (prompt_len == 0 && sequence->num_decoder_embeddings() > 0) {
+    prompt_len = sequence->num_decoder_embeddings();
+  }
   state_ptr->decode_positions_vec.push_back(static_cast<int32_t>(prompt_len));
 
   int32_t bw = std::max(1, FLAGS_beam_width);

@@ -108,8 +108,7 @@ void FixStepsScheduler::handle_prefill_requests(
       size_t num_tokens = prefill_sequence->num_need_compute_tokens();
       // Decoder context embeddings don't contribute prompt tokens, so fall
       // back to embedding count to avoid zero-sized batches.
-      if (num_tokens == 0 &&
-          prefill_sequence->num_decoder_embeddings() > 0) {
+      if (num_tokens == 0 && prefill_sequence->num_decoder_embeddings() > 0) {
         num_tokens = prefill_sequence->num_decoder_embeddings();
       }
       if (num_tokens == 0) {
@@ -239,14 +238,14 @@ std::vector<Batch> FixStepsScheduler::prepare_batch() {
   }
 
   // update the batch
-  auto batches = BatchFactory::get_instance(options_.dp_size())
-                     ->create_batches(
-                         running_requests_,
-                         running_sequences_,
-                         running_sequences_budgets_,
-                         kv_cache_manager_->get_copy_in_cache_block_infos(),
-                         kv_cache_manager_->get_copy_out_cache_block_infos(),
-                         kv_cache_manager_->get_swap_cache_block_infos());
+  auto batches =
+      BatchFactory::get_instance(options_.dp_size())
+          ->create_batches(running_requests_,
+                           running_sequences_,
+                           running_sequences_budgets_,
+                           kv_cache_manager_->get_copy_in_cache_block_infos(),
+                           kv_cache_manager_->get_copy_out_cache_block_infos(),
+                           kv_cache_manager_->get_swap_cache_block_infos());
 
   // update metrics before returning
   if (!batches[0].empty()) {
