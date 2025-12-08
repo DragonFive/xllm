@@ -51,6 +51,12 @@ bool RecVocabDict::initialize(const std::string& vocab_file) {
 
   while (ifs.read(reinterpret_cast<char*>(&item_id), itemid_size) &&
          ifs.read(reinterpret_cast<char*>(tokens.data()), tokens_size)) {
+    for (auto token_id : tokens) {
+      if (token_id > max_token_id_) {
+        max_token_id_ = token_id;
+      }
+    }
+
     if (FLAGS_enable_constrained_decoding) {
       for (int i = 0; i < tokens.size(); i++) {
         std::vector<int32_t> prefix_tokens;
@@ -83,6 +89,7 @@ bool RecVocabDict::initialize(const std::string& vocab_file) {
             << ", parse item to tokens map size:" << item_to_tokens_map_.size()
             << ", parse prefix tokens to next tokens map size:"
             << prefix_tokens_to_next_tokens_map_.size()
+            << ", vocab_size: " << vocab_size()
             << ", cost: " << timer.elapsed_seconds() << " seconds";
 
   return true;

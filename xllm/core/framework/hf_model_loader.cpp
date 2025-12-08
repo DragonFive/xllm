@@ -54,8 +54,9 @@ HFModelLoader::HFModelLoader(const std::string& model_weights_path)
   // sort the model weights files by name
   std::sort(model_weights_files_.begin(), model_weights_files_.end());
 
-  //@todo: 'false' will be replaced with generative recommendation judgment
-  if (false) {
+  // Load rec vocab when tokenizer is configured as rec (or vocab_file provided)
+  if (tokenizer_args_.tokenizer_type() == "rec" ||
+      !tokenizer_args_.vocab_file().empty()) {
     CHECK(load_rec_vocab(model_weights_path))
         << "Failed to load rec content from " << model_weights_path;
   }
@@ -158,6 +159,10 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
     return false;
   }
   model_args_loader(reader, &args_);
+
+  // Extract model version from path (last directory name)
+  std::filesystem::path path = model_weights_path;
+  args_.model_version() = path.filename().string();
 
   return true;
 }

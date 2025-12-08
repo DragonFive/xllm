@@ -172,7 +172,6 @@ inline torch::Tensor compute_onerec_position_bias(
     key_length = 1;
   }
 
-
   // Create position indices
   auto context_position =
       torch::arange(actual_query_length,
@@ -988,6 +987,9 @@ REGISTER_MODEL_ARGS(onerec, [&] {
   // });
 });
 
-REGISTER_TOKENIZER_ARGS(onerec, [&] { SET_ARG(tokenizer_type, "rec"); });
+REGISTER_TOKENIZER_ARGS(onerec, [&] {
+  SET_ARG(tokenizer_type, "rec");
+  SET_ARG(vocab_file, "beam_search_filter.bin");
+});
 
 }  // namespace xllm

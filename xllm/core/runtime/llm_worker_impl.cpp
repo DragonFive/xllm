@@ -24,6 +24,7 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <utility>
 
 #include "common/device_monitor.h"
@@ -33,6 +34,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
+#include "framework/sampling/rec_constrained_decoding.h"
 #include "framework/state_dict/state_dict.h"
 #include "models/model_registry.h"
 #include "util/threadpool.h"
@@ -71,6 +73,36 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
   if (FLAGS_enable_beam_search_kernel) {
     beam_searcher_ = std::make_unique<BeamSearcher>();
   }
+
+  // Initialize constrained decoding for rec backend
+  if (FLAGS_enable_constrained_decoding && FLAGS_backend == "rec") {
+    const auto& model_args = context.get_model_args();
+    const auto vocab_size = model_args.vocab_size();
+    if (vocab_size > 0) {
+      std::string model_version = model_args.model_version();
+      if (model_version.empty()) {
+        model_version = "0";
+        VLOG(1) << "model_version is empty, defaulting to 0 for constrained "
+                   "decoding";
+      }
+      constrained_decoding_ = std::make_unique<RecConstrainedDecoding>(
+          model_version,
+          static_cast<int32_t>(vocab_size),
+          dtype_,
+          device_.unwrap());
+      // Build mask cache
+      if (!constrained_decoding_->build_mask_cache()) {
+        LOG(WARNING) << "Failed to build constrained decoding mask cache";
+      } else {
+        LOG(INFO) << "Constrained decoding initialized with model_version: "
+                  << model_version << ", vocab_size: " << vocab_size;
+      }
+    } else {
+      LOG(WARNING) << "Constrained decoding enabled but vocab_size not "
+                      "available";
+    }
+  }
+
   return true;
 }
 
@@ -302,6 +334,16 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
   const bool is_rec_backend = (FLAGS_backend == "rec");
   bool has_encoder_inputs = false;
 
+  // Initialize generated_tokens_cpu for constrained decoding
+  // Shape will be set lazily per round to match current sampling rows
+  std::vector<std::vector<int32_t>> generated_tokens_cpu;
+  const bool use_constrained_decoding =
+      is_rec_backend && constrained_decoding_ != nullptr;
+
+  // Async state for constrained decoding optimization
+  std::optional<folly::SemiFuture<torch::Tensor>> mask_future;
+  std::optional<folly::SemiFuture<folly::Unit>> update_future;
+
   if (is_rec_backend && !input_params_micro_batches.empty() &&
       input_params_micro_batches[0].rec_params.has_value()) {
     auto& rec_params = input_params_micro_batches[0].rec_params.value();
@@ -331,6 +373,35 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
     const auto& concated_sampling_params =
         round > 0 ? inputs.concated_decoder_sampling_params
                   : inputs.concated_sampling_params;
+
+    // Ensure generated_tokens_cpu rows match current sampling rows (first
+    // round). Prefill uses batch rows; later rounds use beam-expanded rows.
+    if (use_constrained_decoding && generated_tokens_cpu.empty()) {
+      int64_t sample_rows = (round == 0) ? batch : num_seq;
+      generated_tokens_cpu.resize(static_cast<size_t>(sample_rows));
+    }
+
+    // Wait for previous round's generated_tokens_cpu update to complete
+    if (update_future.has_value()) {
+      std::move(update_future.value()).get();
+      update_future.reset();
+    }
+
+    // Async: start generate_mask before model forward (CPU/NPU parallel)
+    if (use_constrained_decoding) {
+      folly::Promise<torch::Tensor> promise;
+      mask_future = promise.getSemiFuture();
+      // Capture generated_tokens_cpu by value to avoid race condition
+      auto tokens_snapshot = generated_tokens_cpu;
+      general_threadpool_.schedule(
+          [this,
+           tokens_snapshot = std::move(tokens_snapshot),
+           promise = std::move(promise)]() mutable {
+            auto filter_mask =
+                constrained_decoding_->generate_mask(tokens_snapshot);
+            promise.setValue(std::move(filter_mask));
+          });
+    }
 
     for (auto i = 0; i < input_params_micro_batches.size(); ++i) {
       auto& mip = input_params_micro_batches[i];
@@ -425,7 +496,33 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                               concated_sampling_params.selected_token_idxes);
     }
     if (concated_sampling_params.selected_token_idxes.defined()) {
-      auto sample_output = sampler_->forward(logits, concated_sampling_params);
+      // Create a mutable copy of sampling params for filter mask
+      SamplingParameters sampling_params_with_mask = concated_sampling_params;
+
+      // Wait for async filter mask (started before model forward)
+      if (use_constrained_decoding && mask_future.has_value()) {
+        torch::Tensor filter_mask = std::move(mask_future.value()).get();
+        mask_future.reset();
+        if (filter_mask.defined()) {
+          // Move filter_mask to device and convert to model dtype
+          filter_mask = filter_mask.to(dtype_).to(device_);
+
+          // Sanity check mask rows vs expected rows (round0=batch,
+          // others=beam-expanded)
+          int64_t expected_rows = (round == 0) ? batch : num_seq;
+          if (filter_mask.size(0) !=
+              expected_rows) {  // allow single-row broadcast
+            LOG(ERROR) << "filter_mask rows (" << filter_mask.size(0)
+                       << ") mismatch expected rows (" << expected_rows
+                       << ") in round " << round
+                       << "; this may broadcast unexpectedly.";
+          }
+
+          sampling_params_with_mask.filter_mask = filter_mask;
+        }
+      }
+
+      auto sample_output = sampler_->forward(logits, sampling_params_with_mask);
       torch::Tensor top_tokens;
       torch::Tensor top_logprobs;
       int32_t beam_width = inputs.micro_inputs[0].beam_width;
@@ -452,6 +549,79 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_multi_round(
                               out_beam_count_prefix_sums,
                               sequence_group);
       }
+
+      // Async update generated_tokens_cpu for constrained decoding
+      // This runs in parallel with next round's preparation, if not last round
+      if (use_constrained_decoding && round < total_rounds - 1) {
+        folly::Promise<folly::Unit> update_promise;
+        update_future = update_promise.getSemiFuture();
+
+        if (round == 0) {
+          // Round 0: directly append top_tokens to each sequence
+          // Copy tensor to CPU first, then update async
+          auto tokens_cpu =
+              sample_output.top_tokens.to(torch::kCPU).to(torch::kInt32);
+          general_threadpool_.schedule(
+              [&generated_tokens_cpu,
+               tokens_cpu = std::move(tokens_cpu),
+               num_seq,
+               update_promise = std::move(update_promise)]() mutable {
+                auto tokens_accessor = tokens_cpu.accessor<int32_t, 1>();
+                for (int64_t i = 0; i < num_seq; ++i) {
+                  generated_tokens_cpu[i].push_back(tokens_accessor[i]);
+                }
+                update_promise.setValue(folly::Unit{});
+              });
+        } else {
+          // Round > 0: reorder based on beam selection and append new tokens
+          auto token_ids_cpu = out_token_ids.to(torch::kCPU).to(torch::kInt32);
+          auto token_index_cpu =
+              out_token_index.to(torch::kCPU).to(torch::kInt32);
+          general_threadpool_.schedule(
+              [&generated_tokens_cpu,
+               token_ids_cpu = std::move(token_ids_cpu),
+               token_index_cpu = std::move(token_index_cpu),
+               num_seq,
+               update_promise = std::move(update_promise)]() mutable {
+                auto ids_accessor = token_ids_cpu.accessor<int32_t, 2>();
+                auto idx_accessor = token_index_cpu.accessor<int32_t, 2>();
+
+                // Create new generated_tokens based on beam selection
+                std::vector<std::vector<int32_t>> new_generated_tokens(num_seq);
+                for (int64_t i = 0; i < num_seq; ++i) {
+                  int32_t src_idx = idx_accessor[i][0];  // beam source index
+                  new_generated_tokens[i] = generated_tokens_cpu[src_idx];
+                  new_generated_tokens[i].push_back(ids_accessor[i][0]);
+                }
+                generated_tokens_cpu = std::move(new_generated_tokens);
+                update_promise.setValue(folly::Unit{});
+              });
+        }
+      } else if (use_constrained_decoding && round == total_rounds - 1) {
+        // Last round: update synchronously (no next round to wait for)
+        if (round == 0) {
+          auto tokens_cpu =
+              sample_output.top_tokens.to(torch::kCPU).to(torch::kInt32);
+          auto tokens_accessor = tokens_cpu.accessor<int32_t, 1>();
+          for (int64_t i = 0; i < num_seq; ++i) {
+            generated_tokens_cpu[i].push_back(tokens_accessor[i]);
+          }
+        } else {
+          auto token_ids_cpu = out_token_ids.to(torch::kCPU).to(torch::kInt32);
+          auto token_index_cpu =
+              out_token_index.to(torch::kCPU).to(torch::kInt32);
+          auto ids_accessor = token_ids_cpu.accessor<int32_t, 2>();
+          auto idx_accessor = token_index_cpu.accessor<int32_t, 2>();
+          std::vector<std::vector<int32_t>> new_generated_tokens(num_seq);
+          for (int64_t i = 0; i < num_seq; ++i) {
+            int32_t src_idx = idx_accessor[i][0];
+            new_generated_tokens[i] = generated_tokens_cpu[src_idx];
+            new_generated_tokens[i].push_back(ids_accessor[i][0]);
+          }
+          generated_tokens_cpu = std::move(new_generated_tokens);
+        }
+      }
+
       // keep group offset contiguous across rounds (already in out_* tensors)
       // update next round tokens.
       if (round == 0) {

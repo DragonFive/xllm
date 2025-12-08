@@ -29,6 +29,14 @@ class RecConstrainedDecoding : public ConstrainedDecoding {
                          torch::ScalarType dtype,
                          torch::Device device,
                          bool use_gen_threadpool_ = true);
+
+  // Constructor with string model_version (recommended for new code)
+  RecConstrainedDecoding(const std::string& model_version,
+                         const int32_t vocab_size,
+                         torch::ScalarType dtype,
+                         torch::Device device,
+                         bool use_gen_threadpool_ = true);
+
   virtual ~RecConstrainedDecoding() = default;
 
   bool build_mask_cache() override;
@@ -44,7 +52,7 @@ class RecConstrainedDecoding : public ConstrainedDecoding {
   bool build_mask_cache_;
   bool use_gen_threadpool_;
   int32_t vocab_size_;
-  uint64_t model_version_;
+  std::string model_version_str_;
   torch::Device device_;
   torch::ScalarType dtype_;
   torch::Tensor first_token_mask_;

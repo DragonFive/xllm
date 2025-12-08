@@ -63,8 +63,12 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
   }
 
-  // same batch size
-  CHECK_EQ(sample_logits.size(0), params.do_sample.size(0));
+  // Apply filter mask for constrained decoding (after index_select)
+  if (params.filter_mask.defined()) {
+    sample_logits = sample_logits + params.filter_mask;
+  }
+
+  CHECK_EQ(sample_logits.size(0), do_sample.size(0));
 
   auto probs = sample_logits;
   torch::Tensor samples;
@@ -82,7 +86,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     // mixed sample, sample both then choose based on do_sample
     auto random = random_sample(probs);
     auto greedy = greedy_sample(probs);
-    samples = torch::where(params.do_sample, random, greedy);
+    samples = torch::where(do_sample, random, greedy);
   }
   output.probs = probs;
   output.next_tokens = samples;

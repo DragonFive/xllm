@@ -84,9 +84,13 @@ class RecVocabDict final {
   const std::set<int32_t>& get_next_tokens_by_prefix_tokens(
       const Slice<int32_t>& prefix_token_ids) const;
 
+  // total vocabulary size (max token id + 1)
+  int32_t vocab_size() const { return max_token_id_ + 1; }
+
  private:
   // check if initialization has been successful
   bool initialized_ = false;
+  int32_t max_token_id_ = -1;
 
   // convert token to item map, key: token id triplet, value: item id list,
   // there is a token id triplet corresponding to multiple item IDs, and

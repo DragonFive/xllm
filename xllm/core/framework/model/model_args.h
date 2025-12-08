@@ -53,6 +53,9 @@ struct ModelArgs {
 
   PROPERTY(int64_t, vocab_size) = -1;
 
+  // model version string (extracted from model path, e.g., "20231015")
+  PROPERTY(std::string, model_version);
+
   PROPERTY(float, rms_norm_eps) = 0.0f;
 
   PROPERTY(float, layer_norm_eps) = 0.0f;

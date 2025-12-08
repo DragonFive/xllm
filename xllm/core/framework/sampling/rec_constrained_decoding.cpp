@@ -42,7 +42,24 @@ RecConstrainedDecoding::RecConstrainedDecoding(uint64_t model_version,
                                                torch::ScalarType dtype,
                                                torch::Device device,
                                                bool use_gen_threadpool)
-    : model_version_(model_version),
+    : model_version_str_(std::to_string(model_version)),
+      vocab_size_(vocab_size),
+      dtype_(dtype),
+      device_(device),
+      use_gen_threadpool_(use_gen_threadpool) {
+  if (use_gen_threadpool_) {
+    gen_threadpool_ = std::make_unique<ThreadPool>(GEN_MASK_THREAD_NUM);
+  }
+
+  build_mask_cache_ = false;
+}
+
+RecConstrainedDecoding::RecConstrainedDecoding(const std::string& model_version,
+                                               const int32_t vocab_size,
+                                               torch::ScalarType dtype,
+                                               torch::Device device,
+                                               bool use_gen_threadpool)
+    : model_version_str_(model_version.empty() ? "0" : model_version),
       vocab_size_(vocab_size),
       dtype_(dtype),
       device_(device),
@@ -62,8 +79,7 @@ bool RecConstrainedDecoding::build_mask_cache() {
                                      empty_token_ids.size()};
 
   const std::set<int32_t>& first_token_ids =
-      VersionSingleton<RecVocabDict>::GetInstance(
-          std::to_string(model_version_))
+      VersionSingleton<RecVocabDict>::GetInstance(model_version_str_)
           ->get_next_tokens_by_prefix_tokens(prefix_token_ids);
 
   for (auto token_id : first_token_ids) {
@@ -126,8 +142,7 @@ torch::Tensor RecConstrainedDecoding::generate_decode_mask(
       Slice<int32_t> tokens_slice(generated_token_list[token_idx]);
 
       const std::set<int32_t>& next_token_ids =
-          VersionSingleton<RecVocabDict>::GetInstance(
-              std::to_string(model_version_))
+          VersionSingleton<RecVocabDict>::GetInstance(model_version_str_)
               ->get_next_tokens_by_prefix_tokens(tokens_slice);
 
       if (next_token_ids.size() > 0) {

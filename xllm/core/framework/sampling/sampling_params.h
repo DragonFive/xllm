@@ -140,6 +140,10 @@ struct SamplingParameters {
 
   // for beam search
   bool use_beam_search = false;
+
+  // for constrained decoding (rec beam search)
+  // shape: [sample_num, vocab_size], applied after index_select
+  torch::Tensor filter_mask;
 };
 
 struct SampleOutput {

@@ -25,6 +25,7 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/quant_args.h"
+#include "framework/sampling/constrained_decoding.h"
 #include "framework/state_dict/state_dict.h"
 #include "options.h"
 #include "runtime/worker_impl.h"
@@ -59,6 +60,7 @@ class LLMWorkerImpl : public WorkerImpl {
 
  private:
   std::unique_ptr<BeamSearcher> beam_searcher_;
+  std::unique_ptr<ConstrainedDecoding> constrained_decoding_;
   std::optional<ForwardOutput> step_multi_round(
       const BatchedForwardInputs& inputs);
 };

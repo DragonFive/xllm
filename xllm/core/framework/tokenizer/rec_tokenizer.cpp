@@ -40,9 +40,12 @@ bool RecTokenizer::decode(const Slice<int32_t>& token_ids,
 }
 
 size_t RecTokenizer::vocab_size() const {
-  // currently, there is no voice size set in the tokenizer configuration. The
-  // voice size can be obtained from the model args
-  return 0;
+  const auto* vocab_dict =
+      VersionSingleton<RecVocabDict>::GetInstance(model_version_);
+  if (nullptr == vocab_dict) {
+    return 0;
+  }
+  return vocab_dict->vocab_size();
 }
 
 std::unique_ptr<Tokenizer> RecTokenizer::clone() const {
