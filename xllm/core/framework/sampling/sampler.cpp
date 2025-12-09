@@ -86,7 +86,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     // mixed sample, sample both then choose based on do_sample
     auto random = random_sample(probs);
     auto greedy = greedy_sample(probs);
-    samples = torch::where(do_sample, random, greedy);
+    samples = torch::where(params.do_sample;, random, greedy);
   }
   output.probs = probs;
   output.next_tokens = samples;
