@@ -18,19 +18,25 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
+#include "common/global_flags.h"
 #include "common/metrics.h"
+#include "common/rec_model_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "util/env_var.h"
 #include "util/pretty_print.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
 namespace xllm {
 
-RecEngine::RecEngine(const runtime::Options& options) : options_(options) {
+RecEngine::RecEngine(const runtime::Options& options,
+                     std::shared_ptr<DistManager> dist_manager)
+    : options_(options), dist_manager_(dist_manager) {
   const auto& devices = options_.devices();
   CHECK_GT(devices.size(), 0) << "At least one device is required";
 
@@ -40,33 +46,29 @@ RecEngine::RecEngine(const runtime::Options& options) : options_(options) {
     CHECK_EQ(device.type(), device_type)
         << "All devices should be the same type";
   }
+}
 
-  // initialize process groups if there are multiple devices
-  if (devices.size() > 1) {
-    // create a process group for each device if there are multiple gpus
-    process_groups_ = parallel_state::create_npu_process_groups(devices);
+void RecEngine::setup_workers(const runtime::Options& options) {
+  if (!dist_manager_) {
+    dist_manager_ = std::make_shared<DistManager>(options);
   }
+  worker_clients_ = dist_manager_->get_worker_clients();
+}
 
-  WorkerType worker_type = WorkerType::REC;
-  const int32_t world_size = static_cast<int32_t>(devices.size());
-  for (size_t i = 0; i < devices.size(); ++i) {
-    const int32_t rank = static_cast<int32_t>(i);
-    ProcessGroup* pg = world_size > 1 ? process_groups_[i].get() : nullptr;
-    ParallelArgs parallel_args(rank, world_size, pg);
-    workers_.emplace_back(std::make_unique<Worker>(
-        parallel_args, devices[i], options_, worker_type));
-  }
-
-  if (workers_.size() > 1) {
-    // test process group
+void RecEngine::process_group_test() {
+#if !defined(USE_NPU)
+  if (worker_clients_num_ > 1) {
     std::vector<folly::SemiFuture<folly::Unit>> futures;
-    futures.reserve(workers_.size());
-    for (auto& worker : workers_) {
+    futures.reserve(worker_clients_num_);
+    for (auto& worker : worker_clients_) {
       futures.emplace_back(worker->process_group_test_async());
     }
-    // wait up to 4 seconds for all futures to complete
-    folly::collectAll(futures).within(std::chrono::seconds(4)).get();
+    const int timeout_seconds = util::get_process_group_test_timeout_seconds();
+    folly::collectAll(futures)
+        .within(std::chrono::seconds(timeout_seconds))
+        .get();
   }
+#endif
 }
 
 bool RecEngine::init() {
@@ -90,7 +92,6 @@ bool RecEngine::init_model() {
   auto model_loader = ModelLoader::create(model_path);
   LOG(INFO) << "Initializing model from: " << model_path;
 
-  // RecEngine does not use tokenizer
   tokenizer_ = model_loader->tokenizer();
   CHECK(tokenizer_ != nullptr);
 
@@ -98,11 +99,96 @@ bool RecEngine::init_model() {
   quant_args_ = model_loader->quant_args();
   tokenizer_args_ = model_loader->tokenizer_args();
 
-  // compute the number of local kv heads and head dim
-  const int world_size = static_cast<int>(workers_.size());
+  const auto rec_model_kind = get_rec_model_kind(args_.model_type());
+  use_raw_forward_input_ = (rec_model_kind == RecModelKind::kLlmRec);
+
+#if defined(USE_NPU)
+  if (use_raw_forward_input_) {
+    FLAGS_enable_atb_comm_multiprocess =
+        options_.enable_offline_inference() || (options_.nnodes() > 1);
+  }
+#endif
+
+  if (use_raw_forward_input_) {
+    auto master_node_addr = options_.master_node_addr().value_or("");
+    CHECK(!master_node_addr.empty())
+        << "REC(kLlmRec) need to set master node addr, "
+           "Please set --master_node_addr.";
+
+    setup_workers(options_);
+    dp_size_ = options_.dp_size();
+    worker_clients_num_ = worker_clients_.size();
+    dp_local_tp_size_ = worker_clients_num_ / dp_size_;
+
+    process_group_test();
+
+    if (!threadpool_) {
+      threadpool_ = std::make_unique<ThreadPool>(16);
+    }
+
+    const int world_size = dp_size_ > 1 ? static_cast<int>(dp_local_tp_size_)
+                                        : static_cast<int>(worker_clients_num_);
+    const int64_t n_heads = args_.n_heads();
+    const int64_t n_kv_heads = args_.n_kv_heads().value_or(n_heads);
+    n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size);
+    head_dim_ = args_.head_dim();
+    dtype_ = xllm::util::parse_dtype(args_.dtype(), options_.devices()[0]);
+
+    LOG(INFO) << "Block info, block_size: " << options_.block_size()
+              << ", n_local_kv_heads: " << n_local_kv_heads_
+              << ", head_dim: " << head_dim_
+              << ", n_layers: " << args_.n_layers() << ", dtype: " << dtype_;
+    LOG(INFO) << "Initializing model with " << args_;
+    LOG(INFO) << "Initializing model with quant args: " << quant_args_;
+    LOG(INFO) << "Initializing model with tokenizer args: " << tokenizer_args_;
+
+    std::vector<folly::SemiFuture<bool>> futures;
+    futures.reserve(worker_clients_num_);
+    for (auto& worker : worker_clients_) {
+      futures.push_back(
+          worker->init_model_async(model_path, FLAGS_random_seed));
+    }
+    auto results = folly::collectAll(futures).get();
+    for (const auto& result : results) {
+      if (!result.value()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const auto& devices = options_.devices();
+  if (devices.size() > 1) {
+    process_groups_ = parallel_state::create_npu_process_groups(devices);
+  }
+
+  workers_.clear();
+  WorkerType worker_type = WorkerType::REC;
+  const int32_t world_size = static_cast<int32_t>(devices.size());
+  for (size_t i = 0; i < devices.size(); ++i) {
+    const int32_t rank = static_cast<int32_t>(i);
+    ProcessGroup* pg = world_size > 1 ? process_groups_[i].get() : nullptr;
+    ParallelArgs parallel_args(rank, world_size, pg);
+    workers_.emplace_back(std::make_unique<Worker>(
+        parallel_args, devices[i], options_, worker_type));
+  }
+
+  if (workers_.size() > 1) {
+    std::vector<folly::SemiFuture<folly::Unit>> futures;
+    futures.reserve(workers_.size());
+    for (auto& worker : workers_) {
+      futures.emplace_back(worker->process_group_test_async());
+    }
+    const int timeout_seconds = util::get_process_group_test_timeout_seconds();
+    folly::collectAll(futures)
+        .within(std::chrono::seconds(timeout_seconds))
+        .get();
+  }
+
+  const int world_size_int = static_cast<int>(workers_.size());
   const int64_t n_heads = args_.n_heads();
   const int64_t n_kv_heads = args_.n_kv_heads().value_or(n_heads);
-  n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size);
+  n_local_kv_heads_ = std::max<int64_t>(1, n_kv_heads / world_size_int);
   head_dim_ = args_.head_dim();
   dtype_ = xllm::util::parse_dtype(args_.dtype(), options_.devices()[0]);
 
@@ -140,12 +226,20 @@ Engine::KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
   const int64_t max_cache_size = options_.max_cache_size();
   const double max_memory_utilization = options_.max_memory_utilization();
 
-  const auto& device = workers_[0]->device();
-  // call worker to profile memory usage
+  const auto num_workers =
+      use_raw_forward_input_ ? worker_clients_.size() : workers_.size();
+  CHECK_GT(num_workers, 0) << "No available workers";
+
   std::vector<folly::SemiFuture<std::tuple<int64_t, int64_t>>> futures;
-  futures.reserve(workers_.size());
-  for (auto& worker : workers_) {
-    futures.push_back(worker->estimate_kv_cache_capacity_async());
+  futures.reserve(num_workers);
+  if (use_raw_forward_input_) {
+    for (auto& worker : worker_clients_) {
+      futures.push_back(worker->estimate_kv_cache_capacity_async());
+    }
+  } else {
+    for (auto& worker : workers_) {
+      futures.push_back(worker->estimate_kv_cache_capacity_async());
+    }
   }
 
   // pick smallest available memory from all devices
@@ -153,16 +247,15 @@ Engine::KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
   for (size_t i = 0; i < results.size(); ++i) {
-    const auto device = workers_[i]->device();
     if (!results[i].hasValue()) {
-      LOG(ERROR) << "Failed to profile memory usage for device: " << device;
+      LOG(ERROR) << "Failed to profile memory usage for worker: " << i;
       continue;
     }
     auto [available_memory, total_memory] = results[i].value();
-    LOG(INFO) << device
+    LOG(INFO) << "worker #" << i
               << ": available memory: " << readable_size(available_memory)
               << ", total memory: " << readable_size(total_memory)
-              << ", Using max_memory_utilization: " << max_memory_utilization
+              << ". Using max_memory_utilization: " << max_memory_utilization
               << ", max_cache_size: " << readable_size(max_cache_size);
     // apply memory cap from config if it is set
     if (max_memory_utilization < 1.0) {
@@ -182,16 +275,15 @@ Engine::KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
       << "Available kv cache size must be greater than 0";
 
   // compute kv cache slot size
-  const auto dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
-  // key + value for all layers
-  const int64_t slot_size =
-      2 * n_local_kv_heads_ * head_dim_ * args_.n_layers() * dtype_size;
+  const int64_t dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
+  const int64_t slot_size = 2 * dtype_size * head_dim_ * n_local_kv_heads_;
   kv_cache_cap.slot_size = slot_size;
+  kv_cache_cap.n_layers = args_.n_layers();
 
-  // compute kv blocks num
   const int32_t block_size = options_.block_size();
   const int64_t block_size_in_bytes = block_size * slot_size;
-  kv_cache_cap.n_blocks = cache_size_in_bytes / block_size_in_bytes;
+  kv_cache_cap.n_blocks = kv_cache_cap.cache_size_in_bytes /
+                          (args_.n_layers() * block_size_in_bytes);
   CHECK_GT(kv_cache_cap.n_blocks, 0) << "no n_blocks for kv cache";
 
   return kv_cache_cap;
@@ -212,6 +304,11 @@ bool RecEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
       kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
   kv_cache_shape.emplace_back(std::vector<int64_t>{
       kv_cache_cap.n_blocks, block_size, n_local_kv_heads_, head_dim_});
+#if defined(USE_MLU)
+  for (auto& shape : kv_cache_shape) {
+    std::swap(shape[1], shape[2]);
+  }
+#endif
 
   LOG(INFO) << "Initializing k cache with shape: [" << kv_cache_shape[0] << "]";
   LOG(INFO) << "Initializing v cache with shape: [" << kv_cache_shape[1] << "]";
@@ -219,18 +316,25 @@ bool RecEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
   // initialize block manager
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks)
-      .host_num_blocks(kv_cache_cap.n_blocks)
+      .host_num_blocks(0)
       .block_size(block_size)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_cache_upload(options_.enable_cache_upload());
-  kv_cache_manager_ = std::make_unique<BlockManagerPool>(options);
+  kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   // init kv cache for each worker in parallel
   std::vector<folly::SemiFuture<bool>> futures;
-  futures.reserve(workers_.size());
-  for (auto& worker : workers_) {
-    futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+  if (use_raw_forward_input_) {
+    futures.reserve(worker_clients_.size());
+    for (auto& worker : worker_clients_) {
+      futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+    }
+  } else {
+    futures.reserve(workers_.size());
+    for (auto& worker : workers_) {
+      futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+    }
   }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
@@ -242,15 +346,133 @@ bool RecEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
   return true;
 }
 
-// RecEngine executes model: prefill + decode steps
-// Similar to LLMEngine but simplified for rec model
+std::vector<RawForwardInput> RecEngine::prepare_inputs(
+    std::vector<Batch>& batch) {
+  std::vector<RawForwardInput> batched_inputs;
+  batched_inputs.reserve(dp_size_);
+
+  std::vector<int32_t> dp_global_token_nums(dp_size_);
+  std::vector<int32_t> dp_is_decode(dp_size_, 0);
+  bool global_empty_kv_cache = true;
+  BatchForwardType batch_forward_type;
+
+  for (auto dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    batch[dp_rank].refresh_forward_type();
+
+    batched_inputs.emplace_back(std::move(
+        batch[dp_rank].prepare_forward_input(args_, threadpool_.get())));
+    dp_global_token_nums[dp_rank] =
+        batched_inputs[dp_rank].flatten_tokens_vec.size();
+    global_empty_kv_cache =
+        batched_inputs[dp_rank].empty_kv_cache && global_empty_kv_cache;
+    if (batch_forward_type.is_empty() &&
+        !batched_inputs[dp_rank].batch_forward_type.is_empty()) {
+      batch_forward_type = batched_inputs[dp_rank].batch_forward_type;
+    }
+    dp_is_decode[dp_rank] = batch_forward_type.is_decode() &&
+                            batched_inputs[dp_rank].q_max_seq_len == 1;
+  }
+
+  for (auto dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    batched_inputs[dp_rank].dp_global_token_nums = dp_global_token_nums;
+    batched_inputs[dp_rank].dp_is_decode = dp_is_decode;
+    batched_inputs[dp_rank].global_empty_kv_cache = global_empty_kv_cache;
+    if (batched_inputs[dp_rank].batch_forward_type.is_empty()) {
+      batched_inputs[dp_rank].batch_forward_type = batch_forward_type;
+    }
+  }
+
+  return batched_inputs;
+}
+
+// RecEngine executes model: prefill + 2 decode steps.
 ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
+  if (use_raw_forward_input_) {
+    if (worker_clients_.empty()) {
+      return {};
+    }
+
+    DCHECK(dp_size_ == batches.size())
+        << "Split DP batch failed with dp_size as " << dp_size_
+        << " and actual batch size as " << batches.size() << ".";
+
+    auto run_one_step = [this, &batches](int step_idx) -> bool {
+      Timer timer;
+      auto raw_forward_inputs = prepare_inputs(batches);
+      COUNTER_ADD(prepare_input_latency_microseconds,
+                  timer.elapsed_microseconds());
+
+      const bool all_empty =
+          std::all_of(raw_forward_inputs.begin(),
+                      raw_forward_inputs.end(),
+                      [](const RawForwardInput& input) {
+                        return input.flatten_tokens_vec.empty();
+                      });
+      if (all_empty) {
+        return false;
+      }
+
+      std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
+      futures.reserve(worker_clients_num_);
+
+      timer.reset();
+      for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+           ++worker_rank) {
+        auto dp_rank = worker_rank / dp_local_tp_size_;
+        futures.emplace_back(worker_clients_[worker_rank]->step_async(
+            raw_forward_inputs[dp_rank]));
+      }
+      auto results = folly::collectAll(futures).get();
+
+      if (step_idx == 0) {
+        COUNTER_ADD(rec_first_token_latency_microseconds,
+                    timer.elapsed_microseconds());
+      } else if (step_idx == 1) {
+        COUNTER_ADD(rec_second_token_latency_microseconds,
+                    timer.elapsed_microseconds());
+      } else if (step_idx == 2) {
+        COUNTER_ADD(rec_third_token_latency_microseconds,
+                    timer.elapsed_microseconds());
+      }
+
+      timer.reset();
+      size_t dp_rank = 0;
+      for (auto worker_rank = 0; worker_rank < worker_clients_num_;
+           worker_rank += dp_local_tp_size_) {
+        auto result = results[worker_rank].value();
+        if (!result.has_value()) {
+          LOG(FATAL) << "Failed to execute model, result has no value";
+        }
+        if (result.value().src_seq_idxes.empty()) {
+          batches[dp_rank].process_sample_output(result.value(), false);
+        } else {
+          batches[dp_rank].process_beam_search_output(result.value(), false);
+        }
+        ++dp_rank;
+      }
+      COUNTER_ADD(rec_sampling_latency_microseconds,
+                  timer.elapsed_microseconds());
+      return true;
+    };
+
+    for (int step_idx = 0; step_idx < 3; ++step_idx) {
+      if (!run_one_step(step_idx)) {
+        break;
+      }
+    }
+
+    for (auto& batch : batches) {
+      batch.finish();
+    }
+    return {};
+  }
+
   if (workers_.empty()) {
-    // empty worker, return
     return {};
   }
 
   Timer timer;
+  batches[0].refresh_forward_type();
   auto forward_inputs = workers_[0]->prepare_inputs(batches[0]);
   COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
 
@@ -275,6 +497,7 @@ ForwardOutput RecEngine::step(std::vector<Batch>& batches) {
 
   for (int i = 0; i < 2; ++i) {
     timer.reset();
+    batches[0].refresh_forward_type();
     forward_inputs = workers_[0]->prepare_inputs(batches[0]);
     COUNTER_ADD(prepare_input_latency_microseconds,
                 timer.elapsed_microseconds());
@@ -307,17 +530,23 @@ void RecEngine::update_last_step_result(std::vector<Batch>& batch) {
 }
 
 std::vector<int64_t> RecEngine::get_active_activation_memory() const {
-  // call worker to get active activation memory
   std::vector<folly::SemiFuture<int64_t>> futures;
-  futures.reserve(workers_.size());
-  for (auto& worker : workers_) {
-    futures.push_back(worker->get_active_activation_memory_async());
+  if (use_raw_forward_input_) {
+    futures.reserve(worker_clients_.size());
+    for (auto& worker : worker_clients_) {
+      futures.push_back(worker->get_active_activation_memory_async());
+    }
+  } else {
+    futures.reserve(workers_.size());
+    for (auto& worker : workers_) {
+      futures.push_back(worker->get_active_activation_memory_async());
+    }
   }
 
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
   std::vector<int64_t> active_activation_memories;
-  active_activation_memories.reserve(workers_.size());
+  active_activation_memories.reserve(futures.size());
   for (auto& result : results) {
     active_activation_memories.push_back(result.value());
   }

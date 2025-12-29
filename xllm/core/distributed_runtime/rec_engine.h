@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 
 #include "common/macros.h"
+#include "dist_manager.h"
 #include "engine.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
@@ -27,13 +28,16 @@ limitations under the License.
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
 #include "runtime/worker.h"
+#include "runtime/worker_client.h"
+#include "util/threadpool.h"
 
 namespace xllm {
 
 class RecEngine : public Engine {
  public:
   // create an engine with the given devices
-  RecEngine(const runtime::Options& options);
+  RecEngine(const runtime::Options& options,
+            std::shared_ptr<DistManager> dist_manager = nullptr);
 
   virtual ~RecEngine() = default;
 
@@ -56,6 +60,10 @@ class RecEngine : public Engine {
   // Helper methods for rec-specific execution
   ForwardOutput get_model_output(const ForwardInput& model_inputs);
 
+  std::vector<RawForwardInput> prepare_inputs(std::vector<Batch>& batch);
+  void setup_workers(const runtime::Options& options);
+  void process_group_test();
+
  private:
   // options
   runtime::Options options_;
@@ -71,6 +79,19 @@ class RecEngine : public Engine {
 
   // a list of workers, with each worker handling a partial of model
   std::vector<std::unique_ptr<Worker>> workers_;
+
+  // a list of worker clients, with each worker client corresponding to a worker
+  std::vector<std::shared_ptr<WorkerClient>> worker_clients_;
+
+  // dp related configs
+  uint32_t dp_size_ = 1;
+  uint32_t worker_clients_num_ = 0;
+  uint32_t dp_local_tp_size_ = 0;
+
+  bool use_raw_forward_input_ = false;
+
+  std::shared_ptr<DistManager> dist_manager_ = nullptr;
+  std::unique_ptr<ThreadPool> threadpool_ = nullptr;
 
   // config for kv cache
   int64_t n_local_kv_heads_ = 0;

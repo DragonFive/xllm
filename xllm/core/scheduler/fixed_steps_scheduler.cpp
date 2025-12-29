@@ -106,6 +106,10 @@ void FixedStepsScheduler::handle_prefill_requests(
         continue;
       }
 
+      if (!requires_kv_cache && prefill_sequence->dp_rank() < 0) {
+        prefill_sequence->set_dp_rank(0);
+      }
+
       size_t num_tokens = prefill_sequence->num_need_compute_tokens();
       if (remaining_token_budget < allocated_tokens + num_tokens ||
           remaining_seq_budget < allocated_seqs + 1) {

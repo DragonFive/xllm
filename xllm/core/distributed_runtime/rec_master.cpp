@@ -92,6 +92,152 @@ bool process_onerec_inputs(
   return true;
 }
 
+bool process_llmrec_inputs(
+    const std::optional<std::vector<int>>& prompt_tokens,
+    const std::optional<std::vector<proto::InferInputTensor>>& input_tensors,
+    const ModelArgs& model_args,
+    std::vector<int32_t>* local_prompt_tokens,
+    MMData* processed_mm_data,
+    OutputCallback callback) {
+  std::vector<int32_t> local_input_tokens;
+  torch::Tensor input_tokens_tensor;
+  torch::Tensor input_indices_tensor;
+  torch::Tensor input_embedding_tensor;
+  int64_t embedding_rows = 0;
+
+  if (prompt_tokens.has_value()) {
+    const auto& tokens = prompt_tokens.value();
+    local_input_tokens.reserve(tokens.size());
+    for (const auto token : tokens) {
+      local_input_tokens.push_back(static_cast<int32_t>(token));
+    }
+  }
+
+  if (input_tensors.has_value()) {
+    for (const auto& tensor : input_tensors.value()) {
+      torch::Tensor t;
+      try {
+        t = util::convert_rec_tensor_to_torch(tensor);
+      } catch (const std::exception& e) {
+        CALLBACK_WITH_ERROR(
+            StatusCode::INVALID_ARGUMENT,
+            std::string("Failed to parse input_tensors: ") + e.what());
+        return false;
+      }
+
+      if (tensor.name() == LLM_REC_INPUT_TOKENS) {
+        input_tokens_tensor = t.to(torch::kCPU).to(torch::kInt32).contiguous();
+      } else if (tensor.name() == LLM_REC_INPUT_INDICES) {
+        input_indices_tensor = t.to(torch::kCPU).to(torch::kInt32).contiguous();
+      } else if (tensor.name() == LLM_REC_INPUT_EMBEDDING) {
+        input_embedding_tensor =
+            t.to(torch::kCPU).to(torch::kFloat32).contiguous();
+      } else {
+        processed_mm_data->add(MMType::EMBEDDING, tensor.name(), t);
+      }
+    }
+  }
+
+  if (!local_input_tokens.empty() && input_tokens_tensor.defined()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "LLMRec input tokens cannot be set by both "
+                        "prompt_tokens and input_tensors");
+    return false;
+  }
+  if (local_input_tokens.empty() && input_tokens_tensor.defined()) {
+    const auto* tokens_ptr = input_tokens_tensor.data_ptr<int32_t>();
+    local_input_tokens.assign(tokens_ptr,
+                              tokens_ptr + input_tokens_tensor.numel());
+  }
+
+  if (input_embedding_tensor.defined()) {
+    if (input_embedding_tensor.dim() != 2) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "LLMRec input embedding should be 2D");
+      return false;
+    }
+    const int64_t cols = input_embedding_tensor.size(1);
+    if (cols != model_args.hidden_size()) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "LLMRec input embedding has invalid hidden size");
+      return false;
+    }
+    embedding_rows = input_embedding_tensor.size(0);
+    local_prompt_tokens->insert(local_prompt_tokens->end(),
+                                static_cast<size_t>(embedding_rows),
+                                kDefaultPlaceholderToken);
+    processed_mm_data->add(
+        MMType::EMBEDDING, LLM_REC_INPUT_EMBEDDING, input_embedding_tensor);
+  }
+
+  if (input_indices_tensor.defined()) {
+    if (local_input_tokens.empty()) {
+      CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                          "LLMRec input indices require input tokens");
+      return false;
+    }
+    if (static_cast<int64_t>(local_input_tokens.size()) !=
+        input_indices_tensor.numel()) {
+      CALLBACK_WITH_ERROR(
+          StatusCode::INVALID_ARGUMENT,
+          "LLMRec input indices size does not match input tokens");
+      return false;
+    }
+    processed_mm_data->add(
+        MMType::EMBEDDING, LLM_REC_INPUT_INDICES, input_indices_tensor);
+  } else if (!local_input_tokens.empty() && input_embedding_tensor.defined()) {
+    CALLBACK_WITH_ERROR(
+        StatusCode::INVALID_ARGUMENT,
+        "LLMRec input indices is required when input embedding is provided");
+    return false;
+  }
+
+  if (!local_input_tokens.empty()) {
+    input_tokens_tensor =
+        torch::from_blob(local_input_tokens.data(),
+                         {static_cast<int64_t>(local_input_tokens.size())},
+                         torch::dtype(torch::kInt32).device(torch::kCPU))
+            .clone();
+    processed_mm_data->add(
+        MMType::EMBEDDING, LLM_REC_INPUT_TOKENS, input_tokens_tensor);
+  }
+
+  local_prompt_tokens->insert(local_prompt_tokens->begin(),
+                              local_input_tokens.begin(),
+                              local_input_tokens.end());
+
+  if (input_indices_tensor.defined()) {
+    const int64_t total_size =
+        static_cast<int64_t>(local_input_tokens.size()) + embedding_rows;
+    std::unordered_set<int32_t> seen;
+    seen.reserve(static_cast<size_t>(input_indices_tensor.numel()));
+
+    torch::Tensor input_indices_cpu =
+        input_indices_tensor.to(torch::kCPU).to(torch::kInt32).contiguous();
+    const auto* indices_ptr = input_indices_cpu.data_ptr<int32_t>();
+    for (int64_t i = 0; i < input_indices_cpu.numel(); ++i) {
+      const auto index = indices_ptr[i];
+      if (index < 0 || index >= total_size) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "LLMRec input indices contain invalid values");
+        return false;
+      }
+      if (!seen.insert(index).second) {
+        CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                            "LLMRec input indices contain duplicate values");
+        return false;
+      }
+    }
+  }
+
+  if (local_prompt_tokens->empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, "Prompt is empty");
+    return false;
+  }
+
+  return true;
+}
+
 bool process_llmrec_raw_inputs(
     std::optional<std::vector<int>> input_tokens,
     std::optional<std::vector<int>> input_indices,
@@ -409,8 +555,9 @@ std::shared_ptr<Request> RecMaster::generate_request(
                                          &processed_mm_data,
                                          callback);
   } else if (rec_type_ == RecType::kLlmRec) {
-    processed_ok = process_onerec_inputs(prompt_tokens,
+    processed_ok = process_llmrec_inputs(prompt_tokens,
                                          input_tensors,
+                                         model_args_,
                                          &local_prompt_tokens,
                                          &processed_mm_data,
                                          callback);
