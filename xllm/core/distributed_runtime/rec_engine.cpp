@@ -155,8 +155,8 @@ Engine::KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
 
   const int32_t block_size = options_.block_size();
   const int64_t block_size_in_bytes = block_size * slot_size;
-  kv_cache_cap.n_blocks =
-      kv_cache_cap.cache_size_in_bytes / (args_.n_layers() * block_size_in_bytes);
+  kv_cache_cap.n_blocks = kv_cache_cap.cache_size_in_bytes /
+                          (args_.n_layers() * block_size_in_bytes);
   CHECK_GT(kv_cache_cap.n_blocks, 0) << "no n_blocks for kv cache";
 
   return kv_cache_cap;
@@ -262,7 +262,8 @@ bool RecEngine::LlmRecEnginePipeline::init_model_workers(
 
 int64_t RecEngine::LlmRecEnginePipeline::estimate_min_available_memory() {
   const int64_t max_cache_size = engine_.options_.max_cache_size();
-  const double max_memory_utilization = engine_.options_.max_memory_utilization();
+  const double max_memory_utilization =
+      engine_.options_.max_memory_utilization();
 
   std::vector<folly::SemiFuture<std::tuple<int64_t, int64_t>>> futures;
   futures.reserve(engine_.worker_clients_.size());
@@ -333,9 +334,8 @@ std::vector<RawForwardInput> RecEngine::LlmRecEnginePipeline::prepare_inputs(
     // kLlmRec needs refresh_forward_type for correct dp_is_decode
     batch[dp_rank].refresh_forward_type();
 
-    batched_inputs.emplace_back(std::move(
-        batch[dp_rank].prepare_forward_input(engine_.args_,
-                                             engine_.threadpool_.get())));
+    batched_inputs.emplace_back(std::move(batch[dp_rank].prepare_forward_input(
+        engine_.args_, engine_.threadpool_.get())));
     dp_global_token_nums[dp_rank] =
         batched_inputs[dp_rank].flatten_tokens_vec.size();
     global_empty_kv_cache =
@@ -360,7 +360,8 @@ std::vector<RawForwardInput> RecEngine::LlmRecEnginePipeline::prepare_inputs(
   return batched_inputs;
 }
 
-ForwardOutput RecEngine::LlmRecEnginePipeline::step(std::vector<Batch>& batches) {
+ForwardOutput RecEngine::LlmRecEnginePipeline::step(
+    std::vector<Batch>& batches) {
   if (engine_.worker_clients_.empty()) {
     return {};
   }
@@ -518,7 +519,8 @@ bool RecEngine::OneRecEnginePipeline::init_model_workers(
 
 int64_t RecEngine::OneRecEnginePipeline::estimate_min_available_memory() {
   const int64_t max_cache_size = engine_.options_.max_cache_size();
-  const double max_memory_utilization = engine_.options_.max_memory_utilization();
+  const double max_memory_utilization =
+      engine_.options_.max_memory_utilization();
 
   std::vector<folly::SemiFuture<std::tuple<int64_t, int64_t>>> futures;
   futures.reserve(engine_.workers_.size());
@@ -572,7 +574,8 @@ size_t RecEngine::OneRecEnginePipeline::num_workers() const {
   return engine_.workers_.size();
 }
 
-ForwardOutput RecEngine::OneRecEnginePipeline::step(std::vector<Batch>& batches) {
+ForwardOutput RecEngine::OneRecEnginePipeline::step(
+    std::vector<Batch>& batches) {
   if (engine_.workers_.empty()) {
     return {};
   }
