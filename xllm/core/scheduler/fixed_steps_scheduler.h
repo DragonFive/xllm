@@ -32,7 +32,6 @@ limitations under the License.
 #include "runtime/xservice_client.h"
 #include "scheduler.h"
 #include "scheduler/continuous_scheduler.h"
-#include "util/threadpool.h"
 
 namespace xllm {
 class Engine;
@@ -63,8 +62,6 @@ class FixedStepsScheduler final : public ContinuousScheduler {
       size_t& remaining_token_budget,
       size_t& remaining_seq_budget,
       std::vector<std::shared_ptr<Request>>& finished_requests);
-
-  std::unique_ptr<ThreadPool> step_threadpool_;
 };
 
 }  // namespace xllm

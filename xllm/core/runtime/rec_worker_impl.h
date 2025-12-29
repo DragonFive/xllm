@@ -19,21 +19,14 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <set>
-#include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include "common/rec_model_utils.h"
-#include "platform/stream.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/threadpool.h"
 
 namespace xllm {
-
-class ModelLoader;
 
 class RecWorkerImpl : public LLMWorkerImpl {
  public:
@@ -41,19 +34,12 @@ class RecWorkerImpl : public LLMWorkerImpl {
                 const torch::Device& device,
                 const runtime::Options& options);
 
-  ~RecWorkerImpl() override;
-
   bool init_model(ModelContext& context) override;
-
-  void load_model(std::unique_ptr<ModelLoader> loader) override;
 
   ForwardInput prepare_inputs(Batch& batch) override;
 
   void prepare_work_before_execute(const ForwardInput& inputs,
                                    ForwardInput& processed_inputs) override;
-
-  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
-      const ForwardInput& inputs) override;
 
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
@@ -112,28 +98,6 @@ class RecWorkerImpl : public LLMWorkerImpl {
   std::unique_ptr<RecWorkPipeline> work_pipeline_;
 
   RecModelKind rec_model_kind_ = RecModelKind::kNone;
-
-  uint32_t max_concurrency_ = 1;
-  bool concurrent_llmrec_enabled_ = false;
-
-  std::vector<std::unique_ptr<CausalLM>> model_instances_;
-  std::vector<std::unique_ptr<Executor>> executor_instances_;
-  std::vector<std::unique_ptr<Stream>> execute_streams_;
-  std::vector<ModelContext> context_instances_;
-
-  std::unique_ptr<ThreadPool> step_threadpool_;
-
-  std::unordered_map<std::thread::id, size_t> thread_id_to_instance_id_;
-  std::set<size_t> allocated_instance_ids_;
-  std::mutex allocation_mutex_;
-
-  void get_thread_model_instance(CausalLM*& model,
-                                 Executor*& executor,
-                                 Stream*& execute_stream,
-                                 ModelContext*& context);
-  void allocate_instance_id_for_current_thread();
-
-  void update_last_step_output(const std::optional<ForwardOutput>& output);
 };
 
 }  // namespace xllm

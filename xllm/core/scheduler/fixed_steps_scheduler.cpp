@@ -36,9 +36,7 @@ limitations under the License.
 
 namespace xllm {
 FixedStepsScheduler::FixedStepsScheduler(Engine* engine, const Options& options)
-    : ContinuousScheduler(engine, options),
-      step_threadpool_(std::make_unique<ThreadPool>(
-          static_cast<size_t>(FLAGS_llm_worker_max_concurrency))) {}
+    : ContinuousScheduler(engine, options) {}
 
 bool FixedStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
@@ -216,12 +214,22 @@ FixedStepsScheduler::ScheduleResult FixedStepsScheduler::prepare_batch() {
     response_processor_->process_completed_requests(finished_requests);
   }
 
-  auto batches = BatchFactory::get_instance(options_.dp_size())
-                     ->create_rec_batches(
-                         running_requests_,
-                         running_sequences_,
-                         running_sequences_budgets_,
-                         kv_cache_manager_->get_swap_block_transfer_infos());
+  auto* batch_factory = BatchFactory::get_instance(options_.dp_size());
+  std::vector<Batch> batches;
+  if (!running_requests_.empty() &&
+      running_requests_[0]->state().rec_type == RecType::kLlmRec) {
+    batches = batch_factory->create_batches(
+        running_requests_,
+        running_sequences_,
+        running_sequences_budgets_,
+        kv_cache_manager_->get_swap_block_transfer_infos());
+  } else {
+    batches = batch_factory->create_rec_batches(
+        running_requests_,
+        running_sequences_,
+        running_sequences_budgets_,
+        kv_cache_manager_->get_swap_block_transfer_infos());
+  }
 
   // update metrics before returning
   if (!batches[0].empty()) {
@@ -320,11 +328,7 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
       }
     };
 
-    if (FLAGS_llm_worker_max_concurrency > 1) {
-      step_threadpool_->schedule(function);
-    } else {
-      function();
-    }
+    function();
   } else {
     LOG(ERROR) << "FixedStepsScheduler::step() not supported with "
                   "enable_schedule_overlap";
