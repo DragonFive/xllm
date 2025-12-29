@@ -84,22 +84,18 @@ bool RecEngine::init_model() {
   rec_model_kind_ = get_rec_model_kind(args_.model_type());
   if (rec_model_kind_ == RecModelKind::kLlmRec) {
     pipeline_ = std::make_unique<LlmRecEnginePipeline>(*this);
-  } else {
-    pipeline_ = std::make_unique<OneRecEnginePipeline>(*this);
-  }
 
 #if defined(USE_NPU)
-  if (rec_model_kind_ == RecModelKind::kLlmRec) {
     FLAGS_enable_atb_comm_multiprocess =
         options_.enable_offline_inference() || (options_.nnodes() > 1);
-  }
 #endif
 
-  if (rec_model_kind_ == RecModelKind::kLlmRec) {
     auto master_node_addr = options_.master_node_addr().value_or("");
     CHECK(!master_node_addr.empty())
         << "REC(kLlmRec) need to set master node addr, "
            "Please set --master_node_addr.";
+  } else {
+    pipeline_ = std::make_unique<OneRecEnginePipeline>(*this);
   }
 
   // Pipeline-specific setup
