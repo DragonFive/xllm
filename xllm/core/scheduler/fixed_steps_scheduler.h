@@ -32,6 +32,7 @@ limitations under the License.
 #include "runtime/xservice_client.h"
 #include "scheduler.h"
 #include "scheduler/continuous_scheduler.h"
+#include "util/threadpool.h"
 
 namespace xllm {
 class Engine;
@@ -48,15 +49,22 @@ class FixedStepsScheduler final : public ContinuousScheduler {
   void step(const absl::Duration& timeout) override;
 
  private:
-  std::vector<Batch> schedule_request(const absl::Duration& timeout);
+  struct ScheduleResult {
+    std::vector<Batch> batches;
+    std::vector<std::shared_ptr<Request>> requests;
+  };
+
+  ScheduleResult schedule_request(const absl::Duration& timeout);
 
   // build a batch of requests from the priority queue
-  virtual std::vector<Batch> prepare_batch();
+  virtual ScheduleResult prepare_batch();
 
   void handle_prefill_requests(
       size_t& remaining_token_budget,
       size_t& remaining_seq_budget,
       std::vector<std::shared_ptr<Request>>& finished_requests);
+
+  std::unique_ptr<ThreadPool> step_threadpool_;
 };
 
 }  // namespace xllm

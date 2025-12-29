@@ -486,6 +486,11 @@ DEFINE_bool(enable_constrained_decoding,
             "that the output meets specific format or structural requirements "
             "through pre-defined rules.");
 
+DEFINE_uint32(llm_worker_max_concurrency,
+              1,
+              "Concurrency for llm worker parallel execution. Less than or "
+              "equal to 1 means disable concurrent llm worker.");
+
 #if defined(USE_NPU)
 DEFINE_string(
     npu_kernel_backend,

@@ -299,9 +299,9 @@ void RecMaster::handle_request(
     std::optional<std::vector<proto::InferInputTensor>> input_tensors,
     RequestParams sp,
     OutputCallback callback) {
-  if (rec_type_ != RecType::kOneRec) {
+  if (rec_type_ == RecType::kNone) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "OneRec should use onerec input interface");
+                        "Unsupported rec model type for prompt interface");
     return;
   }
   schedule_request(std::move(sp),
@@ -403,6 +403,12 @@ std::shared_ptr<Request> RecMaster::generate_request(
   bool processed_ok = false;
 
   if (rec_type_ == RecType::kOneRec) {
+    processed_ok = process_onerec_inputs(prompt_tokens,
+                                         input_tensors,
+                                         &local_prompt_tokens,
+                                         &processed_mm_data,
+                                         callback);
+  } else if (rec_type_ == RecType::kLlmRec) {
     processed_ok = process_onerec_inputs(prompt_tokens,
                                          input_tensors,
                                          &local_prompt_tokens,

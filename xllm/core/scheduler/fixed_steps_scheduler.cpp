@@ -21,11 +21,13 @@ limitations under the License.
 #include <folly/Unit.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 
 #include "common/metrics.h"
+#include "core/common/global_flags.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
 #include "framework/batch/batch_factory.h"
@@ -34,7 +36,9 @@ limitations under the License.
 
 namespace xllm {
 FixedStepsScheduler::FixedStepsScheduler(Engine* engine, const Options& options)
-    : ContinuousScheduler(engine, options) {}
+    : ContinuousScheduler(engine, options),
+      step_threadpool_(std::make_unique<ThreadPool>(
+          static_cast<size_t>(FLAGS_llm_worker_max_concurrency))) {}
 
 bool FixedStepsScheduler::add_request(std::shared_ptr<Request>& request) {
   CHECK(request != nullptr);
@@ -70,8 +74,12 @@ void FixedStepsScheduler::handle_prefill_requests(
          kv_cache_manager_->kv_cache_utilization() <
              FLAGS_prefill_scheduling_memory_usage_threshold) {
     std::shared_ptr<Request> request(waiting_priority_queue_.top());
+    const bool requires_kv_cache =
+        request->state().rec_type == RecType::kLlmRec;
     if (request->finished() || request->cancelled()) {
-      // kv_cache_manager_->deallocate(request.get());
+      if (requires_kv_cache) {
+        kv_cache_manager_->deallocate(request.get());
+      }
       //  release the ownership of the request
       finished_requests.emplace_back(request);
       // remove the request from the priority queue
@@ -108,6 +116,14 @@ void FixedStepsScheduler::handle_prefill_requests(
         break;
       }
 
+      if (requires_kv_cache) {
+        if (!kv_cache_manager_->allocate(prefill_sequence.get())) {
+          can_schedule = false;
+          blocks_exhausted = true;
+          break;
+        }
+      }
+
       prefill_sequences_budget.emplace_back(num_tokens);
       prefill_sequences.emplace_back(prefill_sequence.get());
       allocated_tokens += num_tokens;
@@ -116,8 +132,9 @@ void FixedStepsScheduler::handle_prefill_requests(
 
     if (!can_schedule) {
       for (auto& seq : prefill_sequences) {
-        // release shared blocks
-        kv_cache_manager_->deallocate(seq);
+        if (requires_kv_cache) {
+          kv_cache_manager_->deallocate(seq);
+        }
       }
       break;
     }
@@ -154,8 +171,12 @@ void FixedStepsScheduler::handle_prefill_requests(
   }
 }
 
-std::vector<Batch> FixedStepsScheduler::prepare_batch() {
+FixedStepsScheduler::ScheduleResult FixedStepsScheduler::prepare_batch() {
   Timer timer;
+  running_requests_.clear();
+  running_sequences_.clear();
+  running_sequences_budgets_.clear();
+
   // propogate new requests to waiting_priority_queue_
   // Include those requests that are preempted by others.
   std::shared_ptr<Request> request;
@@ -177,28 +198,7 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
     }
   }
 
-  // handle finished/cancelled requests
   std::vector<std::shared_ptr<Request>> finished_requests;
-  for (auto it = running_requests_.rbegin(); it != running_requests_.rend();
-       ++it) {
-    if (*it == nullptr) {
-      continue;
-    }
-    std::shared_ptr<Request> request = *it;
-    request->update_connection_status();
-    if (request->finished() || request->cancelled()) {
-      // kv_cache_manager_->deallocate(request.get());
-      // release the ownership of the request
-      finished_requests.emplace_back(request);
-      // finished request is set to nullptr
-      *it = nullptr;
-    }
-  }
-
-  // clear previous batch
-  running_requests_.clear();
-  running_sequences_.clear();
-  running_sequences_budgets_.clear();
 
   // remaining budget for the current batch
   size_t remaining_token_budget = options_.max_tokens_per_batch();
@@ -247,21 +247,25 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
     GAUGE_SET(num_free_blocks, kv_cache_manager_->num_free_blocks().size());
     GAUGE_SET(num_used_blocks, kv_cache_manager_->num_used_blocks().size());
   }
-  return batches;
+
+  ScheduleResult result;
+  result.batches = std::move(batches);
+  result.requests = std::move(running_requests_);
+  return result;
 }
 
-std::vector<Batch> FixedStepsScheduler::schedule_request(
+FixedStepsScheduler::ScheduleResult FixedStepsScheduler::schedule_request(
     const absl::Duration& timeout) {
   const auto deadline = absl::Now() + timeout;
-  std::vector<Batch> batch;
+  ScheduleResult result;
   while (true) {
-    batch = prepare_batch();
+    result = prepare_batch();
     bool all_empty =
-        std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
-          return one_batch.empty();
-        });
+        std::all_of(result.batches.begin(),
+                    result.batches.end(),
+                    [](const Batch& one_batch) { return one_batch.empty(); });
     if (!all_empty) {
-      return batch;
+      return result;
     }
     const auto now = absl::Now();
     if (now > deadline) {
@@ -273,8 +277,8 @@ std::vector<Batch> FixedStepsScheduler::schedule_request(
         std::min(absl::Milliseconds(kStepSleepTimeMs), deadline - now);
     absl::SleepFor(time_to_sleep);
   }
-  // return an empty batch
-  return batch;
+  // return an empty result
+  return result;
 }
 
 // step the scheduler forward by one step
@@ -282,16 +286,45 @@ std::vector<Batch> FixedStepsScheduler::schedule_request(
 void FixedStepsScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
-    std::vector<Batch> batch = schedule_request(timeout);
+    ScheduleResult result = schedule_request(timeout);
     bool all_empty =
-        std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
-          return one_batch.empty();
-        });
+        std::all_of(result.batches.begin(),
+                    result.batches.end(),
+                    [](const Batch& one_batch) { return one_batch.empty(); });
     if (all_empty) {
       return;
     }
-    engine_->step(batch);
-    kv_cache_manager_->reset_transfer_infos();
+
+    auto function = [this,
+                     batches = std::move(result.batches),
+                     requests = std::move(result.requests)]() mutable {
+      engine_->step(batches);
+      kv_cache_manager_->reset_transfer_infos();
+
+      std::vector<std::shared_ptr<Request>> finished_requests;
+      for (auto& request : requests) {
+        if (!request) {
+          continue;
+        }
+        request->update_connection_status();
+        if (request->finished() || request->cancelled()) {
+          if (request->state().rec_type == RecType::kLlmRec) {
+            kv_cache_manager_->deallocate(request.get());
+          }
+          finished_requests.emplace_back(std::move(request));
+        }
+      }
+
+      if (!finished_requests.empty()) {
+        response_processor_->process_completed_requests(finished_requests);
+      }
+    };
+
+    if (FLAGS_llm_worker_max_concurrency > 1) {
+      step_threadpool_->schedule(function);
+    } else {
+      function();
+    }
   } else {
     LOG(ERROR) << "FixedStepsScheduler::step() not supported with "
                   "enable_schedule_overlap";
