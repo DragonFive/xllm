@@ -26,6 +26,27 @@ enum class RecModelKind : int8_t {
   kLlmRec = 2,
 };
 
+// Pipeline strategy types (extensible for future strategies)
+enum class RecPipelineType : uint8_t {
+  kLlmRecDefault = 0,  // LlmRec default strategy
+  kOneRecDefault = 1,  // OneRec default strategy
+  // Future extensions:
+  // kLlmRecNpuOptimized = 2,
+  // kLlmRecMultiStream = 3,
+};
+
+// Pipeline strategy selector: choose strategy based on RecModelKind
+inline RecPipelineType get_rec_pipeline_type(RecModelKind kind) {
+  switch (kind) {
+    case RecModelKind::kLlmRec:
+      return RecPipelineType::kLlmRecDefault;
+    case RecModelKind::kOneRec:
+      return RecPipelineType::kOneRecDefault;
+    default:
+      return RecPipelineType::kLlmRecDefault;
+  }
+}
+
 inline constexpr bool is_onerec_model_type(std::string_view model_type) {
   return model_type == "onerec";
 }

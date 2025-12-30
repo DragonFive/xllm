@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
+#include <map>
 #include <memory>
 
 #include "common/global_flags.h"
@@ -34,6 +36,22 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+
+// Engine pipeline factory registry
+using EnginePipelineFactory =
+    std::function<std::unique_ptr<RecEngine::RecEnginePipeline>(RecEngine&)>;
+
+static const std::map<RecPipelineType, EnginePipelineFactory>
+    kEnginePipelineFactories = {
+        {RecPipelineType::kLlmRecDefault,
+         [](RecEngine& e) {
+           return std::make_unique<RecEngine::LlmRecEnginePipeline>(e);
+         }},
+        {RecPipelineType::kOneRecDefault,
+         [](RecEngine& e) {
+           return std::make_unique<RecEngine::OneRecEnginePipeline>(e);
+         }},
+};
 
 // ============================================================
 // RecEngine Implementation
@@ -81,11 +99,13 @@ bool RecEngine::init_model() {
   quant_args_ = model_loader->quant_args();
   tokenizer_args_ = model_loader->tokenizer_args();
 
-  // Determine rec model kind and create pipeline
+  // Determine rec model kind and create pipeline via factory
   rec_model_kind_ = get_rec_model_kind(args_.model_type());
-  if (rec_model_kind_ == RecModelKind::kLlmRec) {
-    pipeline_ = std::make_unique<LlmRecEnginePipeline>(*this);
+  auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
+  pipeline_ = kEnginePipelineFactories.at(pipeline_type)(*this);
 
+  // LlmRec-specific initialization
+  if (rec_model_kind_ == RecModelKind::kLlmRec) {
 #if defined(USE_NPU)
     FLAGS_enable_atb_comm_multiprocess =
         options_.enable_offline_inference() || (options_.nnodes() > 1);
@@ -95,8 +115,6 @@ bool RecEngine::init_model() {
     CHECK(!master_node_addr.empty())
         << "REC(kLlmRec) need to set master node addr, "
            "Please set --master_node_addr.";
-  } else {
-    pipeline_ = std::make_unique<OneRecEnginePipeline>(*this);
   }
 
   // Pipeline-specific setup

@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -32,6 +34,23 @@ limitations under the License.
 #include "util/timer.h"
 
 namespace xllm {
+
+// Worker pipeline factory registry
+using WorkPipelineFactory =
+    std::function<std::unique_ptr<RecWorkerImpl::RecWorkPipeline>(
+        RecWorkerImpl&)>;
+
+static const std::map<RecPipelineType, WorkPipelineFactory>
+    kWorkPipelineFactories = {
+        {RecPipelineType::kLlmRecDefault,
+         [](RecWorkerImpl& w) {
+           return std::make_unique<RecWorkerImpl::LlmRecWorkPipeline>(w);
+         }},
+        {RecPipelineType::kOneRecDefault,
+         [](RecWorkerImpl& w) {
+           return std::make_unique<RecWorkerImpl::OneRecWorkPipeline>(w);
+         }},
+};
 
 RecWorkerImpl::LlmRecWorkPipeline::LlmRecWorkPipeline(RecWorkerImpl& worker)
     : worker_(worker) {}
@@ -253,11 +272,9 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
     return false;
   }
 
-  if (rec_model_kind_ == RecModelKind::kLlmRec) {
-    work_pipeline_ = std::make_unique<LlmRecWorkPipeline>(*this);
-  } else if (rec_model_kind_ == RecModelKind::kOneRec) {
-    work_pipeline_ = std::make_unique<OneRecWorkPipeline>(*this);
-  }
+  // Create work pipeline via factory
+  auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
+  work_pipeline_ = kWorkPipelineFactories.at(pipeline_type)(*this);
 
   return true;
 }
