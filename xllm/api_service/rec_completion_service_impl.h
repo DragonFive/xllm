@@ -19,8 +19,8 @@ limitations under the License.
 
 #include "api_service_impl.h"
 #include "completion.pb.h"
-#include "core/distributed_runtime/rec_master.h"
 #include "rec.pb.h"
+#include "core/distributed_runtime/rec_master.h"
 #include "stream_call.h"
 
 namespace xllm {
