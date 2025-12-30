@@ -27,6 +27,7 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "framework/request/rec_type.h"
 #include "util/env_var.h"
 #include "util/pretty_print.h"
 #include "util/timer.h"
@@ -425,7 +426,7 @@ ForwardOutput RecEngine::LlmRecEnginePipeline::step(
     return true;
   };
 
-  for (int step_idx = 0; step_idx < 3; ++step_idx) {
+  for (size_t step_idx = 0; step_idx < kRecTotalSteps; ++step_idx) {
     if (!run_one_step(step_idx)) {
       break;
     }
@@ -595,7 +596,7 @@ ForwardOutput RecEngine::OneRecEnginePipeline::step(
   COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
 
   ForwardOutput decode_output;
-  for (int i = 0; i < 2; ++i) {
+  for (size_t i = 0; i < kRecDecodeSteps; ++i) {
     timer.reset();
     // OneRec does not need refresh_forward_type
     forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
