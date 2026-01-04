@@ -616,7 +616,8 @@ std::shared_ptr<Request> RecMaster::build_request_common(
     MMData mm_data,
     const RequestParams& sp,
     OutputCallback callback,
-    bool build_stop_checker) {
+    bool build_stop_checker,
+    std::optional<Call*> call) {
   int32_t max_context_len = model_args_.max_position_embeddings();
   if (!options_.enable_chunked_prefill()) {
     max_context_len =
@@ -714,7 +715,8 @@ std::shared_ptr<Request> RecMaster::build_request_common(
                          options_.enable_schedule_overlap(),
                          callback,
                          nullptr,
-                         sp.decode_address);
+                         sp.decode_address,
+                         call);
   req_state.rec_type = rec_type_;
   req_state.bos_token_id = model_args_.bos_token_id();
   auto request = std::make_shared<Request>(sp.request_id,

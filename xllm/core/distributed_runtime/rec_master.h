@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <atomic>
 #include <functional>
+#include <optional>
 #include <thread>
 
 #include "framework/chat_template/jinja_chat_template.h"
@@ -30,6 +31,8 @@ limitations under the License.
 #include "util/threadpool.h"
 
 namespace xllm {
+
+class Call;  // Forward declaration for Call class
 
 class RecMaster : public Master {
  public:
@@ -148,7 +151,8 @@ class RecMaster : public Master {
       MMData mm_data,
       const RequestParams& sp,
       OutputCallback callback,
-      bool build_stop_checker);
+      bool build_stop_checker,
+      std::optional<Call*> call = std::nullopt);
 
   // Pipeline instances
   std::unique_ptr<RecMasterPipeline> pipeline_;
