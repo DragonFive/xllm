@@ -58,3 +58,19 @@ compile_commands.json
 /local
 /logs
 /log
+
+# macOS
+.DS_Store
+
+# local tooling / editor agents
+.claude/
+.iflow/
+.joycode/
+.kilocode/
+.serena/
+
+# local environment / scratch
+.venv-clangformat/
+
+# local backups
+work.md.bak-*

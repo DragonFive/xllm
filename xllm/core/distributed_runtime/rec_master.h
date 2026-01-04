@@ -52,8 +52,17 @@ class RecMaster : public Master {
       RequestParams sp,
       OutputCallback callback);
 
+  // chat
+  // Only supported for LlmRec models.
+  void handle_request(std::vector<Message> messages,
+                      std::optional<std::vector<int>> prompt_tokens,
+                      RequestParams sp,
+                      OutputCallback callback);
+
   // start the handling loop
   void run() override;
+
+  RecType rec_type() const { return rec_type_; }
 
  private:
   using RequestBuilder =
