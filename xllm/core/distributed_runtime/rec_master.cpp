@@ -347,7 +347,8 @@ std::shared_ptr<Request> RecMaster::OneRecMasterPipeline::generate_request(
     std::optional<std::vector<int>> prompt_tokens,
     std::optional<std::vector<proto::InferInputTensor>> input_tensors,
     const RequestParams& sp,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<Call*> call) {
   Timer timer;
   std::vector<int32_t> local_prompt_tokens;
   MMData processed_mm_data;
@@ -367,7 +368,8 @@ std::shared_ptr<Request> RecMaster::OneRecMasterPipeline::generate_request(
                                       std::move(processed_mm_data),
                                       sp,
                                       callback,
-                                      /*build_stop_checker=*/false);
+                                      /*build_stop_checker=*/false,
+                                      call);
 }
 
 // ============================================================

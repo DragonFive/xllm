@@ -136,7 +136,8 @@ class RecMaster : public Master {
         std::optional<std::vector<int>> prompt_tokens,
         std::optional<std::vector<proto::InferInputTensor>> input_tensors,
         const RequestParams& sp,
-        OutputCallback callback) override;
+        OutputCallback callback,
+        std::optional<Call*> call = std::nullopt) override;
   };
 
   // Factory method to create pipeline (can access private classes)
