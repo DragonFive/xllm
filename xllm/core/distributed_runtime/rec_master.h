@@ -60,6 +60,7 @@ class RecMaster : public Master {
   void handle_request(std::vector<Message> messages,
                       std::optional<std::vector<int>> prompt_tokens,
                       RequestParams sp,
+                      std::optional<Call*> call,
                       OutputCallback callback);
 
   // start the handling loop
@@ -86,7 +87,8 @@ class RecMaster : public Master {
         std::optional<std::vector<int>> prompt_tokens,
         std::optional<std::vector<proto::InferInputTensor>> input_tensors,
         const RequestParams& sp,
-        OutputCallback callback);
+        OutputCallback callback,
+        std::optional<Call*> call = std::nullopt);
 
     // For raw input (LlmRec with mm_data)
     virtual std::shared_ptr<Request> generate_request(
@@ -109,7 +111,8 @@ class RecMaster : public Master {
         std::optional<std::vector<int>> prompt_tokens,
         std::optional<std::vector<proto::InferInputTensor>> input_tensors,
         const RequestParams& sp,
-        OutputCallback callback) override;
+        OutputCallback callback,
+        std::optional<Call*> call = std::nullopt) override;
   };
 
   // LlmRecWithMmDataMasterPipeline - qwen3 with embedding (raw input)

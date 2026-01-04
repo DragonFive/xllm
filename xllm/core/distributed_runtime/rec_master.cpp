@@ -224,7 +224,8 @@ std::shared_ptr<Request> RecMaster::RecMasterPipeline::generate_request(
     std::optional<std::vector<int>> /*prompt_tokens*/,
     std::optional<std::vector<proto::InferInputTensor>> /*input_tensors*/,
     const RequestParams& /*sp*/,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<Call*> /*call*/) {
   CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                       "This pipeline does not support prompt-based input");
   return nullptr;
@@ -252,7 +253,8 @@ std::shared_ptr<Request> RecMaster::LlmRecMasterPipeline::generate_request(
     std::optional<std::vector<int>> prompt_tokens,
     std::optional<std::vector<proto::InferInputTensor>> /*input_tensors*/,
     const RequestParams& sp,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<Call*> call) {
   Timer timer;
   std::vector<int32_t> local_prompt_tokens;
   MMData processed_mm_data;
@@ -292,7 +294,8 @@ std::shared_ptr<Request> RecMaster::LlmRecMasterPipeline::generate_request(
                                       std::move(processed_mm_data),
                                       sp,
                                       callback,
-                                      /*build_stop_checker=*/true);
+                                      /*build_stop_checker=*/true,
+                                      call);
 }
 
 // ============================================================
@@ -513,6 +516,7 @@ void RecMaster::handle_request(
 void RecMaster::handle_request(std::vector<Message> messages,
                                std::optional<std::vector<int>> prompt_tokens,
                                RequestParams sp,
+                               std::optional<Call*> call,
                                OutputCallback callback) {
   if (rec_type_ != RecType::kLlmRec) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
@@ -542,11 +546,22 @@ void RecMaster::handle_request(std::vector<Message> messages,
   }
   COUNTER_ADD(chat_template_latency_seconds, timer.elapsed_seconds());
 
-  handle_request(std::move(prompt.value()),
-                 std::move(prompt_tokens),
-                 std::nullopt,
-                 std::move(sp),
-                 std::move(callback));
+  // For chat requests, we need to pass the call parameter through the pipeline
+  // to enable client connection status detection
+  schedule_request(
+      std::move(sp),
+      std::move(callback),
+      [this,
+       prompt = std::move(prompt.value()),
+       prompt_tokens = std::move(prompt_tokens),
+       call](const RequestParams& params, OutputCallback cb) mutable {
+        return pipeline_->generate_request(std::move(prompt),
+                                           std::move(prompt_tokens),
+                                           std::nullopt,
+                                           params,
+                                           std::move(cb),
+                                           call);
+      });
 }
 
 void RecMaster::handle_request(

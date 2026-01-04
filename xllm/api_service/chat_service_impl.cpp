@@ -654,6 +654,7 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
       std::move(messages),
       std::move(prompt_tokens),
       std::move(request_params),
+      call.get(),
       [call,
        model,
        master = rec_master_,
