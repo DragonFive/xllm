@@ -153,11 +153,20 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& input) {
 
     // beam search kernel
     BeamSearchOutput beam_search_output;
+    LOG(INFO) << "[BEAM_DEBUG] Worker beam search kernel check: "
+              << "use_beam_search=" << sampling_params.use_beam_search
+              << ", acc_logprob.defined()=" << input.acc_logprob.defined()
+              << ", acc_logprob.numel()="
+              << (input.acc_logprob.defined() ? input.acc_logprob.numel() : 0);
     if (sampling_params.use_beam_search && input.acc_logprob.defined() &&
         input.acc_logprob.numel() > 0) {
+      LOG(INFO) << "[BEAM_DEBUG] Calling NPU beam search kernel";
       beam_search_output = beam_searcher_->forward(input.acc_logprob,
                                                    sample_output.top_tokens,
                                                    sample_output.top_logprobs);
+    } else {
+      LOG(INFO)
+          << "[BEAM_DEBUG] NPU beam search SKIPPED, will use CPU fallback";
     }
 
     // set sample output to output

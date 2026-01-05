@@ -56,6 +56,10 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
 
   auto probs = sample_logits;
   torch::Tensor samples;
+  LOG(INFO) << "[BEAM_DEBUG] Sampler: all_random_sample="
+            << params.all_random_sample
+            << ", all_greedy_sample=" << params.all_greedy_sample
+            << ", beam_width=" << params.beam_width;
   if (params.all_random_sample) {
     // use float32 for probabilities and log probabilities
     probs =

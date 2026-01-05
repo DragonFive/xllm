@@ -318,6 +318,18 @@ void BatchInputBuilder::process_single_sequence(
       sequence->num_generated_tokens() > 0) {
     state.acc_logprob_vec.push_back(sequence->get_average_logprob() *
                                     sequence->num_generated_tokens());
+    LOG(INFO) << "[BEAM_DEBUG] acc_logprob_vec filled: "
+              << "num_generated_tokens=" << sequence->num_generated_tokens()
+              << ", avg_logprob=" << sequence->get_average_logprob()
+              << ", acc_logprob="
+              << (sequence->get_average_logprob() *
+                  sequence->num_generated_tokens());
+  } else {
+    LOG(INFO) << "[BEAM_DEBUG] acc_logprob_vec SKIPPED: "
+              << "FLAGS_enable_beam_search_kernel="
+              << FLAGS_enable_beam_search_kernel
+              << ", is_beam_search=" << sequence->check_beam_search()
+              << ", num_generated_tokens=" << sequence->num_generated_tokens();
   }
 }
 
