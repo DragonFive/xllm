@@ -130,9 +130,11 @@ void SamplingParameters::init(
   std::vector<int32_t> do_sample;
   for (const auto idx : sample_idxes) {
     const auto* p = req_sampling_params[idx];
-    // need to do sample if any of following is true
-    const bool sample = p->do_sample || p->temperature != 0.0 ||
-                        p->top_p != 1.0 || p->top_k > 0;
+    // beam_search should use greedy sampling for deterministic output
+    // only enable random sampling when beam_width <= 1 and other conditions met
+    const bool sample =
+        (p->beam_width <= 1) && (p->do_sample || p->temperature != 0.0 ||
+                                 p->top_p != 1.0 || p->top_k > 0);
     do_sample.push_back(sample ? 1 : 0);
   }
   this->sample_idxes = torch::tensor(sample_idxes, int_tensor_options);
