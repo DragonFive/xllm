@@ -119,7 +119,7 @@ void FixedStepsScheduler::handle_prefill_requests(
       }
 
       if (requires_kv_cache) {
-        if (!scheduler_pipeline_->allocate_kv_cache(kv_cache_manager_.get(),
+        if (!scheduler_pipeline_->allocate_kv_cache(kv_cache_manager_,
                                                     prefill_sequence.get())) {
           can_schedule = false;
           blocks_exhausted = true;
