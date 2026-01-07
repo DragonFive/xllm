@@ -348,7 +348,7 @@ std::vector<Batch> FixedStepsScheduler::LlmRecSchedulerPipeline::create_batches(
 }
 
 bool FixedStepsScheduler::LlmRecSchedulerPipeline::allocate_kv_cache(
-    BlockManagerPool* kv_cache_manager,
+    KVCacheManager* kv_cache_manager,
     Sequence* sequence) {
   const size_t num_tokens = sequence->num_tokens();
   const size_t max_generated_tokens =

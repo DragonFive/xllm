@@ -58,7 +58,7 @@ class FixedStepsScheduler final : public ContinuousScheduler {
                                               BatchFactory* batch_factory) = 0;
     virtual bool requires_kv_cache() const = 0;
     // Allocate KV cache for sequence, implemented by each pipeline
-    virtual bool allocate_kv_cache(BlockManagerPool* kv_cache_manager,
+    virtual bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
                                    Sequence* sequence) = 0;
   };
 
@@ -67,7 +67,7 @@ class FixedStepsScheduler final : public ContinuousScheduler {
     std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
                                       BatchFactory* batch_factory) override;
     bool requires_kv_cache() const override { return true; }
-    bool allocate_kv_cache(BlockManagerPool* kv_cache_manager,
+    bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
                            Sequence* sequence) override;
   };
 
@@ -76,7 +76,7 @@ class FixedStepsScheduler final : public ContinuousScheduler {
     std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
                                       BatchFactory* batch_factory) override;
     bool requires_kv_cache() const override { return false; }
-    bool allocate_kv_cache(BlockManagerPool* /*kv_cache_manager*/,
+    bool allocate_kv_cache(KVCacheManager* /*kv_cache_manager*/,
                            Sequence* /*sequence*/) override {
       return true;
     }
