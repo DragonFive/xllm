@@ -50,5 +50,10 @@ torch::Tensor scatter(torch::Tensor input,
 std::vector<std::unique_ptr<ProcessGroup>> create_npu_process_groups(
     const std::vector<torch::Device>& devices);
 
+// Create process groups for local (single-node) scenarios
+// Supports GPU (CUDA/MLU) and NPU, including single-device case
+std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
+    const std::vector<torch::Device>& devices);
+
 }  // namespace parallel_state
 }  // namespace xllm

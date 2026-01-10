@@ -281,5 +281,41 @@ std::vector<std::unique_ptr<ProcessGroup>> create_npu_process_groups(
 #endif
 }
 
+std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
+    const std::vector<torch::Device>& devices) {
+  CHECK(!devices.empty()) << "devices should not be empty";
+  const int world_size = static_cast<int>(devices.size());
+
+  std::vector<std::unique_ptr<ProcessGroup>> process_groups;
+  process_groups.reserve(devices.size());
+
+#if defined(USE_NPU)
+  std::vector<HcclComm> comms(devices.size());
+  for (int i = 0; i < world_size; ++i) {
+    process_groups.emplace_back(std::make_unique<ProcessGroupImpl>(
+        /*rank=*/i, world_size, devices[i], comms[i]));
+  }
+#elif defined(USE_CUDA) || defined(USE_MLU) || defined(USE_ILU)
+  // For GPU: use create_process_group with localhost
+  const std::string host = "127.0.0.1";
+  const int base_port = 29500;
+  for (int i = 0; i < world_size; ++i) {
+    process_groups.emplace_back(create_process_group(
+        /*rank=*/i,
+        /*world_size=*/world_size,
+        /*rank_size=*/world_size,
+        /*port=*/base_port,
+        /*trans=*/false,
+        host,
+        /*group_name=*/"local_tp_group",
+        devices[i]));
+  }
+#else
+  LOG(FATAL) << "Unsupported device type for create_local_process_groups";
+#endif
+
+  return process_groups;
+}
+
 }  // namespace parallel_state
 }  // namespace xllm

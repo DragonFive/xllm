@@ -725,19 +725,20 @@ void RecEngine::PureDeviceEnginePipeline::process_group_test() {
 bool RecEngine::PureDeviceEnginePipeline::init_model_workers(
     const std::string& model_path) {
   const auto& devices = engine_.options_.devices();
-  if (devices.size() > 1) {
-    engine_.process_groups_ =
-        parallel_state::create_npu_process_groups(devices);
-  }
+  const int32_t world_size = static_cast<int32_t>(devices.size());
+
+  // Always create process_groups (supports both single and multi-device)
+  engine_.process_groups_ =
+      parallel_state::create_local_process_groups(devices);
 
   engine_.workers_.clear();
   WorkerType worker_type = WorkerType::REC;
-  const int32_t world_size = static_cast<int32_t>(devices.size());
   for (size_t i = 0; i < devices.size(); ++i) {
     const int32_t rank = static_cast<int32_t>(i);
-    ProcessGroup* pg =
-        world_size > 1 ? engine_.process_groups_[i].get() : nullptr;
+    ProcessGroup* pg = engine_.process_groups_[i].get();
     ParallelArgs parallel_args(rank, world_size, pg);
+    // Set tp_group_ = process_group_ for TP parallelism
+    parallel_args.tp_group_ = pg;
     engine_.workers_.emplace_back(std::make_unique<Worker>(
         parallel_args, devices[i], engine_.options_, worker_type));
   }
