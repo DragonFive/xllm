@@ -240,11 +240,8 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   // Lazy initialize pipeline on first batch with requests
   if (!scheduler_pipeline_ && !running_requests_.empty()) {
     auto rec_type = running_requests_[0]->state().rec_type;
-    if (rec_type == RecType::kLlmRec) {
-      scheduler_pipeline_ = std::make_unique<LlmRecSchedulerPipeline>();
-    } else {
-      scheduler_pipeline_ = std::make_unique<OneRecSchedulerPipeline>();
-    }
+    bool is_pure_device = (FLAGS_max_decode_rounds > 0);
+    scheduler_pipeline_ = create_scheduler_pipeline(rec_type, is_pure_device);
   }
 
   // Use pipeline to create batches
@@ -354,6 +351,29 @@ std::vector<Batch> FixedStepsScheduler::OneRecSchedulerPipeline::create_batches(
       scheduler.running_sequences_,
       scheduler.running_sequences_budgets_,
       scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
+}
+
+std::vector<Batch>
+FixedStepsScheduler::PureDeviceSchedulerPipeline::create_batches(
+    FixedStepsScheduler& scheduler,
+    BatchFactory* batch_factory) {
+  return batch_factory->create_rec_batches(
+      scheduler.running_requests_,
+      scheduler.running_sequences_,
+      scheduler.running_sequences_budgets_,
+      scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
+}
+
+std::unique_ptr<FixedStepsScheduler::SchedulerPipeline>
+FixedStepsScheduler::create_scheduler_pipeline(RecType rec_type,
+                                               bool is_pure_device) {
+  if (is_pure_device) {
+    return std::make_unique<PureDeviceSchedulerPipeline>();
+  }
+  if (rec_type == RecType::kLlmRec) {
+    return std::make_unique<LlmRecSchedulerPipeline>();
+  }
+  return std::make_unique<OneRecSchedulerPipeline>();
 }
 
 }  // namespace xllm

@@ -28,9 +28,10 @@ enum class RecModelKind : int8_t {
 
 // Pipeline strategy types (extensible for future strategies)
 enum class RecPipelineType : uint8_t {
-  kLlmRecDefault = 0,     // LlmRec without mm_data (pure qwen)
-  kLlmRecWithMmData = 1,  // LlmRec with mm_data (qwen + embedding)
-  kOneRecDefault = 2,     // OneRec
+  kLlmRecDefault = 0,          // LlmRec without mm_data (pure qwen)
+  kLlmRecWithMmData = 1,       // LlmRec with mm_data (qwen + embedding)
+  kOneRecDefault = 2,          // OneRec
+  kLlmPureDevicePipeLine = 3,  // LlmRec pure device pipeline for multi-round
 };
 
 // Pipeline strategy selector: choose strategy based on RecModelKind

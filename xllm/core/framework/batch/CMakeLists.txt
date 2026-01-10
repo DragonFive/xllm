@@ -3,7 +3,7 @@ include(cc_library)
 include(cc_test)
 
 cc_library(
-  NAME 
+  NAME
     batch
   HDRS
     dit_batch.h
@@ -13,7 +13,7 @@ cc_library(
     rec_batch_input_builder.h
     onerec_batch_input_builder.h
     mposition.h
-  SRCS 
+  SRCS
     dit_batch.cpp
     batch.cpp
     batch_factory.cpp
