@@ -42,28 +42,28 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
   CHECK(plan_info->layer_id != -1) << "Need to set layer_id to PlanInfo.";
   if (plan_info->layer_id != 0) return;
 
-  LOG(INFO) << "inner update_plan_info";
-  LOG(INFO) << "backend: " << backend;
-  LOG(INFO) << "attn_meta.q_cu_seq_lens.shape: "
-            << attn_meta.q_cu_seq_lens.sizes();
-  LOG(INFO) << "attn_meta.kv_cu_seq_lens.shape: "
-            << attn_meta.kv_cu_seq_lens.sizes();
-  LOG(INFO) << "attn_meta.paged_kv_indptr.shape: "
-            << attn_meta.paged_kv_indptr.sizes();
-  LOG(INFO) << "attn_meta.paged_kv_indices.shape: "
-            << attn_meta.paged_kv_indices.sizes();
-  LOG(INFO) << "attn_meta.paged_kv_last_page_len.shape: "
-            << attn_meta.paged_kv_last_page_len.sizes();
-  LOG(INFO) << "attn_meta.kv_seq_lens.shape: " << attn_meta.kv_seq_lens.sizes();
-  LOG(INFO) << "head_dim_qk: " << head_dim_qk;
-  LOG(INFO) << "head_dim_vo: " << head_dim_vo;
-  LOG(INFO) << "num_qo_heads: " << num_qo_heads;
-  LOG(INFO) << "num_kv_heads: " << num_kv_heads;
-  LOG(INFO) << "block_size: " << block_size;
-  LOG(INFO) << "window_size_left: " << window_size_left;
-  LOG(INFO) << "enable_cuda_graph: " << enable_cuda_graph;
-  LOG(INFO) << "causal: " << causal;
-  LOG(INFO) << "use_tensor_core: " << use_tensor_core;
+  // LOG(INFO) << "inner update_plan_info";
+  // LOG(INFO) << "backend: " << backend;
+  // LOG(INFO) << "attn_meta.q_cu_seq_lens.shape: "
+  //           << attn_meta.q_cu_seq_lens.sizes();
+  // LOG(INFO) << "attn_meta.kv_cu_seq_lens.shape: "
+  //           << attn_meta.kv_cu_seq_lens.sizes();
+  // LOG(INFO) << "attn_meta.paged_kv_indptr.shape: "
+  //           << attn_meta.paged_kv_indptr.sizes();
+  // LOG(INFO) << "attn_meta.paged_kv_indices.shape: "
+  //           << attn_meta.paged_kv_indices.sizes();
+  // LOG(INFO) << "attn_meta.paged_kv_last_page_len.shape: "
+  //           << attn_meta.paged_kv_last_page_len.sizes();
+  // LOG(INFO) << "attn_meta.kv_seq_lens.shape: " <<
+  // attn_meta.kv_seq_lens.sizes(); LOG(INFO) << "head_dim_qk: " << head_dim_qk;
+  // LOG(INFO) << "head_dim_vo: " << head_dim_vo;
+  // LOG(INFO) << "num_qo_heads: " << num_qo_heads;
+  // LOG(INFO) << "num_kv_heads: " << num_kv_heads;
+  // LOG(INFO) << "block_size: " << block_size;
+  // LOG(INFO) << "window_size_left: " << window_size_left;
+  // LOG(INFO) << "enable_cuda_graph: " << enable_cuda_graph;
+  // LOG(INFO) << "causal: " << causal;
+  // LOG(INFO) << "use_tensor_core: " << use_tensor_core;
 
   // 1. prefill plan info
   if (causal) {
@@ -169,7 +169,7 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
           /*pos_encoding_mode=*/0,
           /*use_sliding_window=*/false,
           /*use_logits_soft_cap=*/false);
-      LOG(INFO) << "plan_info->uri: " << plan_info->uri;
+      // LOG(INFO) << "plan_info->uri: " << plan_info->uri;
       torch::Tensor paged_kv_indptr_host =
           attn_meta.decode_paged_kv_indptr.to(torch::kCPU);
       const int64_t batch_size =
@@ -199,36 +199,36 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
                     head_dim_vo,
                     empty_q_data,
                     empty_kv_data);
-      LOG(INFO) << "float_workspace_buffer.shape: "
-                << FlashinferWorkspace::get_instance()
-                       .get_float_workspace_buffer()
-                       .sizes();
-      LOG(INFO) << "int_workspace_buffer.shape: "
-                << FlashinferWorkspace::get_instance()
-                       .get_int_workspace_buffer()
-                       .sizes();
-      LOG(INFO) << "page_locked_int_workspace_buffer.shape: "
-                << FlashinferWorkspace::get_instance()
-                       .get_page_locked_int_workspace_buffer()
-                       .sizes();
-      LOG(INFO) << "paged_kv_indptr_host: " << paged_kv_indptr_host;
-      LOG(INFO) << "batch_size: " << batch_size;
-      LOG(INFO) << "num_qo_heads: " << num_qo_heads;
-      LOG(INFO) << "num_kv_heads: " << num_kv_heads;
-      LOG(INFO) << "block_size: " << block_size;
-      LOG(INFO) << "enable_cuda_graph: " << enable_cuda_graph;
-      LOG(INFO) << "window_size_left: " << window_size_left;
-      LOG(INFO) << "logits_soft_cap: " << 0.0;
-      LOG(INFO) << "head_dim_qk: " << head_dim_qk;
-      LOG(INFO) << "head_dim_vo: " << head_dim_vo;
-      LOG(INFO) << "empty_q_data: " << empty_q_data;
-      LOG(INFO) << "empty_kv_data: " << empty_kv_data;
+      // LOG(INFO) << "float_workspace_buffer.shape: "
+      //           << FlashinferWorkspace::get_instance()
+      //                  .get_float_workspace_buffer()
+      //                  .sizes();
+      // LOG(INFO) << "int_workspace_buffer.shape: "
+      //           << FlashinferWorkspace::get_instance()
+      //                  .get_int_workspace_buffer()
+      //                  .sizes();
+      // LOG(INFO) << "page_locked_int_workspace_buffer.shape: "
+      //           << FlashinferWorkspace::get_instance()
+      //                  .get_page_locked_int_workspace_buffer()
+      //                  .sizes();
+      // LOG(INFO) << "paged_kv_indptr_host: " << paged_kv_indptr_host;
+      // LOG(INFO) << "batch_size: " << batch_size;
+      // LOG(INFO) << "num_qo_heads: " << num_qo_heads;
+      // LOG(INFO) << "num_kv_heads: " << num_kv_heads;
+      // LOG(INFO) << "block_size: " << block_size;
+      // LOG(INFO) << "enable_cuda_graph: " << enable_cuda_graph;
+      // LOG(INFO) << "window_size_left: " << window_size_left;
+      // LOG(INFO) << "logits_soft_cap: " << 0.0;
+      // LOG(INFO) << "head_dim_qk: " << head_dim_qk;
+      // LOG(INFO) << "head_dim_vo: " << head_dim_vo;
+      // LOG(INFO) << "empty_q_data: " << empty_q_data;
+      // LOG(INFO) << "empty_kv_data: " << empty_kv_data;
 
-      LOG(INFO) << "causal: " << causal;
-      LOG(INFO) << "use_tensor_core: " << use_tensor_core;
-      LOG(INFO) << "query_dtype: " << query_dtype;
-      LOG(INFO) << "key_dtype: " << key_dtype;
-      LOG(INFO) << "output_dtype: " << output_dtype;
+      // LOG(INFO) << "causal: " << causal;
+      // LOG(INFO) << "use_tensor_core: " << use_tensor_core;
+      // LOG(INFO) << "query_dtype: " << query_dtype;
+      // LOG(INFO) << "key_dtype: " << key_dtype;
+      // LOG(INFO) << "output_dtype: " << output_dtype;
     }
   }
 }

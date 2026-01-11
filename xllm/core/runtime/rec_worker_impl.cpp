@@ -379,7 +379,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_work_before_execute(
 
 std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     const ForwardInput& input) {
-  LOG(INFO) << "inner LlmRecPureDevicePipeline::step";
+  // LOG(INFO) << "inner LlmRecPureDevicePipeline::step";
   return step_multi_round(const_cast<ForwardInput&>(input));
 }
 
@@ -412,7 +412,7 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
     auto full_k_cache = input.input_params.full_k_caches[i];
     auto full_v_cache = input.input_params.full_v_caches[i];
 
-    LOG(INFO) << "full_k_cache.shape: " << full_k_cache.sizes();
+    // LOG(INFO) << "full_k_cache.shape: " << full_k_cache.sizes();
 
     auto unshared_k_cache = full_k_cache.slice(0, unshared_offset, full_kv_len);
     auto unshared_v_cache = full_v_cache.slice(0, unshared_offset, full_kv_len);
@@ -421,7 +421,7 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
         {batch, beam_width, max_decode_step, num_kv_heads, head_dim});
     unshared_v_cache = unshared_v_cache.view(
         {batch, beam_width, max_decode_step, num_kv_heads, head_dim});
-    LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache.sizes();
+    // LOG(INFO) << "unshared_k_cache.shape: " << unshared_k_cache.sizes();
     unshared_k_caches.push_back(unshared_k_cache);
     unshared_v_caches.push_back(unshared_v_cache);
   }
@@ -438,10 +438,10 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
       torch::zeros({batch, beam_width, total_rounds}, int_options);
 
   int64_t num_seq = batch * beam_width;
-  LOG(INFO) << "batch: " << batch;
-  LOG(INFO) << "beam_width: " << beam_width;
-  LOG(INFO) << "total_rounds: " << total_rounds;
-  LOG(INFO) << "num_seq: " << num_seq;
+  // LOG(INFO) << "batch: " << batch;
+  // LOG(INFO) << "beam_width: " << beam_width;
+  // LOG(INFO) << "total_rounds: " << total_rounds;
+  // LOG(INFO) << "num_seq: " << num_seq;
   torch::Tensor acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
   torch::Tensor out_log_probs = torch::zeros({num_seq, 1}, fp32_options);
   torch::Tensor out_token_ids = torch::zeros({num_seq, 1}, int_options);
@@ -635,16 +635,16 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
   // 从第一层的 cache 获取维度信息（假设所有层相同）
   auto unshared_k_cache_first = unshared_k_caches[0];
   uint32_t shared_kv_len = FLAGS_max_token_per_req;
-  LOG(INFO) << "shared_kv_len: " << shared_kv_len;
+  // LOG(INFO) << "shared_kv_len: " << shared_kv_len;
   uint32_t max_decode_step = unshared_k_cache_first.size(2);
-  LOG(INFO) << "max_decode_step: " << max_decode_step;
+  // LOG(INFO) << "max_decode_step: " << max_decode_step;
   // 获取必要的 tensor
   auto kv_cu_seq_lens = input.input_params.kv_seq_lens;
-  LOG(INFO) << "kv_cu_seq_lens: " << kv_cu_seq_lens;
+  // LOG(INFO) << "kv_cu_seq_lens: " << kv_cu_seq_lens;
   // 计算 batch_shared_kv_lens
   // [batch_size]
   auto batch_shared_kv_lens = torch::diff(kv_cu_seq_lens);
-  LOG(INFO) << "batch_shared_kv_lens: " << batch_shared_kv_lens;
+  // LOG(INFO) << "batch_shared_kv_lens: " << batch_shared_kv_lens;
   auto paged_options =
       torch::TensorOptions().dtype(torch::kInt32).device(worker_.device_);
 
@@ -767,11 +767,12 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
   input.input_params.decode_paged_kv_indices = paged_kv_indices;
   input.input_params.decode_paged_kv_indptr = paged_kv_indptr;
   input.input_params.decode_paged_kv_last_page_len = paged_kv_last_page_len;
-  LOG(INFO) << "input.input_params.decode_paged_kv_indices: "
-            << paged_kv_indices;
-  LOG(INFO) << "input.input_params.decode_paged_kv_indptr: " << paged_kv_indptr;
-  LOG(INFO) << "input.input_params.decode_paged_kv_last_page_len: "
-            << paged_kv_last_page_len;
+  // LOG(INFO) << "input.input_params.decode_paged_kv_indices: "
+  //           << paged_kv_indices;
+  // LOG(INFO) << "input.input_params.decode_paged_kv_indptr: " <<
+  // paged_kv_indptr; LOG(INFO) <<
+  // "input.input_params.decode_paged_kv_last_page_len: "
+  //           << paged_kv_last_page_len;
   // LOG(INFO) << "input.input_params.decode_paged_kv_indices: " <<
   // input.input_params.decode_paged_kv_indices; LOG(INFO) <<
   // "input.input_params.decode_paged_kv_indptr: " <<

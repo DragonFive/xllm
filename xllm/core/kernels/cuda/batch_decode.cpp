@@ -39,7 +39,7 @@ void batch_decode(const std::string& uri,
                   bool enable_cuda_graph,
                   bool use_tensor_core,
                   torch::Tensor kv_seq_lens) {
-  LOG(INFO) << "use_tensor_core: " << use_tensor_core;
+  // LOG(INFO) << "use_tensor_core: " << use_tensor_core;
   if (use_tensor_core) {
     const int64_t batch_size = paged_kv_last_page_len.size(0);
     torch::Tensor qo_indptr_host =
