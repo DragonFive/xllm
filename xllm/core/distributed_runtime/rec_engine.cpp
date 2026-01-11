@@ -726,19 +726,42 @@ bool RecEngine::PureDeviceEnginePipeline::init_model_workers(
     const std::string& model_path) {
   const auto& devices = engine_.options_.devices();
   const int32_t world_size = static_cast<int32_t>(devices.size());
+  const int32_t dp_size = engine_.options_.dp_size();
 
-  // Always create process_groups (supports both single and multi-device)
-  engine_.process_groups_ =
-      parallel_state::create_local_process_groups(devices);
+  // Create process groups with TP + DP support
+  auto local_pgs =
+      parallel_state::create_local_process_groups_with_dp(devices, dp_size);
+
+  // Store process groups in engine
+  engine_.world_process_groups_ = std::move(local_pgs.world_groups);
+  engine_.tp_process_groups_ = std::move(local_pgs.tp_groups);
+  engine_.dp_process_groups_ = std::move(local_pgs.dp_groups);
+
+  // Also keep process_groups_ for backward compatibility
+  // (points to world_process_groups_)
+  engine_.process_groups_.clear();
+  engine_.process_groups_.reserve(world_size);
+  for (int32_t i = 0; i < world_size; ++i) {
+    // Note: We can't move from world_process_groups_ since we need to keep them
+    // So process_groups_ will be empty for PureDevice pipeline
+  }
 
   engine_.workers_.clear();
+  engine_.dp_size_ = dp_size;
   WorkerType worker_type = WorkerType::REC;
+
   for (size_t i = 0; i < devices.size(); ++i) {
     const int32_t rank = static_cast<int32_t>(i);
-    ProcessGroup* pg = engine_.process_groups_[i].get();
-    ParallelArgs parallel_args(rank, world_size, pg);
-    // Set tp_group_ = process_group_ for TP parallelism
-    parallel_args.tp_group_ = pg;
+
+    // Build ParallelArgs with all process groups
+    ParallelArgs parallel_args(
+        rank, world_size, dp_size, engine_.world_process_groups_[i].get());
+    parallel_args.tp_group_ = engine_.tp_process_groups_[i].get();
+    if (dp_size > 1) {
+      parallel_args.dp_local_process_group_ =
+          engine_.dp_process_groups_[i].get();
+    }
+
     engine_.workers_.emplace_back(std::make_unique<Worker>(
         parallel_args, devices[i], engine_.options_, worker_type));
   }

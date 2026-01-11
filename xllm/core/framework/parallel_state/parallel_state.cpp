@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "parallel_state.h"
 
+#include <thread>
+
 #include "core/util/utils.h"
 
 #if defined(USE_NPU)
@@ -286,35 +288,112 @@ std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
   CHECK(!devices.empty()) << "devices should not be empty";
   const int world_size = static_cast<int>(devices.size());
 
-  std::vector<std::unique_ptr<ProcessGroup>> process_groups;
-  process_groups.reserve(devices.size());
+  std::vector<std::unique_ptr<ProcessGroup>> process_groups(world_size);
 
-#if defined(USE_NPU)
-  std::vector<HcclComm> comms(devices.size());
-  for (int i = 0; i < world_size; ++i) {
-    process_groups.emplace_back(std::make_unique<ProcessGroupImpl>(
-        /*rank=*/i, world_size, devices[i], comms[i]));
-  }
-#elif defined(USE_CUDA) || defined(USE_MLU) || defined(USE_ILU)
-  // For GPU: use create_process_group with localhost
   const std::string host = "127.0.0.1";
   const int base_port = 29500;
+
+  // Use multi-threading for concurrent initialization
+  // (TCPStore requires all ranks to connect simultaneously)
+  std::vector<std::thread> threads;
+  threads.reserve(world_size);
+
   for (int i = 0; i < world_size; ++i) {
-    process_groups.emplace_back(create_process_group(
-        /*rank=*/i,
-        /*world_size=*/world_size,
-        /*rank_size=*/world_size,
-        /*port=*/base_port,
-        /*trans=*/false,
-        host,
-        /*group_name=*/"local_tp_group",
-        devices[i]));
+    threads.emplace_back([&, i]() {
+      process_groups[i] = create_process_group(
+          /*rank=*/i,
+          /*world_size=*/world_size,
+          /*rank_size=*/world_size,
+          /*port=*/base_port,
+          /*trans=*/false,
+          host,
+          /*group_name=*/"local_tp_group",
+          devices[i]);
+    });
   }
-#else
-  LOG(FATAL) << "Unsupported device type for create_local_process_groups";
-#endif
+
+  for (auto& t : threads) {
+    t.join();
+  }
 
   return process_groups;
+}
+
+LocalProcessGroups create_local_process_groups_with_dp(
+    const std::vector<torch::Device>& devices,
+    int32_t dp_size) {
+  CHECK(!devices.empty()) << "devices should not be empty";
+  const int32_t world_size = static_cast<int32_t>(devices.size());
+  CHECK(world_size % dp_size == 0)
+      << "world_size (" << world_size << ") must be divisible by dp_size ("
+      << dp_size << ")";
+  const int32_t tp_size = world_size / dp_size;
+
+  LocalProcessGroups result;
+  result.world_groups.resize(world_size);
+  result.tp_groups.resize(world_size);
+  if (dp_size > 1) {
+    result.dp_groups.resize(world_size);
+  }
+
+  const std::string host = "127.0.0.1";
+  const int base_port = 29500;
+
+  // Use multi-threading for concurrent initialization
+  // (TCPStore requires all ranks to connect simultaneously)
+  std::vector<std::thread> threads;
+  threads.reserve(world_size);
+
+  for (int32_t rank = 0; rank < world_size; ++rank) {
+    threads.emplace_back([&, rank]() {
+      // 1. World Group (all devices)
+      result.world_groups[rank] = create_process_group(rank,
+                                                       world_size,
+                                                       world_size,
+                                                       base_port,
+                                                       false,
+                                                       host,
+                                                       "world_group",
+                                                       devices[rank]);
+
+      // 2. TP Group (devices within the same DP rank)
+      // TP group layout: [0,1], [2,3] for world_size=4, dp_size=2
+      // tp_group_index = rank / tp_size (i.e., dp_rank)
+      int32_t dp_rank = rank / tp_size;
+      int32_t tp_port = base_port + 100 + dp_rank;
+      result.tp_groups[rank] = create_process_group(rank,
+                                                    world_size,
+                                                    tp_size,
+                                                    tp_port,
+                                                    false,
+                                                    host,
+                                                    "tp_group",
+                                                    devices[rank]);
+
+      // 3. DP Group (devices with the same TP rank)
+      // DP group layout: [0,2], [1,3] for world_size=4, dp_size=2
+      // dp_group_index = rank % tp_size (i.e., tp_rank)
+      if (dp_size > 1) {
+        int32_t tp_rank = rank % tp_size;
+        int32_t dp_port = base_port + 200 + tp_rank;
+        result.dp_groups[rank] =
+            create_process_group(rank,
+                                 world_size,
+                                 dp_size,
+                                 dp_port,
+                                 true,  // trans=true for DP groups
+                                 host,
+                                 "dp_group",
+                                 devices[rank]);
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  return result;
 }
 
 }  // namespace parallel_state

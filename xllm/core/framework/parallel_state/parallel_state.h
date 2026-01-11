@@ -55,5 +55,21 @@ std::vector<std::unique_ptr<ProcessGroup>> create_npu_process_groups(
 std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
     const std::vector<torch::Device>& devices);
 
+// Local ProcessGroup collection (supports TP + DP)
+struct LocalProcessGroups {
+  std::vector<std::unique_ptr<ProcessGroup>> world_groups;  // one per rank
+  std::vector<std::unique_ptr<ProcessGroup>> tp_groups;     // one per rank
+  std::vector<std::unique_ptr<ProcessGroup>>
+      dp_groups;  // one per rank (when dp_size > 1)
+};
+
+// Create process groups for local scenarios with TP + DP support
+// devices: list of devices to create process groups on
+// dp_size: data parallelism size (default 1 means pure TP)
+// Returns: LocalProcessGroups containing world, tp, and dp groups
+LocalProcessGroups create_local_process_groups_with_dp(
+    const std::vector<torch::Device>& devices,
+    int32_t dp_size = 1);
+
 }  // namespace parallel_state
 }  // namespace xllm

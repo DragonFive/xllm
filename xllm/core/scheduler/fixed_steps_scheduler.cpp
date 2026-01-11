@@ -357,7 +357,7 @@ std::vector<Batch>
 FixedStepsScheduler::PureDeviceSchedulerPipeline::create_batches(
     FixedStepsScheduler& scheduler,
     BatchFactory* batch_factory) {
-  return batch_factory->create_rec_batches(
+  return batch_factory->create_batches(
       scheduler.running_requests_,
       scheduler.running_sequences_,
       scheduler.running_sequences_budgets_,

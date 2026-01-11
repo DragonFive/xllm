@@ -184,6 +184,12 @@ class RecEngine : public Engine {
   std::vector<std::unique_ptr<ProcessGroup>> process_groups_;
   std::vector<std::unique_ptr<Worker>> workers_;
 
+  // PureDevice specific (managed by PureDeviceEnginePipeline)
+  // Supports TP + DP parallelism
+  std::vector<std::unique_ptr<ProcessGroup>> world_process_groups_;
+  std::vector<std::unique_ptr<ProcessGroup>> tp_process_groups_;
+  std::vector<std::unique_ptr<ProcessGroup>> dp_process_groups_;
+
   // KV cache config
   int64_t n_local_kv_heads_ = 0;
   int64_t head_dim_ = 0;
