@@ -489,7 +489,7 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
                                                           input.positions,
                                                           worker_.kv_caches_,
                                                           input.input_params);
-    LOG(INFO) << "hidden_stats:" << hidden_states;
+    // LOG(INFO) << "hidden_stats:" << hidden_states;
     if (!hidden_states.defined()) {
       return std::nullopt;
     }

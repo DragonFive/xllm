@@ -837,7 +837,9 @@ ForwardOutput RecEngine::PureDeviceEnginePipeline::step(
               timer.elapsed_microseconds());
 
   timer.reset();
-  batches[0].process_sample_output(output.sample_output, false);
+  // Use process_beam_sequence_group for multi-round beam search results
+  // instead of process_sample_output which would call append_token()
+  batches[0].process_beam_sequence_group(output);
   COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
 
   batches[0].finish();
@@ -855,7 +857,16 @@ ForwardOutput RecEngine::PureDeviceEnginePipeline::get_model_output(
   auto forward_output = results.front().value();
 
   CHECK(forward_output.has_value()) << "Failed to execute model";
-  return forward_output.value();
+
+  // D2H transfer for beam_sequence_group (multi-round results)
+  auto& output = forward_output.value();
+  output.beam_sequence_group = safe_to(output.beam_sequence_group, torch::kCPU);
+  if (output.beam_search_output.out_logprobs.defined()) {
+    output.beam_search_output.out_logprobs =
+        safe_to(output.beam_search_output.out_logprobs, torch::kCPU);
+  }
+
+  return output;
 }
 
 std::vector<int64_t>
