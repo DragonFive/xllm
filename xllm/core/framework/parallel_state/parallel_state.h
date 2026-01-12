@@ -20,6 +20,11 @@ limitations under the License.
 
 namespace xllm {
 
+// Forward declaration
+namespace runtime {
+struct Options;
+}
+
 namespace parallel_state {
 
 std::optional<ParallelArgs> get_dp_attn_parallel_args(
@@ -52,8 +57,10 @@ std::vector<std::unique_ptr<ProcessGroup>> create_npu_process_groups(
 
 // Create process groups for local (single-node) scenarios
 // Supports GPU (CUDA/MLU) and NPU, including single-device case
+// Parse port from options.master_node_addr() to support multiple instances
 std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
-    const std::vector<torch::Device>& devices);
+    const std::vector<torch::Device>& devices,
+    const runtime::Options& options);
 
 }  // namespace parallel_state
 }  // namespace xllm

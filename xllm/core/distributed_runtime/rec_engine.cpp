@@ -724,7 +724,7 @@ bool RecEngine::PureDeviceEnginePipeline::init_model_workers(
 
   // Always create process_groups (supports both single and multi-device)
   engine_.process_groups_ =
-      parallel_state::create_local_process_groups(devices);
+      parallel_state::create_local_process_groups(devices, engine_.options_);
 
   engine_.workers_.clear();
   WorkerType worker_type = WorkerType::REC;
