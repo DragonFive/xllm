@@ -110,6 +110,11 @@ void cache_select(const torch::Tensor& beam_index,
                   int64_t beam_size,
                   int64_t layer_num);
 
+void lse_combine(torch::Tensor output,
+                 torch::Tensor shared_o,
+                 torch::Tensor shared_lse,
+                 torch::Tensor unshared_o,
+                 torch::Tensor unshared_lse);
 void prefill_reshape_and_cache(
     torch::Tensor proj_k,  // [shared_len, kv_heads, head_dim]
     torch::Tensor proj_v,  // [shared_len, kv_heads, head_dim]
