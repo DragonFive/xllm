@@ -69,8 +69,10 @@ void beam_search(torch::Tensor acc_logprob,
     auto ordered_indices = new_indices.argsort(static_cast<int64_t>(1), false);
     // Reorder new_probs (and corresponding new_indices) by ordered_indices to
     // keep alignment.
-    new_probs = new_probs.gather(1, ordered_indices);
-    new_indices = new_indices.gather(1, ordered_indices);
+    if (current_step < total_rounds - 1) {
+      new_probs = new_probs.gather(1, ordered_indices);
+      new_indices = new_indices.gather(1, ordered_indices);
+    }
     auto parent_beam =
         (new_indices / top_k).to(torch::kLong);  // [batch_size, beam_size]
     auto token_in_beam =
