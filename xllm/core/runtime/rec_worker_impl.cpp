@@ -452,6 +452,8 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
   auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
   auto fp32_options =
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
+  auto paged_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(device);
 
   torch::Tensor sequence_group =
       torch::zeros({batch_size, beam_width, total_rounds}, int_options);
@@ -463,7 +465,26 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
   torch::Tensor out_token_index = torch::zeros({num_seq, 1}, int_options);
   torch::Tensor out_beam_count_prefix_sums =
       torch::zeros({num_seq, 1}, int_options);
-  auto out_seqgroup = sequence_group.clone();
+  torch::Tensor out_seqgroup = torch::zeros_like(sequence_group);
+
+  // Pre-create fixed tensors outside loop for reuse
+  torch::Tensor batch_ids = torch::arange(0, batch_size, paged_options)
+                                .unsqueeze(1)
+                                .unsqueeze(2)
+                                .expand({-1, beam_width, max_decode_step}) *
+                            (beam_width * max_decode_step);
+
+  torch::Tensor beams_ids = torch::arange(0, beam_width, paged_options)
+                                .unsqueeze(0)
+                                .unsqueeze(2)
+                                .expand({batch_size, -1, max_decode_step}) *
+                            max_decode_step;
+
+  torch::Tensor max_decode_step_ids =
+      torch::arange(0, max_decode_step, paged_options)
+          .unsqueeze(0)
+          .unsqueeze(1)
+          .expand({batch_size, beam_width, -1});
 
   ForwardOutput output;
 
@@ -497,6 +518,7 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
 
     if (sampling_params.selected_token_idxes.defined()) {
       auto sample_output = worker_.sampler_->forward(logits, sampling_params);
+      // Convert once, reused in update_input_for_next_round
       torch::Tensor top_tokens =
           sample_output.top_tokens.to(torch::kInt32).reshape({-1, beam_width});
       torch::Tensor top_logprobs =
@@ -527,17 +549,22 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
                                       round);
 
 #endif
-      sequence_group.copy_(out_seqgroup);
-      acc_logprob.copy_(out_log_probs);
+      sequence_group.copy_(out_seqgroup, /*non_blocking=*/false);
+      acc_logprob.copy_(out_log_probs, /*non_blocking=*/false);
 
       if (round < total_rounds - 1) {
         update_input_for_next_round(input,
                                     round,
                                     sample_output,
+                                    top_tokens,
                                     out_token_ids,
                                     batch_size,
                                     beam_width,
-                                    max_decode_step);
+                                    max_decode_step,
+                                    paged_options,
+                                    batch_ids,
+                                    beams_ids,
+                                    max_decode_step_ids);
         if (round > 0) {
 #if defined(USE_NPU)
           xllm_ops::cache_select(out_token_index,
@@ -549,14 +576,15 @@ RecWorkerImpl::LlmRecPureDevicePipeline::step_multi_round(ForwardInput& input) {
                                  beam_width,
                                  layer_num);
 #elif defined(USE_CUDA)
-          xllm::kernel::cuda::cache_select(out_token_index,
-                                           input.input_params.unshared_k_caches,
-                                           input.input_params.unshared_v_caches,
-                                           input.input_params.naive_block_table,
-                                           out_beam_count_prefix_sums,
-                                           round - 1,  // 对应第0步decode
-                                           beam_width,
-                                           layer_num);
+          xllm::kernel::cuda::cache_select(
+              out_token_index,
+              input.input_params.unshared_k_caches,
+              input.input_params.unshared_v_caches,
+              input.input_params.naive_block_table,
+              out_beam_count_prefix_sums,
+              round - 1,  // Corresponds to step 0 decode
+              beam_width,
+              layer_num);
 #endif
         }
       }
@@ -586,14 +614,19 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
     ForwardInput& input,
     int32_t current_step,
     const SampleOutput& sample_output,
+    const torch::Tensor& top_tokens,
     const torch::Tensor& out_token_ids,
     int32_t batch_size,
     int32_t beam_size,
-    int32_t max_decode_step) {
+    int32_t max_decode_step,
+    const torch::TensorOptions& paged_options,
+    const torch::Tensor& batch_ids,
+    const torch::Tensor& beams_ids,
+    const torch::Tensor& max_decode_step_ids) {
   if (current_step == 0) {
-    input.token_ids = sample_output.top_tokens.to(torch::kInt32).reshape({-1});
+    input.token_ids = top_tokens.reshape({-1});
   } else {
-    input.token_ids = out_token_ids.clone().reshape({-1});
+    input.token_ids = out_token_ids.reshape({-1});
   }
 
   // update next current_step positions.
@@ -608,74 +641,54 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
 
   input.input_params.batch_forward_type = BatchForwardType(2);
 
-  // uint32_t shared_kv_len = FLAGS_max_token_per_req;
-
   auto kv_cu_seq_lens = input.input_params.kv_seq_lens;
   auto max_val = kv_cu_seq_lens.max();
   int32_t shared_kv_len = max_val.item().toInt();
   auto batch_shared_kv_lens = torch::diff(kv_cu_seq_lens);
-  auto paged_options =
-      torch::TensorOptions().dtype(torch::kInt32).device(worker_.device_);
+
+  auto shared_kv_len_offsets = torch::arange(0, shared_kv_len, paged_options)
+                                   .unsqueeze(0)
+                                   .expand({batch_size, shared_kv_len});
 
   auto beam_shared_kv_expanded =
       batch_shared_kv_lens.unsqueeze(1).expand({-1, shared_kv_len});
-  auto shared_kv_len_offsets = torch::arange(0, shared_kv_len, paged_options);
-  shared_kv_len_offsets =
-      shared_kv_len_offsets.unsqueeze(0).expand({batch_size, -1});
-  auto shared_mask = shared_kv_len_offsets < beam_shared_kv_expanded;
-  shared_mask = shared_mask.unsqueeze(1).expand({-1, beam_size, -1});
 
+  auto shared_mask = (shared_kv_len_offsets < beam_shared_kv_expanded)
+                         .unsqueeze(1)
+                         .expand({-1, beam_size, -1});
+
+  auto kv_cu_seq_lens_prefix = kv_cu_seq_lens.slice(0, 0, -1);
   auto shared_batch_offsets =
-      torch::zeros({batch_size, shared_kv_len}, paged_options);
-  shared_batch_offsets =
-      shared_batch_offsets +
-      kv_cu_seq_lens.slice(0, 0, -1).unsqueeze(1).expand({-1, shared_kv_len});
+      kv_cu_seq_lens_prefix.unsqueeze(1).expand({-1, shared_kv_len});
 
-  auto shared_kv_indices = shared_batch_offsets + shared_kv_len_offsets;
-  shared_kv_indices =
-      shared_kv_indices.unsqueeze(1).expand({-1, beam_size, -1});
+  auto shared_kv_indices = (shared_batch_offsets + shared_kv_len_offsets)
+                               .unsqueeze(1)
+                               .expand({-1, beam_size, -1});
 
   uint32_t unshared_begin_index = shared_kv_len * batch_size;
-  auto batch_ids = torch::arange(0, batch_size, paged_options);
-  batch_ids = batch_ids.unsqueeze(1)
-                  .expand({-1, beam_size})
-                  .unsqueeze(2)
-                  .expand({-1, -1, max_decode_step});
-  batch_ids = batch_ids * beam_size * max_decode_step;
-  auto beams_ids = torch::arange(0, beam_size, paged_options);
-  beams_ids = beams_ids.unsqueeze(0)
-                  .expand({batch_size, -1})
-                  .unsqueeze(2)
-                  .expand({-1, -1, max_decode_step});
-  beams_ids = beams_ids * max_decode_step;
-  auto max_decode_step_ids = torch::arange(0, max_decode_step, paged_options);
-  max_decode_step_ids = max_decode_step_ids.unsqueeze(0)
-                            .expand({batch_size, -1})
-                            .unsqueeze(1)
-                            .expand({-1, beam_size, -1});
   auto unshared_kv_offsets = batch_ids + beams_ids + max_decode_step_ids;
   auto unshared_kv_indices = unshared_kv_offsets + unshared_begin_index;
   auto unshared_mask = max_decode_step_ids <= current_step;
+
   auto full_mask = torch::cat({shared_mask, unshared_mask}, 2);
-  torch::Tensor full_kv_indices =
+  auto full_kv_indices =
       torch::cat({shared_kv_indices, unshared_kv_indices}, 2);
-  full_kv_indices = full_kv_indices.masked_select(full_mask);
-  auto paged_kv_indices = full_kv_indices;
-  auto batch_beam_shared_kv_lens =
-      batch_shared_kv_lens.unsqueeze(1).expand({-1, beam_size});
+
   uint32_t unshared_kv_len = current_step + 1;
-  batch_beam_shared_kv_lens = batch_beam_shared_kv_lens + unshared_kv_len;
-  auto flattened = batch_beam_shared_kv_lens.flatten();
-  auto cumsum_result = torch::cumsum(flattened, 0);
+  auto batch_beam_shared_kv_lens =
+      (batch_shared_kv_lens.unsqueeze(1).expand({-1, beam_size}) +
+       unshared_kv_len)
+          .flatten();
+
+  auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
   auto paged_kv_indptr = torch::cat(
       {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)}, 0);
 
-  auto paged_kv_last_page_len =
-      torch::ones({batch_size * beam_size}, paged_options);
-
-  input.input_params.paged_kv_indices = paged_kv_indices;
+  input.input_params.paged_kv_indices =
+      full_kv_indices.masked_select(full_mask);
   input.input_params.paged_kv_indptr = paged_kv_indptr;
-  input.input_params.paged_kv_last_page_len = paged_kv_last_page_len;
+  input.input_params.paged_kv_last_page_len =
+      torch::ones({batch_size * beam_size}, paged_options);
 }
 
 RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,

@@ -133,10 +133,15 @@ class RecWorkerImpl : public LLMWorkerImpl {
     void update_input_for_next_round(ForwardInput& input,
                                      int32_t current_step,
                                      const SampleOutput& sample_output,
+                                     const torch::Tensor& top_tokens,
                                      const torch::Tensor& out_token_ids,
                                      int32_t batch_size,
                                      int32_t beam_size,
-                                     int32_t max_decode_step);
+                                     int32_t max_decode_step,
+                                     const torch::TensorOptions& paged_options,
+                                     const torch::Tensor& batch_ids,
+                                     const torch::Tensor& beams_ids,
+                                     const torch::Tensor& max_decode_step_ids);
 
     RecWorkerImpl& worker_;
   };
