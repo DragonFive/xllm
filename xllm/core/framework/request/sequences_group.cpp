@@ -18,6 +18,7 @@ limitations under the License.
 #include <unordered_set>
 
 #include "common/global_flags.h"
+#include "core/common/rec_model_utils.h"
 #include "framework/batch/beam_search.h"
 #include "util/blocking_counter.h"
 #include "util/slice.h"
@@ -94,7 +95,7 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
                                       const Tokenizer& tokenizer,
                                       ThreadPool* thread_pool) {
   // Check for multi-round beam search results
-  if (FLAGS_max_decode_rounds > 0) {
+  if (is_pure_device_mode()) {
     if (check_beam_search() && sequences_.size() == 1) {
       auto* base = sequences_[0].get();
       if (base->has_beam_result()) {
@@ -188,7 +189,7 @@ void SequencesGroup::process_beam_search() {
   }
 
   // Handle multi-round beam search result
-  if (FLAGS_max_decode_rounds > 0) {
+  if (is_pure_device_mode()) {
     if (sequences_.size() == 1) {
       auto* base = sequences_[0].get();
       if (base->has_beam_result()) {

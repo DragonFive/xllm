@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/common/rec_model_utils.h"
 #include "framework/batch/mposition.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -64,7 +65,7 @@ MultiStepBatchInputBuilder::MultiStepBatchInputBuilder(
     use_mrope_ = (args_->rope_scaling_rope_type() == "mrope");
   }
   // Initialize MultiStep specific state
-  multi_step_state_.total_steps = FLAGS_max_decode_rounds;
+  multi_step_state_.total_steps = get_pure_device_decode_rounds();
   // multi_step_state_.step_tokens_vec.reserve(1000);
   // multi_step_state_.step_positions_vec.reserve(1000);
   // TODO: Add multi-step specific initialization
@@ -113,14 +114,14 @@ void MultiStepBatchInputBuilder::process_single_sequence(
 #if defined(USE_NPU)
   base_state.seq_lens.push_back(seq_len);
   base_state.q_seq_lens.push_back(q_seq_len);
-  if (FLAGS_max_decode_rounds > 0) {
+  if (is_pure_device_mode()) {
     state.decode_seq_lens.push_back(decode_seq_len);
     state.decode_q_seq_lens.push_back(decode_q_seq_len);
   }
 #elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU)
   base_state.seq_lens.push_back(base_state.seq_lens.back() + seq_len);
   base_state.q_seq_lens.push_back(base_state.q_seq_lens.back() + q_seq_len);
-  if (FLAGS_max_decode_rounds > 0) {
+  if (is_pure_device_mode()) {
     state.decode_seq_lens.push_back(decode_seq_len);
     state.decode_q_seq_lens.push_back(decode_q_seq_len);
   }
@@ -165,7 +166,7 @@ void MultiStepBatchInputBuilder::process_single_sequence(
 RawForwardInput MultiStepBatchInputBuilder::build_raw_forward_input() {
   // Reset multi-step state for this build
   // multi_step_state_ = MultiStepBuilderState{};
-  multi_step_state_.total_steps = FLAGS_max_decode_rounds;
+  multi_step_state_.total_steps = get_pure_device_decode_rounds();
 
   is_mtp_decode_ = false;
   // LOG(INFO) << "sequences_.size(): " << sequences_.size();
@@ -180,7 +181,7 @@ RawForwardInput MultiStepBatchInputBuilder::build_raw_forward_input() {
 
 ForwardInput MultiStepBatchInputBuilder::build_forward_input() {
   // Reset multi-step state for this build
-  multi_step_state_.total_steps = FLAGS_max_decode_rounds;
+  multi_step_state_.total_steps = get_pure_device_decode_rounds();
 
   is_mtp_decode_ = false;
   // Single-threaded processing for now; can be extended to use thread_pool_
@@ -324,6 +325,18 @@ void MultiStepBatchInputBuilder::setup_kv_cache_info(
 #elif defined(USE_CUDA)
   MultiStepBuilderState& state = multi_step_state_;
   BuilderState& base_state = state.base_state;
+
+  // Pure Device mode uses full KV cache managed by Worker layer,
+  // not paged KV cache. Skip paged KV cache allocation but still
+  // fill paged_kv_last_page_len for batch_size calculation.
+  if (is_pure_device_mode()) {
+    // Fill paged_kv_last_page_len for batch_size calculation in Worker
+    // (rec_worker_impl.cpp uses paged_kv_last_page_len.numel() as batch_size)
+    base_state.paged_kv_last_page_len.push_back(seq_len);
+    // Add empty block_tables_vec entry for consistency
+    base_state.block_tables_vec.emplace_back(std::vector<int32_t>{});
+    return;
+  }
 
   std::unordered_set<int32_t>& write_block_ids =
       write_block_ids_ptr ? *write_block_ids_ptr : write_block_ids_;
@@ -472,7 +485,7 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
 
   // Multi-step specific metadata
   auto& multi_step_state = multi_step_state_;
-  multi_step_state.total_steps = FLAGS_max_decode_rounds;
+  multi_step_state.total_steps = get_pure_device_decode_rounds();
   forward_input.beam_width = FLAGS_beam_width;
   forward_input.total_round = multi_step_state.total_steps;
 
@@ -501,9 +514,10 @@ ForwardInput MultiStepBatchInputBuilder::state_to_forward_input() {
         args_ ? args_->n_kv_heads().value_or(args_->n_heads()) : 0;
     int64_t head_dim = args_ ? args_->head_dim() : 0;
 
+    int32_t decode_rounds = get_pure_device_decode_rounds();
     forward_input.full_kv_shape = {
         batch_size * FLAGS_max_token_per_req +
-            batch_size * FLAGS_beam_width * (FLAGS_max_decode_rounds - 1),
+            batch_size * FLAGS_beam_width * std::max(0, decode_rounds - 1),
         n_kv_heads,
         head_dim};
   }
@@ -637,7 +651,7 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
 
   // Add multi-step specific data using existing RawForwardInput fields
   auto& multi_step_state = multi_step_state_;
-  multi_step_state.total_steps = FLAGS_max_decode_rounds;
+  multi_step_state.total_steps = get_pure_device_decode_rounds();
 
   // Set step-level decode metadata for multi-step processing
   raw_forward_input.beam_width = FLAGS_beam_width;
@@ -657,9 +671,10 @@ RawForwardInput MultiStepBatchInputBuilder::state_to_raw_forward_input(
     // LOG(INFO) << "FLAGS_max_token_per_req:" << FLAGS_max_token_per_req;
     // LOG(INFO) << "FLAGS_beam_width:" << FLAGS_beam_width;
     // LOG(INFO) << "FLAGS_max_decode_rounds:" << FLAGS_max_decode_rounds;
+    int32_t decode_rounds = get_pure_device_decode_rounds();
     raw_forward_input.full_kv_shape = {
         batch_size * FLAGS_max_token_per_req +
-            batch_size * FLAGS_beam_width * (FLAGS_max_decode_rounds - 1),
+            batch_size * FLAGS_beam_width * std::max(0, decode_rounds - 1),
         n_kv_heads,
         head_dim};
   }

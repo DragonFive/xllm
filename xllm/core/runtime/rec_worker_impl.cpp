@@ -313,7 +313,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_work_before_execute(
 
 #if defined(USE_NPU) || defined(USE_CUDA)
   // step-level decode full cache: allocate/attach by step_uid metadata
-  if (FLAGS_max_decode_rounds > 0) {
+  if (is_pure_device_mode()) {
     auto& mip = processed_inputs.input_params;
     int32_t batch_size =
         processed_inputs.input_params.paged_kv_last_page_len.numel();

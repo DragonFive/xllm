@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <tuple>
 
+#include "core/common/rec_model_utils.h"
+
 namespace {
 inline bool is_qwen3_model(const std::string& model_type) {
   static const std::set<std::string> qwen3_type_set = {
@@ -102,7 +104,7 @@ Qwen2AttentionImpl::Qwen2AttentionImpl(const ModelContext& context) {
                                        options));
 
   // 5. Attention
-  if (FLAGS_max_decode_rounds > 0) {
+  if (is_pure_device_mode()) {
     attn_ = register_module("xattention",
                             XAttention(num_heads_,
                                        head_dim_,

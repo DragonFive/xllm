@@ -24,6 +24,7 @@ limitations under the License.
 #include "batch_input_builder.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/common/rec_model_utils.h"
 #include "framework/batch/mposition.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
@@ -398,7 +399,7 @@ void Batch::process_beam_sequence_group(const RawForwardOutput& raw_output) {
     LOG(ERROR) << "beam_sequence_group is empty";
     return;
   }
-  int32_t total_rounds = FLAGS_max_decode_rounds;
+  int32_t total_rounds = get_pure_device_decode_rounds();
   size_t num_groups = sequence_groups_.size();
   for (size_t g = 0; g < num_groups; ++g) {
     std::vector<std::vector<int32_t>> group_flat2d;
@@ -439,7 +440,7 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
   if (beam_width <= 1) {
     return;
   }
-  int32_t total_rounds = FLAGS_max_decode_rounds;
+  int32_t total_rounds = get_pure_device_decode_rounds();
   size_t num_groups = sequence_groups_.size();
   if (num_groups == 0) {
     // Fallback: treat sequences_ as single group

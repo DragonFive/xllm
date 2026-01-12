@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include "core/common/rec_model_utils.h"
 #include "core/layers/qwen3_decoder_layer.h"
 #include "llm_model_base.h"
 
@@ -126,7 +127,7 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
 
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
-      if (FLAGS_max_decode_rounds) {
+      if (is_pure_device_mode()) {
         attn_metadata.full_k_cache = input_params_new.full_k_caches[i];
         attn_metadata.full_v_cache = input_params_new.full_v_caches[i];
         attn_metadata.unshared_k_cache = input_params_new.unshared_k_caches[i];
