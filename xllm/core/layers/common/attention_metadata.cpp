@@ -76,6 +76,7 @@ AttentionMetadata AttentionMetadata::build(
     attn_metadata.paged_kv_indptr = params.paged_kv_indptr;
     attn_metadata.paged_kv_last_page_len = params.paged_kv_last_page_len;
     attn_metadata.naive_block_table = params.naive_block_table;
+    attn_metadata.kv_seq_lens = torch::diff(params.paged_kv_indptr);
   }
 
   return attn_metadata;

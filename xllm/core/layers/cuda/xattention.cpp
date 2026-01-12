@@ -123,7 +123,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
 
     // maybe we need to update shared attn state before execute attention,
     // currently we update flashinfer step_wise_attn_state_ at layer 0.
-    std::string backend = "fa3";
+    std::string backend = "fa2";
     flashinfer::update_plan_info(attn_metadata.plan_info,
                                  backend,
                                  attn_metadata,
@@ -138,7 +138,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
                                  /*window_size_left*/ sliding_window_,
                                  /*enable_cuda_graph*/ false,
                                  /*causal*/ false,
-                                 /*use_tensor_core*/ false);
+                                 /*use_tensor_core*/ true);
 
     xllm::kernel::AttentionParams attention_params;
     auto unshared_lse = std::nullopt;
@@ -173,7 +173,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
         attn_metadata.paged_kv_last_page_len;
     attention_params.uri = attn_metadata.plan_info->uri;
     attention_params.plan_info = attn_metadata.plan_info->plan_info;
-    attention_params.use_tensor_core = false;
+    attention_params.use_tensor_core = true;
     xllm::kernel::batch_decode(attention_params);
   }
   output = output.view({-1, num_heads_ * head_size_});
