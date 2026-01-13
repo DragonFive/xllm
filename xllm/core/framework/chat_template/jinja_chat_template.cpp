@@ -34,6 +34,10 @@ const std::unordered_map<std::string, std::string> type_to_modality = {
 }
 
 JinjaChatTemplate::JinjaChatTemplate(const TokenizerArgs& args) : args_(args) {
+  LOG(INFO) << "JinjaChatTemplate init with chat_template: "
+            << args_.chat_template();
+  LOG(INFO) << "JinjaChatTemplate init with bos_token: " << args_.bos_token();
+  LOG(INFO) << "JinjaChatTemplate init with eos_token: " << args_.eos_token();
   try {
     template_ = std::make_unique<minja::chat_template>(
         args_.chat_template(), args_.bos_token(), args_.eos_token());
