@@ -131,14 +131,33 @@ std::optional<std::string> JinjaChatTemplate::apply(
     nlohmann::ordered_json& messages,
     const nlohmann::ordered_json& tools,
     const nlohmann::ordered_json& chat_template_kwargs) const {
-  minja::chat_template_inputs input;
-  input.messages = messages;
-  input.tools = tools;
-  input.add_generation_prompt = true;
-  input.extra_context = chat_template_kwargs;
-  minja::chat_template_options options;
+  LOG(INFO) << "JinjaChatTemplate::apply called with messages: "
+            << messages.dump(2);
+  LOG(INFO) << "tools: " << tools.dump(2);
+  LOG(INFO) << "chat_template_kwargs: " << chat_template_kwargs.dump(2);
 
-  return template_->apply(input, options);
+  try {
+    minja::chat_template_inputs input;
+    input.messages = messages;
+    input.tools = tools;
+    input.add_generation_prompt = true;
+    input.extra_context = chat_template_kwargs;
+    minja::chat_template_options options;
+
+    auto result = template_->apply(input, options);
+    LOG(INFO) << "JinjaChatTemplate::apply result length: " << result.size();
+    if (result.empty()) {
+      LOG(ERROR) << "JinjaChatTemplate::apply returned empty string, "
+                 << "this usually indicates a chat_template rendering issue";
+      return std::nullopt;
+    }
+    return result;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed to apply chat template: " << e.what()
+               << "\nmessages: " << messages.dump(2)
+               << "\ntools: " << tools.dump(2);
+    return std::nullopt;
+  }
 }
 
 nlohmann::ordered_json JinjaChatTemplate::get_mm_content(

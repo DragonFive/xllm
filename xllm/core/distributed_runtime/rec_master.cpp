@@ -529,10 +529,19 @@ void RecMaster::handle_request(std::vector<Message> messages,
 
   Timer timer;
   std::optional<std::string> prompt;
+  LOG(INFO) << "RecMaster::handle_chat_request: has_tools=" << sp.has_tools()
+            << ", messages size=" << messages.size();
   if (sp.has_tools()) {
     prompt = chat_template_->apply(messages, sp.tools, sp.chat_template_kwargs);
   } else {
     prompt = chat_template_->apply(messages, sp.chat_template_kwargs);
+  }
+
+  LOG(INFO) << "RecMaster::handle_chat_request: prompt.has_value()="
+            << prompt.has_value();
+  if (prompt.has_value()) {
+    LOG(INFO) << "RecMaster::handle_chat_request: prompt length="
+              << prompt.value().size();
   }
 
   if (!prompt.has_value()) {
