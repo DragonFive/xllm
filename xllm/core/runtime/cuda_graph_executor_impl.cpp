@@ -343,42 +343,89 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           << "total_beam must be divisible by request_batch_size";
       const int64_t beam_width = total_beam / request_batch_size;
 
-      // Pre-allocate two-stage decode cache (stable pointers for CUDA graph).
-      layer::TwoStageDecodeCache cache;
-      auto fp32_options =
-          torch::TensorOptions().dtype(torch::kFloat32).device(tokens.device());
-      auto model_options = torch::TensorOptions().dtype(dtype).device(device_);
+      // CRITICAL FIX: Use persistent cache to survive capture() scope.
+      // Previously, cache was a local variable that got destroyed after
+      // capture(), causing use-after-free during replay().
+      //
+      // Check if we need to (re-)allocate the persistent cache:
+      // - First capture: cache doesn't exist
+      // - Shape change: batch_size/beam_size/heads/head_size changed
+      bool need_alloc =
+          !persistent_two_stage_decode_cache_.has_value() ||
+          persistent_two_stage_decode_cache_->cached_batch_size !=
+              static_cast<int32_t>(request_batch_size) ||
+          persistent_two_stage_decode_cache_->cached_beam_size !=
+              static_cast<int32_t>(beam_width) ||
+          persistent_two_stage_decode_cache_->cached_num_heads !=
+              static_cast<int32_t>(n_heads) ||
+          persistent_two_stage_decode_cache_->cached_head_size != head_dim;
 
-      cache.shared_lse = torch::zeros({total_beam, n_heads, 1}, fp32_options);
-      cache.shared_o =
-          torch::zeros({total_beam, n_heads, head_dim}, model_options);
-      cache.unshared_lse = torch::zeros({total_beam, n_heads, 1}, fp32_options);
-      cache.unshared_o =
-          torch::zeros({total_beam, n_heads, head_dim}, model_options);
+      if (need_alloc) {
+        LOG(INFO) << "Allocating persistent_two_stage_decode_cache_: "
+                  << "batch_size=" << request_batch_size
+                  << ", beam_width=" << beam_width << ", n_heads=" << n_heads
+                  << ", head_dim=" << head_dim;
 
-      cache.q_cu_seq_lens_shared = torch::arange(
-          0,
-          (request_batch_size + 1) * beam_width,
-          beam_width,
-          torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
+        layer::TwoStageDecodeCache cache;
+        auto fp32_options = torch::TensorOptions()
+                                .dtype(torch::kFloat32)
+                                .device(tokens.device());
+        auto model_options =
+            torch::TensorOptions().dtype(dtype).device(device_);
 
-      cache.paged_kv_indptr_expanded = torch::arange(
-          total_beam + 1,
-          torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
-      cache.paged_kv_indices_expanded = torch::arange(
-          total_beam,
-          torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
-      cache.paged_kv_last_page_len_expanded = torch::full(
-          {total_beam},
-          static_cast<int32_t>(params.current_round + 1),
-          torch::TensorOptions().dtype(torch::kInt32).device(tokens.device()));
+        cache.shared_lse = torch::zeros({total_beam, n_heads, 1}, fp32_options);
+        cache.shared_o =
+            torch::zeros({total_beam, n_heads, head_dim}, model_options);
+        cache.unshared_lse =
+            torch::zeros({total_beam, n_heads, 1}, fp32_options);
+        cache.unshared_o =
+            torch::zeros({total_beam, n_heads, head_dim}, model_options);
 
-      cache.cached_batch_size = static_cast<int32_t>(request_batch_size);
-      cache.cached_beam_size = static_cast<int32_t>(beam_width);
-      cache.cached_num_heads = static_cast<int32_t>(n_heads);
-      cache.cached_head_size = head_dim;
+        cache.q_cu_seq_lens_shared =
+            torch::arange(0,
+                          (request_batch_size + 1) * beam_width,
+                          beam_width,
+                          torch::TensorOptions()
+                              .dtype(torch::kInt32)
+                              .device(tokens.device()));
 
-      attn_metadata->two_stage_decode_cache = cache;
+        cache.paged_kv_indptr_expanded =
+            torch::arange(total_beam + 1,
+                          torch::TensorOptions()
+                              .dtype(torch::kInt32)
+                              .device(tokens.device()));
+        cache.paged_kv_indices_expanded =
+            torch::arange(total_beam,
+                          torch::TensorOptions()
+                              .dtype(torch::kInt32)
+                              .device(tokens.device()));
+        cache.paged_kv_last_page_len_expanded =
+            torch::full({total_beam},
+                        static_cast<int32_t>(params.current_round + 1),
+                        torch::TensorOptions()
+                            .dtype(torch::kInt32)
+                            .device(tokens.device()));
+
+        cache.cached_batch_size = static_cast<int32_t>(request_batch_size);
+        cache.cached_beam_size = static_cast<int32_t>(beam_width);
+        cache.cached_num_heads = static_cast<int32_t>(n_heads);
+        cache.cached_head_size = head_dim;
+
+        // Store in persistent member - this survives capture() scope!
+        persistent_two_stage_decode_cache_ = cache;
+      } else {
+        // Reuse existing cache, only update dynamic values
+        // paged_kv_last_page_len_expanded depends on current_round
+        persistent_two_stage_decode_cache_->paged_kv_last_page_len_expanded
+            .fill_(static_cast<int32_t>(params.current_round + 1));
+      }
+
+      // Use the persistent cache
+      attn_metadata->two_stage_decode_cache =
+          persistent_two_stage_decode_cache_;
+
+      // Reference the persistent cache for plan_info setup
+      auto& cache = persistent_two_stage_decode_cache_.value();
 
       // 1) shared stage (prefill, causal) plan
       layer::AttentionMetadata shared_attn_meta = *attn_metadata;

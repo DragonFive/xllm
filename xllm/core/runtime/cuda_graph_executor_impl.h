@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
+#include "core/layers/common/attention_metadata.h"
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
@@ -153,6 +154,16 @@ class CudaGraphPersistentParam {
     return persistent_decode_qo_indptr_;
   }
 
+  // Getter/setter for persistent two-stage decode cache
+  std::optional<layer::TwoStageDecodeCache>&
+  persistent_two_stage_decode_cache() {
+    return persistent_two_stage_decode_cache_;
+  }
+  const std::optional<layer::TwoStageDecodeCache>&
+  persistent_two_stage_decode_cache() const {
+    return persistent_two_stage_decode_cache_;
+  }
+
  private:
   const ModelArgs& args_;
   const torch::Device& device_;
@@ -176,6 +187,13 @@ class CudaGraphPersistentParam {
 
   // TODO maybe not used. or use q_cu_seq_lens instead.
   torch::Tensor persistent_chunked_prefill_qo_indptr_;
+
+  // CRITICAL FIX: Persistent two-stage decode cache for CUDA graph.
+  // This cache MUST survive capture() scope to prevent use-after-free during
+  // replay. During capture, xattention kernels record pointers to tensors in
+  // this cache. If the cache is destroyed after capture(), replay() will access
+  // freed memory, causing GPU hang.
+  std::optional<layer::TwoStageDecodeCache> persistent_two_stage_decode_cache_;
 };
 
 // CUDA graph executor using libtorch CUDAGraph for memory management
