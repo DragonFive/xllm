@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <numeric>
+#include <thread>
 
 #include "core/common/global_flags.h"
 #include "core/common/metrics.h"
@@ -141,6 +142,84 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   const int64_t request_batch_size =
       params.kv_seq_lens.defined() ? (params.kv_seq_lens.numel() - 1) : 0;
 
+  // Runtime assertion: Validate critical parameters
+  if (return_capture_params) {
+    CHECK_GT(actual_num_tokens, 0) << "actual_num_tokens must be > 0";
+    CHECK_GT(actual_batch_size, 0) << "actual_batch_size must be > 0";
+    CHECK(params.paged_kv_indptr.defined())
+        << "paged_kv_indptr must be defined";
+    CHECK(params.paged_kv_indices.defined())
+        << "paged_kv_indices must be defined";
+    CHECK(params.paged_kv_last_page_len.defined())
+        << "paged_kv_last_page_len must be defined";
+  }
+
+  // Check if buffer resize is needed for two-stage decode (beam-expanded batch
+  // size) In two-stage decode, actual_batch_size = request_batch_size *
+  // beam_width, which can be much larger than the initial buffer size (based on
+  // max_seqs_per_batch)
+  const bool needs_buffer_resize =
+      (actual_batch_size >
+       static_cast<int64_t>(options_.max_seqs_per_batch())) &&
+      (params.current_round >= 0) && !params.full_k_caches.empty() &&
+      !params.unshared_k_caches.empty() &&
+      FLAGS_enable_xattention_two_stage_decode;
+
+  if (needs_buffer_resize) {
+    // Protect buffer resize operations with mutex to prevent concurrent access
+    // Multiple requests may share this persistent_param_ and concurrently call
+    // update()
+    std::lock_guard<std::mutex> lock(buffer_resize_mutex_);
+
+    // Double-check after acquiring lock (another thread may have already
+    // resized)
+    const int64_t required_indptr_size = actual_batch_size + 1;
+    VLOG(50) << "[DEBUG] Two-stage decode requires buffer resize: "
+             << "actual_batch_size=" << actual_batch_size
+             << ", request_batch_size=" << request_batch_size
+             << ", required_indptr_size=" << required_indptr_size
+             << ", current_indptr_size=" << persistent_paged_kv_indptr_.size(0)
+             << ", thread_id=" << std::this_thread::get_id();
+
+    if (persistent_paged_kv_indptr_.size(0) < required_indptr_size) {
+      VLOG(50) << "[DEBUG] [RESIZE] Resizing persistent_paged_kv_indptr_ from "
+               << persistent_paged_kv_indptr_.size(0) << " to "
+               << required_indptr_size
+               << ", old_data_ptr=" << persistent_paged_kv_indptr_.data_ptr()
+               << ", thread_id=" << std::this_thread::get_id();
+      persistent_paged_kv_indptr_ = torch::zeros(
+          {required_indptr_size}, torch::dtype(torch::kInt).device(device_));
+      VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
+               << persistent_paged_kv_indptr_.data_ptr();
+    }
+
+    if (persistent_paged_kv_last_page_len_.size(0) < actual_batch_size) {
+      VLOG(50) << "[DEBUG] [RESIZE] Resizing "
+                  "persistent_paged_kv_last_page_len_ from "
+               << persistent_paged_kv_last_page_len_.size(0) << " to "
+               << actual_batch_size << ", old_data_ptr="
+               << persistent_paged_kv_last_page_len_.data_ptr()
+               << ", thread_id=" << std::this_thread::get_id();
+      persistent_paged_kv_last_page_len_ = torch::zeros(
+          {actual_batch_size}, torch::dtype(torch::kInt).device(device_));
+      VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
+               << persistent_paged_kv_last_page_len_.data_ptr();
+    }
+
+    const int64_t required_indices_size = params.paged_kv_indices.size(0);
+    if (persistent_paged_kv_indices_.size(0) < required_indices_size) {
+      VLOG(50) << "[DEBUG] [RESIZE] Resizing persistent_paged_kv_indices_ from "
+               << persistent_paged_kv_indices_.size(0) << " to "
+               << required_indices_size
+               << ", old_data_ptr=" << persistent_paged_kv_indices_.data_ptr()
+               << ", thread_id=" << std::this_thread::get_id();
+      persistent_paged_kv_indices_ = torch::zeros(
+          {required_indices_size}, torch::dtype(torch::kInt).device(device_));
+      VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
+               << persistent_paged_kv_indices_.data_ptr();
+    }
+  }
+
   // Copy data from input parameters to persistent graph tensors
   VLOG(kGraphExecutorLogVerboseLevel)
       << "copy_ tokens: src shape=" << tokens.sizes() << ", dst slice shape=["
@@ -241,9 +320,17 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   // FlashInfer decode parameters update (if present)
   CHECK(params.paged_kv_indptr.defined())
       << "paged_kv_indptr should not be null";
+  const int64_t required_indptr_size = actual_batch_size + 1;
+  CHECK_GE(persistent_paged_kv_indptr_.size(0), required_indptr_size)
+      << "persistent_paged_kv_indptr_ buffer too small: "
+      << "buffer_size=" << persistent_paged_kv_indptr_.size(0)
+      << ", required=" << required_indptr_size
+      << ", actual_batch_size=" << actual_batch_size
+      << ". This may happen with large beam_width in two-stage decode. "
+      << "Ensure buffer resize logic in enable_two_stage branch is working.";
   VLOG(kGraphExecutorLogVerboseLevel)
       << "copy_ paged_kv_indptr: src shape=" << params.paged_kv_indptr.sizes()
-      << ", dst slice shape=[" << (actual_batch_size + 1) << "]";
+      << ", dst slice shape=[" << required_indptr_size << "]";
   if (VLOG_IS_ON(kGraphExecutorLogVerboseLevel)) {
     torch::Tensor paged_kv_indptr_cpu = params.paged_kv_indptr.to(torch::kCPU);
     VLOG(kGraphExecutorLogVerboseLevel)
@@ -252,12 +339,18 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   persistent_paged_kv_indptr_
       .slice(/*dim=*/0,
              /*start=*/0,
-             /*end=*/actual_batch_size + 1)
+             /*end=*/required_indptr_size)
       .copy_(params.paged_kv_indptr, /*non_blocking=*/true);
 
   CHECK(params.paged_kv_indices.defined())
       << "paged_kv_indices should not be null";
   const int64_t actual_indices_size = params.paged_kv_indices.size(0);
+  CHECK_GE(persistent_paged_kv_indices_.size(0), actual_indices_size)
+      << "persistent_paged_kv_indices_ buffer too small: "
+      << "buffer_size=" << persistent_paged_kv_indices_.size(0)
+      << ", required=" << actual_indices_size
+      << ". This may happen with large beam_width in two-stage decode. "
+      << "Ensure buffer resize logic in enable_two_stage branch is working.";
   VLOG(kGraphExecutorLogVerboseLevel)
       << "copy_ paged_kv_indices: src shape=" << params.paged_kv_indices.sizes()
       << ", dst slice shape=[" << actual_indices_size << "]";
@@ -268,6 +361,12 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
       .copy_(params.paged_kv_indices, /*non_blocking=*/true);
   CHECK(params.paged_kv_last_page_len.defined())
       << "paged_kv_last_page_len should not be null";
+  CHECK_GE(persistent_paged_kv_last_page_len_.size(0), actual_batch_size)
+      << "persistent_paged_kv_last_page_len_ buffer too small: "
+      << "buffer_size=" << persistent_paged_kv_last_page_len_.size(0)
+      << ", required=" << actual_batch_size
+      << ". This may happen with large beam_width in two-stage decode. "
+      << "Ensure buffer resize logic in enable_two_stage branch is working.";
   VLOG(kGraphExecutorLogVerboseLevel)
       << "copy_ paged_kv_last_page_len: src shape="
       << params.paged_kv_last_page_len.sizes() << ", dst slice shape=["
@@ -358,11 +457,46 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
 
     if (enable_two_stage) {
       const int64_t total_beam = static_cast<int64_t>(actual_num_tokens);
+
+      // Buffer resize has already been done earlier if needed (before copy
+      // operations)
+      VLOG(50) << "[DEBUG] Two-stage decode enabled: total_beam=" << total_beam
+               << ", request_batch_size=" << request_batch_size
+               << ", actual_num_tokens=" << actual_num_tokens
+               << ", padded_num_tokens=" << padded_num_tokens;
+
+      // Diagnostic: Check unshared_k_caches status
+      VLOG(50) << "[DEBUG] unshared_k_caches.empty()="
+               << params.unshared_k_caches.empty()
+               << ", unshared_k_caches.size()="
+               << params.unshared_k_caches.size();
+      if (!params.unshared_k_caches.empty()) {
+        VLOG(50) << "[DEBUG] unshared_k_caches[0].sizes()="
+                 << params.unshared_k_caches[0].sizes()
+                 << ", unshared_k_caches[0].defined()="
+                 << params.unshared_k_caches[0].defined();
+      }
+
       CHECK_GT(request_batch_size, 0)
           << "request_batch_size must be > 0 for two-stage xattention";
       CHECK_EQ(total_beam % request_batch_size, 0)
           << "total_beam must be divisible by request_batch_size";
       const int64_t beam_width = total_beam / request_batch_size;
+      VLOG(50) << "[DEBUG] Calculated beam_width=" << beam_width;
+
+      // Runtime assertion: Validate unshared_k_caches before using
+      CHECK(!params.unshared_k_caches.empty())
+          << "unshared_k_caches must not be empty for two-stage decode";
+      CHECK(!params.unshared_v_caches.empty())
+          << "unshared_v_caches must not be empty for two-stage decode";
+      CHECK_EQ(params.unshared_k_caches.size(), params.unshared_v_caches.size())
+          << "unshared_k_caches and unshared_v_caches must have same size";
+      if (!params.unshared_k_caches.empty()) {
+        CHECK_GE(params.unshared_k_caches[0].size(2), 1)
+            << "unshared_k_caches[0].size(2) must be >= 1, got: "
+            << params.unshared_k_caches[0].size(2)
+            << ", tensor sizes: " << params.unshared_k_caches[0].sizes();
+      }
 
       // CRITICAL FIX: Use persistent cache to survive capture() scope.
       // Previously, cache was a local variable that got destroyed after
@@ -471,6 +605,11 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           /*enable_cuda_graph*/ true,
           /*causal*/ true,
           /*use_tensor_core*/ true);
+      // Root cause fix: Synchronize after update_plan_info to ensure all
+      // GPU->CPU transfers (e.g., .to(torch::kCPU) inside update_plan_info) are
+      // complete. update_plan_info() internally performs async GPU->CPU
+      // transfers which need to complete before CUDA graph capture.
+      torch::cuda::synchronize();
 
       // 2) unshared stage (decode, non-tensor-core) plan
       layer::AttentionMetadata unshared_attn_meta = *attn_metadata;
@@ -481,14 +620,38 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           cache.paged_kv_last_page_len_expanded;
       unshared_attn_meta.use_tensor_core = false;
 
+      // Diagnostic: Calculate max_decode_step with detailed logging
+      //   VLOG(50) << "[DEBUG] Calculating max_decode_step for unshared stage";
       const int64_t max_decode_step =
           params.unshared_k_caches.empty()
               ? 0
               : static_cast<int64_t>(params.unshared_k_caches[0].size(2));
+      //   VLOG(50) << "[DEBUG] max_decode_step=" << max_decode_step
+      // << " (from unshared_k_caches[0].size(2))";
+      if (params.unshared_k_caches.empty()) {
+        LOG(ERROR) << "[DEBUG] unshared_k_caches is empty! Cannot determine "
+                      "max_decode_step.";
+      } else if (params.unshared_k_caches[0].size(2) == 0) {
+        LOG(ERROR)
+            << "[DEBUG] unshared_k_caches[0].size(2) == 0! Invalid shape: "
+            << params.unshared_k_caches[0].sizes();
+      }
       CHECK_GT(max_decode_step, 0)
-          << "max_decode_step must be > 0 for two-stage unshared plan";
+          << "max_decode_step must be > 0 for two-stage unshared plan. "
+          << "unshared_k_caches.empty()=" << params.unshared_k_caches.empty()
+          << ", unshared_k_caches.size()=" << params.unshared_k_caches.size()
+          << (params.unshared_k_caches.empty()
+                  ? ""
+                  : (", unshared_k_caches[0].sizes()=" +
+                     std::to_string(params.unshared_k_caches[0].size(0)) + "," +
+                     std::to_string(params.unshared_k_caches[0].size(1)) + "," +
+                     std::to_string(params.unshared_k_caches[0].size(2))));
 
       attn_metadata->unshared_plan_info->layer_id = 0;
+      //   VLOG(50) << "[DEBUG] Updating unshared_plan_info: layer_id=0, "
+      //             << "max_decode_step=" << max_decode_step
+      //             << ", batch_size=" <<
+      //             unshared_attn_meta.paged_kv_last_page_len.size(0);
       layer::flashinfer::update_plan_info(attn_metadata->unshared_plan_info,
                                           /*backend*/ "fa3",
                                           unshared_attn_meta,
@@ -504,6 +667,15 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
                                           /*enable_cuda_graph*/ true,
                                           /*causal*/ false,
                                           /*use_tensor_core*/ false);
+      // Root cause fix: Synchronize after update_plan_info to ensure all
+      // GPU->CPU transfers (e.g., .to(torch::kCPU) inside update_plan_info) are
+      // complete before CUDA graph capture. This ensures tensor metadata is
+      // fully accessible.
+      torch::cuda::synchronize();
+      //   VLOG(50) << "[DEBUG] unshared_plan_info updated:
+      //   plan_info.defined()="
+      //             <<
+      //             (attn_metadata->unshared_plan_info->plan_info.defined());
     } else {
       // Default decode plan
       const bool pure_device =
@@ -597,6 +769,35 @@ bool CudaGraph::capture(CausalLM* model,
   CHECK(graph_params_opt.has_value())
       << "update() should return ModelInputParams when "
          "return_capture_params=true";
+
+  // Diagnostic: Verify plan_info initialization before capture
+  //   const auto& capture_params = graph_params_opt.value();
+  //   if (capture_params.attn_metadata) {
+  //     VLOG(50) << "[DEBUG] Before capture: plan_info.defined()="
+  //               << (capture_params.attn_metadata->plan_info &&
+  //                   capture_params.attn_metadata->plan_info->plan_info.defined())
+  //               << ", unshared_plan_info.defined()="
+  //               << (capture_params.attn_metadata->unshared_plan_info &&
+  //                   capture_params.attn_metadata->unshared_plan_info->plan_info.defined())
+  //               << ", two_stage_decode_cache.has_value()="
+  //               <<
+  //               capture_params.attn_metadata->two_stage_decode_cache.has_value();
+
+  //     if (capture_params.attn_metadata->plan_info) {
+  //       VLOG(50) << "[DEBUG] plan_info->layer_id="
+  //                 << capture_params.attn_metadata->plan_info->layer_id
+  //                 << ", plan_info->uri="
+  //                 << capture_params.attn_metadata->plan_info->uri;
+  //     }
+  //     if (capture_params.attn_metadata->unshared_plan_info) {
+  //       VLOG(50) << "[DEBUG] unshared_plan_info->layer_id="
+  //                 <<
+  //                 capture_params.attn_metadata->unshared_plan_info->layer_id
+  //                 << ", unshared_plan_info->uri="
+  //                 << capture_params.attn_metadata->unshared_plan_info->uri;
+  //     }
+  //   }
+
   // Synchronize to ensure all data is copied to graph persistent buffers
   torch::cuda::synchronize();
 
@@ -691,6 +892,11 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
   // Update persistent parameters with new input data
   const torch::Tensor& k_cache = kv_cache[0].get_k_cache();
   const torch::Tensor& v_cache = kv_cache[0].get_v_cache();
+
+  VLOG(50) << "[DEBUG] Before update in replay: thread_id="
+           << std::this_thread::get_id()
+           << ", actual_num_tokens=" << actual_num_tokens;
+
   persistent_param_.update(tokens,
                            k_cache,
                            v_cache,
@@ -698,6 +904,12 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
                            params,
                            padded_num_tokens_,
                            /*return_capture_params=*/false);
+
+  // Synchronize before replay to ensure all updates are complete
+  torch::cuda::synchronize();
+
+  VLOG(50) << "[DEBUG] Before graph replay: thread_id="
+           << std::this_thread::get_id();
 
   // Replay captured graph
   // NOTE: Some CUDA graph runtimes replay on the capture stream. Make sure the
@@ -735,6 +947,8 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
   }
 
   VLOG(1) << "CUDA graph replay end, actual_num_tokens: " << actual_num_tokens;
+  VLOG(50) << "[DEBUG] After graph replay: thread_id="
+           << std::this_thread::get_id();
 
   // Return only the actual num_tokens portion of hidden states
   return get_hidden_states(actual_num_tokens);

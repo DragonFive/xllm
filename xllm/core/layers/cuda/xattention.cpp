@@ -132,7 +132,18 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
       if (attn_metadata.enable_cuda_graph) {
         CHECK(attn_metadata.two_stage_decode_cache.has_value())
             << "two_stage_decode_cache must be pre-initialized before CUDA "
-               "graph capture/replay.";
+               "graph capture/replay. enable_cuda_graph="
+            << attn_metadata.enable_cuda_graph << ", batch_size=" << batch_size
+            << ", beam_size=" << beam_size;
+
+        // Additional validation for CUDA graph mode
+        const auto& cache = attn_metadata.two_stage_decode_cache.value();
+        CHECK_EQ(cache.cached_batch_size, static_cast<int32_t>(batch_size))
+            << "Cached batch_size mismatch: cached=" << cache.cached_batch_size
+            << ", actual=" << batch_size;
+        CHECK_EQ(cache.cached_beam_size, static_cast<int32_t>(beam_size))
+            << "Cached beam_size mismatch: cached=" << cache.cached_beam_size
+            << ", actual=" << beam_size;
       }
       // 判断是否在第一层
       bool is_layer_0 = (attn_metadata.plan_info->layer_id == 0);
@@ -224,10 +235,13 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
       shared_attn_meta.q_cu_seq_lens = cache.q_cu_seq_lens_shared;
 
       if (attn_metadata.enable_cuda_graph) {
+        CHECK(attn_metadata.plan_info)
+            << "plan_info is null when enable_cuda_graph=true";
         CHECK(attn_metadata.plan_info->plan_info.defined())
-            << "shared stage plan_info should not be null when "
-               "enable_cuda_graph "
-               "is true";
+            << "shared stage plan_info->plan_info should not be null when "
+               "enable_cuda_graph is true. plan_info->layer_id="
+            << attn_metadata.plan_info->layer_id
+            << ", plan_info->uri=" << attn_metadata.plan_info->uri;
       } else {
         flashinfer::update_plan_info(
             attn_metadata.plan_info,
@@ -278,6 +292,19 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
       // Step 5: Update plan info for unshared stage (decode mode)
       // Use independent unshared_plan_info to avoid overwriting shared stage
       // plan_info
+
+      // Runtime assertion: Validate unshared cache tensors
+      CHECK(attn_metadata.unshared_k_cache.defined())
+          << "unshared_k_cache must be defined for two-stage decode";
+      CHECK(attn_metadata.unshared_v_cache.defined())
+          << "unshared_v_cache must be defined for two-stage decode";
+      CHECK_GE(attn_metadata.unshared_k_cache.size(2), 1)
+          << "unshared_k_cache.size(2) must be >= 1, got: "
+          << attn_metadata.unshared_k_cache.size(2)
+          << ", tensor sizes: " << attn_metadata.unshared_k_cache.sizes();
+      CHECK(attn_metadata.unshared_plan_info)
+          << "unshared_plan_info must not be null for two-stage decode";
+
       int64_t actual_head_dim_qk = query.size(-1);
       int64_t actual_head_dim_vo = attn_metadata.unshared_v_cache.size(-1);
       AttentionMetadata unshared_attn_meta = attn_metadata;
@@ -288,10 +315,16 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
           cache.paged_kv_last_page_len_expanded;
       unshared_attn_meta.use_tensor_core = false;
       if (attn_metadata.enable_cuda_graph) {
+        CHECK(attn_metadata.unshared_plan_info)
+            << "unshared_plan_info is null when enable_cuda_graph=true";
         CHECK(attn_metadata.unshared_plan_info->plan_info.defined())
-            << "unshared stage plan_info should not be null when "
-               "enable_cuda_graph "
-               "is true";
+            << "unshared stage plan_info->plan_info should not be null when "
+               "enable_cuda_graph is true. unshared_plan_info->layer_id="
+            << attn_metadata.unshared_plan_info->layer_id
+            << ", unshared_plan_info->uri="
+            << attn_metadata.unshared_plan_info->uri
+            << ", unshared_k_cache.size(2)="
+            << attn_metadata.unshared_k_cache.size(2);
       } else {
         flashinfer::update_plan_info(
             attn_metadata.unshared_plan_info,

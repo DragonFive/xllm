@@ -98,6 +98,7 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
   } else {
     // 2. decode plan info
     if (use_tensor_core) {
+      VLOG(50) << "decode plan info:";
       plan_info->uri = kernel::cuda::get_batch_prefill_uri(
           /*backend=*/"fa2",
           query_dtype,
@@ -161,6 +162,7 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
                     head_dim_vo,  // head_dim_vo
                     /*causal=*/false);
     } else {
+      VLOG(50) << "decode plan info:";
       plan_info->uri = kernel::cuda::get_batch_decode_uri(
           query_dtype,
           key_dtype,

@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <thread>
 
 #include "common/instance_name.h"
 #include "completion.pb.h"
@@ -127,6 +128,13 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
                                 int64_t created_time,
                                 const std::string& model,
                                 const RequestOutput& req_output) {
+  VLOG(50) << "[DEBUG] send_result_to_client_brpc called: "
+           << "request_id=" << request_id
+           << ", finished=" << req_output.finished
+           << ", cancelled=" << req_output.cancelled
+           << ", outputs.size()=" << req_output.outputs.size()
+           << ", thread_id=" << std::this_thread::get_id();
+
   auto& response = call->response();
   response.set_object("text_completion");
   response.set_id(request_id);
@@ -154,7 +162,16 @@ bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
     proto_usage->set_total_tokens(static_cast<int32_t>(usage.num_total_tokens));
   }
 
-  return call->write_and_finish(response);
+  VLOG(50) << "[DEBUG] Before write_and_finish: "
+           << "request_id=" << request_id
+           << ", response.choices_size()=" << response.choices_size();
+
+  bool result = call->write_and_finish(response);
+
+  VLOG(50) << "[DEBUG] After write_and_finish: "
+           << "request_id=" << request_id << ", result=" << result;
+
+  return result;
 }
 
 }  // namespace
@@ -219,6 +236,13 @@ void CompletionServiceImpl::process_async_impl(
        request_id = std::move(saved_request_id),
        created_time = absl::ToUnixSeconds(absl::Now())](
           const RequestOutput& req_output) -> bool {
+        VLOG(50) << "[DEBUG] handle_request callback invoked: "
+                 << "request_id=" << request_id
+                 << ", finished=" << req_output.finished
+                 << ", cancelled=" << req_output.cancelled
+                 << ", outputs.size()=" << req_output.outputs.size()
+                 << ", thread_id=" << std::this_thread::get_id();
+
         if (req_output.status.has_value()) {
           const auto& status = req_output.status.value();
           if (!status.ok()) {
@@ -234,12 +258,19 @@ void CompletionServiceImpl::process_async_impl(
         // or canceled.
         if (req_output.finished || req_output.cancelled) {
           master->get_rate_limiter()->decrease_one_request();
+          VLOG(50) << "[DEBUG] Request finished or cancelled, "
+                   << "calling send_result_to_client_brpc: "
+                   << "request_id=" << request_id << ", stream=" << stream;
         }
 
         if (stream) {
+          VLOG(50) << "[DEBUG] Using stream response, calling "
+                      "send_delta_to_client_brpc";
           return send_delta_to_client_brpc(
               call, include_usage, request_id, created_time, model, req_output);
         }
+        VLOG(50) << "[DEBUG] Using non-stream response, calling "
+                    "send_result_to_client_brpc";
         return send_result_to_client_brpc(
             call, request_id, created_time, model, req_output);
       });

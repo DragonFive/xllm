@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "core/common/macros.h"
@@ -168,6 +169,11 @@ class CudaGraphPersistentParam {
   const ModelArgs& args_;
   const torch::Device& device_;
   const runtime::Options& options_;
+
+  // Mutex to protect buffer resize operations from concurrent access
+  // Multiple CudaGraph instances may share this persistent_param_ and
+  // concurrently call update(), which may trigger buffer resizing
+  mutable std::mutex buffer_resize_mutex_;
 
   // Persistent tensors - basic parameters
   torch::Tensor persistent_tokens_;
