@@ -270,6 +270,14 @@ class CudaGraph {
   // replay. Without this, plan_info and unshared_plan_info are destroyed after
   // capture(), causing replay to access freed memory.
   std::shared_ptr<layer::AttentionMetadata> captured_attn_metadata_;
+
+  // CRITICAL FIX (Layer 5): Store unshared_k_caches and unshared_v_caches to
+  // keep them alive during replay. The CUDA graph captures kernel calls that
+  // reference these tensors' GPU addresses. Without storing them here, the
+  // tensors are destroyed when the first request completes, and replay accesses
+  // freed memory causing GPU hang.
+  std::vector<torch::Tensor> captured_unshared_k_caches_;
+  std::vector<torch::Tensor> captured_unshared_v_caches_;
 };
 
 // Executor implementation using CUDA graph optimization

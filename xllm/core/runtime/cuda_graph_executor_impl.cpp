@@ -882,6 +882,16 @@ bool CudaGraph::capture(CausalLM* model,
   // out of scope, causing replay to access freed memory (GPU hang).
   captured_attn_metadata_ = graph_params_opt.value().attn_metadata;
 
+  // CRITICAL FIX (Layer 5): Store unshared_k_caches and unshared_v_caches to
+  // keep them alive during replay. The CUDA graph captures kernel calls in
+  // xattention.forward() that reference these tensors' GPU addresses via:
+  //   attn_metadata.unshared_k_cache = params.unshared_k_caches[layer_id_]
+  // Without storing them, the tensors are destroyed when mutable_input goes
+  // out of scope after the first request, causing replay to access freed
+  // memory.
+  captured_unshared_k_caches_ = graph_params_opt.value().unshared_k_caches;
+  captured_unshared_v_caches_ = graph_params_opt.value().unshared_v_caches;
+
   return true;
 }
 
