@@ -874,10 +874,16 @@ bool CudaGraph::capture(CausalLM* model,
   torch::cuda::synchronize();
 
   graph_.replay();
-
   LOG(INFO) << "CUDA graph capture end, bucket_num_tokens: "
             << bucket_num_tokens;
+
+  // CRITICAL FIX: Store attn_metadata to keep plan_info and unshared_plan_info
+  // tensors alive. Without this, they are destroyed when graph_params_opt goes
+  // out of scope, causing replay to access freed memory (GPU hang).
+  captured_attn_metadata_ = graph_params_opt.value().attn_metadata;
+
   return true;
+}
 }
 
 torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
@@ -912,6 +918,26 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
 
   // Synchronize before replay to ensure all updates are complete
   torch::cuda::synchronize();
+
+  // CRITICAL FIX (Layer 4): Update captured_attn_metadata_'s tensors for
+  // replay. The graph was captured with captured_attn_metadata_'s tensors.
+  // During replay, persistent_param_.update() may update a DIFFERENT tensor (if
+  // cache was reallocated) or may skip the update (if
+  // enable_two_stage_for_update is false due to empty caches in params). We
+  // must directly update the captured tensors to ensure the graph reads correct
+  // data.
+  if (captured_attn_metadata_ &&
+      captured_attn_metadata_->two_stage_decode_cache.has_value()) {
+    const int32_t round_value = static_cast<int32_t>(params.current_round + 1);
+    captured_attn_metadata_->two_stage_decode_cache
+        ->paged_kv_last_page_len_expanded.fill_(round_value);
+    VLOG(1) << "[CudaGraph::replay] Updated captured "
+            << "paged_kv_last_page_len_expanded to " << round_value
+            << " for current_round=" << params.current_round;
+    // Sync to ensure fill_() completes before graph replay.
+    // fill_() is async on default stream, but graph replays on capture stream.
+    torch::cuda::synchronize();
+  }
 
   VLOG(50) << "[DEBUG] Before graph replay: thread_id="
            << std::this_thread::get_id();

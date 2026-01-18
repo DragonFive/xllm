@@ -265,6 +265,11 @@ class CudaGraph {
   // already non-default when capturing.
   std::optional<c10::cuda::CUDAStream> graph_stream_;
   c10::DeviceIndex device_index_;
+
+  // CRITICAL FIX: Store attn_metadata to keep plan_info tensors alive during
+  // replay. Without this, plan_info and unshared_plan_info are destroyed after
+  // capture(), causing replay to access freed memory.
+  std::shared_ptr<layer::AttentionMetadata> captured_attn_metadata_;
 };
 
 // Executor implementation using CUDA graph optimization
