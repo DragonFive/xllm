@@ -548,16 +548,7 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
         // TODO(maxiaolong): Replace with fine-grained stream dependency
         // (event-based) instead of global synchronization for better
         // performance.
-#ifdef USE_CUDA
-        // DIAG-6: Log stream info before global synchronize to help debug
-        // deadlock
-        VLOG(1) << "[DIAG-6] Before global synchronize, current_stream="
-                << c10::cuda::getCurrentCUDAStream();
-#endif
         torch::cuda::synchronize();
-#ifdef USE_CUDA
-        VLOG(1) << "[DIAG-6] After global synchronize completed";
-#endif
         VLOG(1) << "[PureDevice] round=" << round
                 << " synchronized CUDA streams before "
                    "update_input_for_next_round";

@@ -206,18 +206,27 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
       VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
                << persistent_paged_kv_last_page_len_.data_ptr();
     }
+  }
 
+  // CRITICAL FIX: paged_kv_indices resize must be independent of batch size
+  // check because the indices buffer size depends on total KV cache pages, not
+  // batch size. In high-concurrency scenarios, indices can exceed buffer even
+  // when batch is small. This fixes the error:
+  // "persistent_paged_kv_indices_ buffer too small: buffer_size=1284,
+  // required=1672"
+  if (params.paged_kv_indices.defined()) {
+    std::lock_guard<std::mutex> lock(buffer_resize_mutex_);
     const int64_t required_indices_size = params.paged_kv_indices.size(0);
     if (persistent_paged_kv_indices_.size(0) < required_indices_size) {
-      VLOG(50) << "[DEBUG] [RESIZE] Resizing persistent_paged_kv_indices_ from "
-               << persistent_paged_kv_indices_.size(0) << " to "
-               << required_indices_size
-               << ", old_data_ptr=" << persistent_paged_kv_indices_.data_ptr()
-               << ", thread_id=" << std::this_thread::get_id();
+      VLOG(1) << "[RESIZE] Resizing persistent_paged_kv_indices_ from "
+              << persistent_paged_kv_indices_.size(0) << " to "
+              << required_indices_size
+              << ", old_data_ptr=" << persistent_paged_kv_indices_.data_ptr()
+              << ", thread_id=" << std::this_thread::get_id();
       persistent_paged_kv_indices_ = torch::zeros(
           {required_indices_size}, torch::dtype(torch::kInt).device(device_));
-      VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
-               << persistent_paged_kv_indices_.data_ptr();
+      VLOG(1) << "[RESIZE] After resize, new_data_ptr="
+              << persistent_paged_kv_indices_.data_ptr();
     }
   }
 
@@ -1014,42 +1023,7 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
     need_restore_stream = true;
   }
 
-  // DIAG-1: Log workspace buffer pointer before replay to detect if it was
-  // overwritten by prefill stage
-  VLOG(1) << "[DIAG-1] Before graph replay: workspace_buffer.data_ptr="
-          << layer::flashinfer::FlashinferWorkspace::get_instance()
-                 .get_float_workspace_buffer()
-                 .data_ptr();
-
-  // DIAG-2: Log plan_info status
-  if (captured_attn_metadata_ && captured_attn_metadata_->plan_info) {
-    VLOG(1)
-        << "[DIAG-2] plan_info.defined="
-        << captured_attn_metadata_->plan_info->plan_info.defined()
-        << ", plan_info.data_ptr="
-        << (captured_attn_metadata_->plan_info->plan_info.defined()
-                ? std::to_string(reinterpret_cast<uintptr_t>(
-                      captured_attn_metadata_->plan_info->plan_info.data_ptr()))
-                : "N/A");
-  }
-
   graph_.replay();
-
-  // DIAG-3: Check for CUDA errors after replay
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    LOG(ERROR) << "[DIAG-3] CUDA error after replay: "
-               << cudaGetErrorString(err);
-  }
-
-  // DIAG-4: Sync replay stream to verify kernel completion
-  VLOG(1) << "[DIAG-4] Attempting stream sync on replay_stream...";
-  cudaError_t syncErr = cudaStreamSynchronize(replay_stream.stream());
-  if (syncErr != cudaSuccess) {
-    LOG(ERROR) << "[DIAG-4] Stream sync error: " << cudaGetErrorString(syncErr);
-  } else {
-    VLOG(1) << "[DIAG-4] Stream sync success on replay_stream";
-  }
 
   if (need_restore_stream) {
     // Bridge stream dependency: caller_stream waits for replay_stream.
