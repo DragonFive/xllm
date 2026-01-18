@@ -892,6 +892,18 @@ bool CudaGraph::capture(CausalLM* model,
   captured_unshared_k_caches_ = graph_params_opt.value().unshared_k_caches;
   captured_unshared_v_caches_ = graph_params_opt.value().unshared_v_caches;
 
+  // CRITICAL FIX (Layer 6): Store full_k_caches and full_v_caches to keep them
+  // alive during replay. Similar to Layer 5, xattention.forward() sets:
+  //   attn_metadata.full_k_cache = params.full_k_caches[layer_id_]
+  // These tensors are used in the shared stage (batch_prefill) of two-stage
+  // decode.
+  captured_full_k_caches_ = graph_params_opt.value().full_k_caches;
+  captured_full_v_caches_ = graph_params_opt.value().full_v_caches;
+
+  LOG(INFO) << "CUDA graph capture stored: "
+            << "unshared_k_caches.size=" << captured_unshared_k_caches_.size()
+            << ", full_k_caches.size=" << captured_full_k_caches_.size();
+
   return true;
 }
 
