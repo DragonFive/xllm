@@ -437,6 +437,23 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   // Update plan_info only before capture. Replay does not invoke model forward,
   // so updating plan_info here has no effect on graph replay.
   if (return_capture_params) {
+    // CRITICAL FIX: Allocate dedicated workspace buffers for CUDA graph mode
+    // to isolate graph plan data from eager mode (prefill) operations.
+    // Without this, prefill's plan() calls will overwrite workspace data
+    // that graph replay kernels depend on, causing kernel hangs.
+    if (!graph_float_workspace_buffer_.defined()) {
+      VLOG(1)
+          << "Allocating dedicated graph workspace buffers for CUDA graph mode";
+      graph_float_workspace_buffer_ =
+          torch::empty({FLAGS_flashinfer_workspace_buffer_size},
+                       torch::dtype(torch::kUInt8).device(device_));
+      graph_int_workspace_buffer_ = torch::empty(
+          {8 * 1024 * 1024}, torch::dtype(torch::kUInt8).device(device_));
+      graph_page_locked_int_workspace_buffer_ = torch::empty(
+          {8 * 1024 * 1024},
+          torch::dtype(torch::kUInt8).device(torch::kCPU).pinned_memory(true));
+    }
+
     // Get attention parameters from ModelArgs
     const int32_t head_dim = args_.head_dim();
     const int64_t n_heads = args_.n_heads();
@@ -585,6 +602,14 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
       attn_metadata->two_stage_decode_cache =
           persistent_two_stage_decode_cache_;
 
+      // CRITICAL FIX: Pass dedicated graph workspace buffers to attn_metadata
+      // for isolation from eager mode (prefill) operations.
+      attn_metadata->graph_float_workspace_buffer =
+          graph_float_workspace_buffer_;
+      attn_metadata->graph_int_workspace_buffer = graph_int_workspace_buffer_;
+      attn_metadata->graph_page_locked_int_workspace_buffer =
+          graph_page_locked_int_workspace_buffer_;
+
       // Reference the persistent cache for plan_info setup
       auto& cache = persistent_two_stage_decode_cache_.value();
 
@@ -610,7 +635,11 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
           sliding_window,
           /*enable_cuda_graph*/ true,
           /*causal*/ true,
-          /*use_tensor_core*/ true);
+          /*use_tensor_core*/ true,
+          // CRITICAL FIX: Pass dedicated graph workspace buffers for isolation
+          graph_float_workspace_buffer_,
+          graph_int_workspace_buffer_,
+          graph_page_locked_int_workspace_buffer_);
       // Root cause fix: Synchronize after update_plan_info to ensure all
       // GPU->CPU transfers (e.g., .to(torch::kCPU) inside update_plan_info) are
       // complete. update_plan_info() internally performs async GPU->CPU
@@ -658,21 +687,26 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
       //             << "max_decode_step=" << max_decode_step
       //             << ", batch_size=" <<
       //             unshared_attn_meta.paged_kv_last_page_len.size(0);
-      layer::flashinfer::update_plan_info(attn_metadata->unshared_plan_info,
-                                          /*backend*/ "fa3",
-                                          unshared_attn_meta,
-                                          dtype,
-                                          dtype,
-                                          dtype,
-                                          head_dim,
-                                          head_dim,
-                                          static_cast<int32_t>(n_heads),
-                                          static_cast<int32_t>(n_kv_heads),
-                                          static_cast<int32_t>(max_decode_step),
-                                          sliding_window,
-                                          /*enable_cuda_graph*/ true,
-                                          /*causal*/ false,
-                                          /*use_tensor_core*/ false);
+      layer::flashinfer::update_plan_info(
+          attn_metadata->unshared_plan_info,
+          /*backend*/ "fa3",
+          unshared_attn_meta,
+          dtype,
+          dtype,
+          dtype,
+          head_dim,
+          head_dim,
+          static_cast<int32_t>(n_heads),
+          static_cast<int32_t>(n_kv_heads),
+          static_cast<int32_t>(max_decode_step),
+          sliding_window,
+          /*enable_cuda_graph*/ true,
+          /*causal*/ false,
+          /*use_tensor_core*/ false,
+          // CRITICAL FIX: Pass dedicated graph workspace buffers
+          graph_float_workspace_buffer_,
+          graph_int_workspace_buffer_,
+          graph_page_locked_int_workspace_buffer_);
       // Root cause fix: Synchronize after update_plan_info to ensure all
       // GPU->CPU transfers (e.g., .to(torch::kCPU) inside update_plan_info) are
       // complete before CUDA graph capture. This ensures tensor metadata is

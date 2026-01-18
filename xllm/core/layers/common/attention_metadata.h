@@ -130,6 +130,14 @@ struct AttentionMetadata {
   // for xattention two-stage decode cache (layer 0 only)
   std::optional<TwoStageDecodeCache> two_stage_decode_cache;
 
+  // CRITICAL FIX: Optional dedicated workspace buffers for CUDA graph mode.
+  // When set, xattention should use these instead of global
+  // FlashinferWorkspace. This prevents prefill operations from overwriting
+  // workspace data that graph replay kernels depend on.
+  std::optional<torch::Tensor> graph_float_workspace_buffer;
+  std::optional<torch::Tensor> graph_int_workspace_buffer;
+  std::optional<torch::Tensor> graph_page_locked_int_workspace_buffer;
+
   // for npu
   torch::Tensor attn_mask;
   torch::Tensor kv_seq_lens_host;

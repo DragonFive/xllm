@@ -24,27 +24,44 @@ limitations under the License.
 #include "kernels/cuda/utils.h"
 namespace xllm::layer::flashinfer {
 
-void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
-                      const std::string& backend,
-                      const AttentionMetadata& attn_meta,
-                      c10::ScalarType query_dtype,
-                      c10::ScalarType key_dtype,
-                      c10::ScalarType output_dtype,
-                      int32_t head_dim_qk,
-                      int32_t head_dim_vo,
-                      int32_t num_qo_heads,
-                      int32_t num_kv_heads,
-                      int32_t block_size,
-                      int32_t window_size_left,
-                      bool enable_cuda_graph,
-                      bool causal,
-                      bool use_tensor_core) {
+void update_plan_info(
+    std::shared_ptr<PlanInfo> plan_info,
+    const std::string& backend,
+    const AttentionMetadata& attn_meta,
+    c10::ScalarType query_dtype,
+    c10::ScalarType key_dtype,
+    c10::ScalarType output_dtype,
+    int32_t head_dim_qk,
+    int32_t head_dim_vo,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t block_size,
+    int32_t window_size_left,
+    bool enable_cuda_graph,
+    bool causal,
+    bool use_tensor_core,
+    std::optional<torch::Tensor> float_workspace_buffer,
+    std::optional<torch::Tensor> int_workspace_buffer,
+    std::optional<torch::Tensor> page_locked_int_workspace_buffer) {
   CHECK(plan_info->layer_id != -1) << "Need to set layer_id to PlanInfo.";
   if (plan_info->layer_id != 0) return;
 
   VLOG(kGraphExecutorLogVerboseLevel)
       << "update_plan_info: layer_id=" << plan_info->layer_id
       << ", enable_cuda_graph=" << enable_cuda_graph;
+
+  // CRITICAL FIX: Get workspace buffers - use provided ones for CUDA graph
+  // isolation, or fall back to global FlashinferWorkspace for eager mode.
+  // This separation prevents prefill operations from overwriting workspace
+  // data that graph replay kernels depend on.
+  torch::Tensor float_ws = float_workspace_buffer.value_or(
+      FlashinferWorkspace::get_instance().get_float_workspace_buffer());
+  torch::Tensor int_ws = int_workspace_buffer.value_or(
+      FlashinferWorkspace::get_instance().get_int_workspace_buffer());
+  torch::Tensor page_locked_int_ws = page_locked_int_workspace_buffer.value_or(
+      FlashinferWorkspace::get_instance()
+          .get_page_locked_int_workspace_buffer());
+
   // 1. prefill plan info
   if (causal) {
     plan_info->uri = kernel::cuda::get_batch_prefill_uri(
@@ -68,23 +85,21 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
     const int64_t total_num_rows = qo_indptr_host[-1].item<int64_t>();
     const int64_t batch_size = qo_indptr_host.size(0) - 1;
     auto call_plan_func = [&](auto&& func) {
-      return func.call(
-          FlashinferWorkspace::get_instance().get_float_workspace_buffer(),
-          FlashinferWorkspace::get_instance().get_int_workspace_buffer(),
-          FlashinferWorkspace::get_instance()
-              .get_page_locked_int_workspace_buffer(),
-          qo_indptr_host,
-          kv_cu_seq_lens_host,
-          kv_len_arr_host,
-          total_num_rows,
-          batch_size,
-          num_qo_heads,
-          num_kv_heads,
-          /*page_size=*/1,
-          enable_cuda_graph,
-          head_dim_qk,
-          head_dim_vo,
-          causal);
+      return func.call(float_ws,
+                       int_ws,
+                       page_locked_int_ws,
+                       qo_indptr_host,
+                       kv_cu_seq_lens_host,
+                       kv_len_arr_host,
+                       total_num_rows,
+                       batch_size,
+                       num_qo_heads,
+                       num_kv_heads,
+                       /*page_size=*/1,
+                       enable_cuda_graph,
+                       head_dim_qk,
+                       head_dim_vo,
+                       causal);
     };
     if (backend == "fa2") {
       plan_info->plan_info = call_plan_func(
@@ -140,27 +155,23 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
         VLOG(kGraphExecutorLogVerboseLevel) << "query_dtype: " << query_dtype;
         VLOG(kGraphExecutorLogVerboseLevel) << "key_dtype: " << key_dtype;
       }
-      plan_info->plan_info =
-          kernel::cuda::FunctionFactory::get_instance()
-              .fa2_prefill_plan_func(plan_info->uri)
-              .call(FlashinferWorkspace::get_instance()
-                        .get_float_workspace_buffer(),
-                    FlashinferWorkspace::get_instance()
-                        .get_int_workspace_buffer(),
-                    FlashinferWorkspace::get_instance()
-                        .get_page_locked_int_workspace_buffer(),
-                    qo_indptr_host,
-                    paged_kv_indptr_host,
-                    kv_len_arr_host,
-                    batch_size,  // total_num_rows
-                    batch_size,
-                    num_qo_heads,  // num_qo_heads
-                    num_kv_heads,  // num_kv_heads
-                    block_size,    // block_size
-                    enable_cuda_graph,
-                    head_dim_qk,  // head_dim_qk
-                    head_dim_vo,  // head_dim_vo
-                    /*causal=*/false);
+      plan_info->plan_info = kernel::cuda::FunctionFactory::get_instance()
+                                 .fa2_prefill_plan_func(plan_info->uri)
+                                 .call(float_ws,
+                                       int_ws,
+                                       page_locked_int_ws,
+                                       qo_indptr_host,
+                                       paged_kv_indptr_host,
+                                       kv_len_arr_host,
+                                       batch_size,  // total_num_rows
+                                       batch_size,
+                                       num_qo_heads,  // num_qo_heads
+                                       num_kv_heads,  // num_kv_heads
+                                       block_size,    // block_size
+                                       enable_cuda_graph,
+                                       head_dim_qk,  // head_dim_qk
+                                       head_dim_vo,  // head_dim_vo
+                                       /*causal=*/false);
     } else {
       VLOG(50) << "decode plan info:";
       plan_info->uri = kernel::cuda::get_batch_decode_uri(
@@ -180,27 +191,23 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
           torch::empty({0}, torch::TensorOptions().dtype(query_dtype));
       torch::Tensor empty_kv_data =
           torch::empty({0}, torch::TensorOptions().dtype(key_dtype));
-      plan_info->plan_info =
-          kernel::cuda::FunctionFactory::get_instance()
-              .decode_plan_func(plan_info->uri)
-              .call(FlashinferWorkspace::get_instance()
-                        .get_float_workspace_buffer(),
-                    FlashinferWorkspace::get_instance()
-                        .get_int_workspace_buffer(),
-                    FlashinferWorkspace::get_instance()
-                        .get_page_locked_int_workspace_buffer(),
-                    paged_kv_indptr_host,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    block_size,
-                    enable_cuda_graph,
-                    window_size_left,
-                    /*logits_soft_cap=*/0.0,
-                    head_dim_qk,
-                    head_dim_vo,
-                    empty_q_data,
-                    empty_kv_data);
+      plan_info->plan_info = kernel::cuda::FunctionFactory::get_instance()
+                                 .decode_plan_func(plan_info->uri)
+                                 .call(float_ws,
+                                       int_ws,
+                                       page_locked_int_ws,
+                                       paged_kv_indptr_host,
+                                       batch_size,
+                                       num_qo_heads,
+                                       num_kv_heads,
+                                       block_size,
+                                       enable_cuda_graph,
+                                       window_size_left,
+                                       /*logits_soft_cap=*/0.0,
+                                       head_dim_qk,
+                                       head_dim_vo,
+                                       empty_q_data,
+                                       empty_kv_data);
       if (VLOG_IS_ON(kGraphExecutorLogVerboseLevel)) {
         VLOG(kGraphExecutorLogVerboseLevel)
             << "use_tensor_core: " << use_tensor_core;

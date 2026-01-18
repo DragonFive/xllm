@@ -272,15 +272,28 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
       shared_attention_params.output_lse = cache.shared_lse;
       shared_attention_params.window_size_left = sliding_window_;
       shared_attention_params.scale = scale_;
-      shared_attention_params.float_workspace_buffer =
-          ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
-              .get_float_workspace_buffer();
-      shared_attention_params.int_workspace_buffer =
-          ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
-              .get_int_workspace_buffer();
-      shared_attention_params.page_locked_int_workspace_buffer =
-          ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
-              .get_page_locked_int_workspace_buffer();
+      // CRITICAL FIX: Use dedicated graph workspace if available (CUDA graph
+      // mode), otherwise fall back to global workspace (eager mode). This
+      // prevents prefill operations from overwriting workspace data that graph
+      // replay kernels depend on.
+      if (attn_metadata.graph_float_workspace_buffer.has_value()) {
+        shared_attention_params.float_workspace_buffer =
+            attn_metadata.graph_float_workspace_buffer.value();
+        shared_attention_params.int_workspace_buffer =
+            attn_metadata.graph_int_workspace_buffer.value();
+        shared_attention_params.page_locked_int_workspace_buffer =
+            attn_metadata.graph_page_locked_int_workspace_buffer.value();
+      } else {
+        shared_attention_params.float_workspace_buffer =
+            ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
+                .get_float_workspace_buffer();
+        shared_attention_params.int_workspace_buffer =
+            ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
+                .get_int_workspace_buffer();
+        shared_attention_params.page_locked_int_workspace_buffer =
+            ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
+                .get_page_locked_int_workspace_buffer();
+      }
       shared_attention_params.key = shared_k_cache;
       shared_attention_params.value = shared_v_cache;
 
@@ -362,15 +375,28 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> XAttentionImpl::forward(
       unshared_attention_params.output_lse = cache.unshared_lse;
       unshared_attention_params.window_size_left = sliding_window_;
       unshared_attention_params.scale = scale_;
-      unshared_attention_params.float_workspace_buffer =
-          ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
-              .get_float_workspace_buffer();
-      unshared_attention_params.int_workspace_buffer =
-          ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
-              .get_int_workspace_buffer();
-      unshared_attention_params.page_locked_int_workspace_buffer =
-          ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
-              .get_page_locked_int_workspace_buffer();
+      // CRITICAL FIX: Use dedicated graph workspace if available (CUDA graph
+      // mode), otherwise fall back to global workspace (eager mode). This
+      // prevents prefill operations from overwriting workspace data that graph
+      // replay kernels depend on.
+      if (attn_metadata.graph_float_workspace_buffer.has_value()) {
+        unshared_attention_params.float_workspace_buffer =
+            attn_metadata.graph_float_workspace_buffer.value();
+        unshared_attention_params.int_workspace_buffer =
+            attn_metadata.graph_int_workspace_buffer.value();
+        unshared_attention_params.page_locked_int_workspace_buffer =
+            attn_metadata.graph_page_locked_int_workspace_buffer.value();
+      } else {
+        unshared_attention_params.float_workspace_buffer =
+            ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
+                .get_float_workspace_buffer();
+        unshared_attention_params.int_workspace_buffer =
+            ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
+                .get_int_workspace_buffer();
+        unshared_attention_params.page_locked_int_workspace_buffer =
+            ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance()
+                .get_page_locked_int_workspace_buffer();
+      }
       unshared_attention_params.k_cache = unshared_k;
       unshared_attention_params.v_cache = unshared_v;
 

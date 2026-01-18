@@ -15,24 +15,36 @@ limitations under the License.
 
 #pragma once
 
+#include <optional>
+
 #include "layers/common/attention_metadata.h"
 
 namespace xllm::layer::flashinfer {
 
-void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
-                      const std::string& backend,
-                      const AttentionMetadata& attn_meta,
-                      c10::ScalarType query_dtype,
-                      c10::ScalarType key_dtype,
-                      c10::ScalarType output_dtype,
-                      int32_t head_dim_qk,
-                      int32_t head_dim_vo,
-                      int32_t num_qo_heads,
-                      int32_t num_kv_heads,
-                      int32_t block_size,
-                      int32_t window_size_left,
-                      bool enable_cuda_graph,
-                      bool causal,
-                      bool use_tensor_core);
+// Update plan_info for FlashInfer attention computation.
+// Optional workspace buffers can be provided for CUDA graph mode isolation.
+// When workspace buffers are not provided, the global FlashinferWorkspace is
+// used.
+void update_plan_info(
+    std::shared_ptr<PlanInfo> plan_info,
+    const std::string& backend,
+    const AttentionMetadata& attn_meta,
+    c10::ScalarType query_dtype,
+    c10::ScalarType key_dtype,
+    c10::ScalarType output_dtype,
+    int32_t head_dim_qk,
+    int32_t head_dim_vo,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t block_size,
+    int32_t window_size_left,
+    bool enable_cuda_graph,
+    bool causal,
+    bool use_tensor_core,
+    // Optional workspace buffers for CUDA graph mode isolation
+    std::optional<torch::Tensor> float_workspace_buffer = std::nullopt,
+    std::optional<torch::Tensor> int_workspace_buffer = std::nullopt,
+    std::optional<torch::Tensor> page_locked_int_workspace_buffer =
+        std::nullopt);
 
 }  // namespace xllm::layer::flashinfer

@@ -200,6 +200,31 @@ class CudaGraphPersistentParam {
   // this cache. If the cache is destroyed after capture(), replay() will access
   // freed memory, causing GPU hang.
   std::optional<layer::TwoStageDecodeCache> persistent_two_stage_decode_cache_;
+
+  // CRITICAL FIX: Dedicated workspace buffers for CUDA graph mode (isolated
+  // from eager mode). These buffers are used during graph capture and replay
+  // to avoid conflicts with prefill operations that use the global
+  // FlashinferWorkspace. Without this separation, prefill's plan() calls will
+  // overwrite workspace data that graph replay kernels depend on, causing
+  // kernel hangs.
+  torch::Tensor graph_float_workspace_buffer_;
+  torch::Tensor graph_int_workspace_buffer_;
+  torch::Tensor graph_page_locked_int_workspace_buffer_;
+
+ public:
+  // Getters for graph workspace buffers
+  torch::Tensor& graph_float_workspace_buffer() {
+    return graph_float_workspace_buffer_;
+  }
+  torch::Tensor& graph_int_workspace_buffer() {
+    return graph_int_workspace_buffer_;
+  }
+  torch::Tensor& graph_page_locked_int_workspace_buffer() {
+    return graph_page_locked_int_workspace_buffer_;
+  }
+  bool has_graph_workspace_buffers() const {
+    return graph_float_workspace_buffer_.defined();
+  }
 };
 
 // CUDA graph executor using libtorch CUDAGraph for memory management
