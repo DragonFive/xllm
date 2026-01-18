@@ -472,10 +472,17 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                                       : mutable_input.sampling_params;
     mutable_input.input_params.is_prefill = round == 0;
     mutable_input.input_params.current_round = round - 1;
+    VLOG(1) << "[PureDevice] round=" << round << "/" << (total_rounds - 1)
+            << ", is_prefill=" << (round == 0)
+            << ", current_round=" << mutable_input.input_params.current_round
+            << ", token_ids.numel=" << mutable_input.token_ids.numel()
+            << ", kv_max_seq_len=" << mutable_input.input_params.kv_max_seq_len
+            << ", enable_cuda_graph="
+            << mutable_input.input_params.enable_cuda_graph;
 
     // Start async computation for next round input (overlap with GPU
     // logits/sampling)
-    if (round < total_rounds - 1) {
+    if (round < total_rounds - 1 && worker_.enable_schedule_overlap()) {
       next_round_async_result =
           compute_next_round_input_async(mutable_input.input_params.kv_seq_lens,
                                          round,
@@ -487,11 +494,15 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
 
     torch::Tensor hidden_states;
 
+    VLOG(1) << "[PureDevice] round=" << round << " forward begin";
+    Timer forward_timer;
     hidden_states =
         worker_.model_executor_->forward(mutable_input.token_ids,
                                          mutable_input.positions,
                                          worker_.kv_caches_,
                                          mutable_input.input_params);
+    VLOG(1) << "[PureDevice] round=" << round << " forward end, elapsed_ms="
+            << forward_timer.elapsed_milliseconds();
 
     if (!hidden_states.defined()) {
       return std::nullopt;
@@ -517,6 +528,28 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                                      /*non_blocking=*/true);
 
       if (round < total_rounds - 1) {
+        VLOG(1) << "[PureDevice] round=" << round
+                << " update_input_for_next_round begin";
+        // CRITICAL FIX: Synchronize all streams before
+        // update_input_for_next_round to avoid stream dependency deadlock
+        // when using CUDA graph. Different rounds may use different
+        // graph_streams (e.g., stream 9, stream 41), but
+        // update_input_for_next_round executes on default stream (stream 0).
+        // Without synchronization, masked_select in
+        // update_input_for_next_round may race with graph replay on another
+        // stream, causing deadlock. IMPORTANT: Always sync regardless of
+        // enable_cuda_graph flag, because:
+        // 1. Graph replay happens in CudaGraphExecutorImpl, not visible to
+        // ModelInputParams
+        // 2. enable_cuda_graph=0 during capture, but replay still uses
+        // non-default stream
+        // TODO(maxiaolong): Replace with fine-grained stream dependency
+        // (event-based) instead of global synchronization for better
+        // performance.
+        torch::cuda::synchronize();
+        VLOG(1) << "[PureDevice] round=" << round
+                << " synchronized CUDA streams before "
+                   "update_input_for_next_round";
         // Use async results if available, otherwise fallback to sync
         // computation
         if (next_round_async_result.has_value()) {
@@ -538,17 +571,25 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                                       max_decode_step,
                                       paged_options);
         }
-
-        if (round > 0) {
-          execute_cache_select(
-              beam_tensors, mutable_input, round, beam_width, layer_num);
-        }
       }
+      VLOG(1) << "[PureDevice] round=" << round
+              << " update_input_for_next_round end";
 
-      if (round == total_rounds - 1) {
-        build_final_output(
-            logits, sample_output, sampling_params, beam_tensors, output);
+      if (round > 0) {
+        VLOG(1) << "[PureDevice] round=" << round
+                << " cache_select begin (decode_step=" << (round - 1) << ")";
+        Timer cache_select_timer;
+        execute_cache_select(
+            beam_tensors, mutable_input, round, beam_width, layer_num);
+        VLOG(1) << "[PureDevice] round=" << round
+                << " cache_select end, elapsed_ms="
+                << cache_select_timer.elapsed_milliseconds();
       }
+    }
+
+    if (round == total_rounds - 1) {
+      build_final_output(
+          logits, sample_output, sampling_params, beam_tensors, output);
     }
   }
 
@@ -620,7 +661,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::execute_beam_search(
     int32_t round,
     int32_t batch_size) {
 #if defined(USE_NPU)
-// TODO: implement beam search for NPU
+  // TODO: implement beam search for NPU
 #elif defined(USE_CUDA)
   xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
                                   beam_tensors.sequence_group,
@@ -643,7 +684,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::execute_cache_select(
     int32_t beam_width,
     int32_t layer_num) {
 #if defined(USE_NPU)
-// TODO: implement cache select for NPU
+  // TODO: implement cache select for NPU
 #elif defined(USE_CUDA)
   xllm::kernel::cuda::cache_select(beam_tensors.out_token_index,
                                    input.input_params.unshared_k_caches,
@@ -699,7 +740,8 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
   folly::Promise<NextRoundInputResults> promise;
   auto future = promise.getSemiFuture();
 
-  // Launch async computation in thread pool (can overlap with GPU execution)
+  // Launch async computation in thread pool (can overlap with GPU
+  // execution)
   threadpool_.schedule([=, promise = std::move(promise)]() mutable {
     // [batch_size, beam_size, FLAGS_max_token_per_req]
     auto shared_kv_offsets =
@@ -733,7 +775,28 @@ RecWorkerImpl::LlmRecPureDevicePipeline::compute_next_round_input_async(
 
     // [batch_size, beam_size, max_decode_step]
     auto unshared_kv_offsets = unshared_full_kv_offsets.slice(0, 0, batch_size);
-    int32_t unshared_kv_len = beam_size * max_decode_step;
+    int32_t unshared_kv_len = max_decode_step;
+    CHECK_EQ(unshared_kv_offsets.size(1), beam_size)
+        << "unshared_kv_offsets beam dim mismatch: "
+           "unshared_kv_offsets.size(1)="
+        << unshared_kv_offsets.size(1) << ", beam_size=" << beam_size;
+    CHECK_EQ(unshared_kv_offsets.size(2), unshared_kv_len)
+        << "unshared_kv_offsets len dim mismatch: "
+           "unshared_kv_offsets.size(2)="
+        << unshared_kv_offsets.size(2)
+        << ", unshared_kv_len=" << unshared_kv_len;
+    CHECK_LE(static_cast<int64_t>(FLAGS_max_token_per_req + unshared_kv_len),
+             full_kv_indices.size(2))
+        << "full_kv_indices 3rd dim too small for unshared KV slice: "
+        << "FLAGS_max_token_per_req=" << FLAGS_max_token_per_req
+        << ", unshared_kv_len=" << unshared_kv_len
+        << ", full_kv_indices.size(2)=" << full_kv_indices.size(2)
+        << ", beam_size=" << beam_size
+        << ", max_decode_step=" << max_decode_step;
+    VLOG(1) << "[PureDevice] build next-round paged_kv (async): batch_size="
+            << batch_size << ", beam_size=" << beam_size
+            << ", max_decode_step=" << max_decode_step
+            << ", full_kv_indices.size(2)=" << full_kv_indices.size(2);
     auto unshared_kv_indices =
         full_kv_indices
             .slice(2,
@@ -817,6 +880,7 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
     int32_t beam_size,
     int32_t max_decode_step,
     const torch::TensorOptions& paged_options) {
+  Timer kv_build_timer;
   // [FLAGS_max_seqs_per_batch, beam_size, max_decode_step]
   auto full_kv_offsets = worker_.full_kv_cache_offsets_->full_kv_offsets;
   // [FLAGS_max_seqs_per_batch, beam_size, max_decode_step]
@@ -842,6 +906,9 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
       full_kv_mask.slice(2, 0, FLAGS_max_token_per_req).slice(0, 0, batch_size);
 
   shared_mask.copy_(shared_kv_offsets < shared_kv_lens_each_batch_broadcast);
+  VLOG(1) << "[PureDevice] next-round paged_kv: shared_mask ready, "
+          << "shared_mask.shape=" << shared_mask.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
   // [batch_size]
   auto kv_lens_batch_offsets = kv_cu_seq_lens.slice(0, 0, -1);
 
@@ -852,6 +919,9 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
                                .slice(0, 0, batch_size);
 
   shared_kv_indices.copy_(kv_lens_batch_offsets_broadcast + shared_kv_offsets);
+  VLOG(1) << "[PureDevice] next-round paged_kv: shared_kv_indices ready, "
+          << "shared_kv_indices.shape=" << shared_kv_indices.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
   uint32_t unshared_kv_begin_offset =
       FLAGS_max_token_per_req * FLAGS_max_seqs_per_batch;
 
@@ -860,7 +930,26 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
 
   // [batch_size, beam_size, max_decode_step]
   auto unshared_kv_offsets = unshared_full_kv_offsets.slice(0, 0, batch_size);
-  int32_t unshared_kv_len = beam_size * max_decode_step;
+  int32_t unshared_kv_len = max_decode_step;
+  CHECK_EQ(unshared_kv_offsets.size(1), beam_size)
+      << "unshared_kv_offsets beam dim mismatch: "
+         "unshared_kv_offsets.size(1)="
+      << unshared_kv_offsets.size(1) << ", beam_size=" << beam_size;
+  CHECK_EQ(unshared_kv_offsets.size(2), unshared_kv_len)
+      << "unshared_kv_offsets len dim mismatch: "
+         "unshared_kv_offsets.size(2)="
+      << unshared_kv_offsets.size(2) << ", unshared_kv_len=" << unshared_kv_len;
+  CHECK_LE(static_cast<int64_t>(FLAGS_max_token_per_req + unshared_kv_len),
+           full_kv_indices.size(2))
+      << "full_kv_indices 3rd dim too small for unshared KV slice: "
+      << "FLAGS_max_token_per_req=" << FLAGS_max_token_per_req
+      << ", unshared_kv_len=" << unshared_kv_len
+      << ", full_kv_indices.size(2)=" << full_kv_indices.size(2)
+      << ", beam_size=" << beam_size << ", max_decode_step=" << max_decode_step;
+  VLOG(1) << "[PureDevice] build next-round paged_kv (sync): batch_size="
+          << batch_size << ", beam_size=" << beam_size
+          << ", max_decode_step=" << max_decode_step
+          << ", full_kv_indices.size(2)=" << full_kv_indices.size(2);
   auto unshared_kv_indices =
       full_kv_indices
           .slice(2,
@@ -868,6 +957,9 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
                  FLAGS_max_token_per_req + unshared_kv_len)
           .slice(0, 0, batch_size);
   unshared_kv_indices.copy_(unshared_kv_offsets + unshared_kv_begin_offset);
+  VLOG(1) << "[PureDevice] next-round paged_kv: unshared_kv_indices ready, "
+          << "unshared_kv_indices.shape=" << unshared_kv_indices.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
 
   auto unshared_mask = full_kv_mask
                            .slice(2,
@@ -878,6 +970,9 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
       worker_.full_kv_cache_offsets_->max_decode_step_ids.slice(
           0, 0, batch_size);
   unshared_mask.copy_(real_max_decode_step_ids <= current_step);
+  VLOG(1) << "[PureDevice] next-round paged_kv: unshared_mask ready, "
+          << "unshared_mask.shape=" << unshared_mask.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
 
   torch::Tensor paged_kv_indices, paged_kv_indptr, paged_kv_last_page_len;
   unshared_kv_len = current_step + 1;
@@ -887,10 +982,27 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::update_input_for_next_round(
        unshared_kv_len)
           .flatten();
   auto cumsum_result = torch::cumsum(batch_beam_shared_kv_lens, 0);
+  VLOG(1) << "[PureDevice] next-round paged_kv: cumsum done, "
+          << "cumsum_result.shape=" << cumsum_result.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
   paged_kv_indptr = torch::cat(
       {torch::zeros({1}, paged_options), cumsum_result.to(paged_options)}, 0);
-  paged_kv_indices = full_kv_indices.masked_select(full_kv_mask);
+  VLOG(1) << "[PureDevice] next-round paged_kv: indptr ready, "
+          << "paged_kv_indptr.shape=" << paged_kv_indptr.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
+
+  // Only select indices for the active batch range to avoid leaking stale
+  // masks/indices from other batch slots across requests.
+  auto active_full_kv_mask = full_kv_mask.slice(0, 0, batch_size);
+  auto active_full_kv_indices = full_kv_indices.slice(0, 0, batch_size);
+  paged_kv_indices = active_full_kv_indices.masked_select(active_full_kv_mask);
+  VLOG(1) << "[PureDevice] next-round paged_kv: indices ready, "
+          << "paged_kv_indices.shape=" << paged_kv_indices.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
   paged_kv_last_page_len = torch::ones({batch_size * beam_size}, paged_options);
+  VLOG(1) << "[PureDevice] next-round paged_kv: last_page_len ready, "
+          << "paged_kv_last_page_len.shape=" << paged_kv_last_page_len.sizes()
+          << ", elapsed_ms=" << kv_build_timer.elapsed_milliseconds();
 
   input.input_params.paged_kv_indices = paged_kv_indices;
   input.input_params.paged_kv_indptr = paged_kv_indptr;

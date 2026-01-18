@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <c10/core/Device.h>
 #include <c10/core/TensorOptions.h>
+#include <cuda_runtime.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
@@ -539,14 +540,29 @@ bool CudaGraph::capture(CausalLM* model,
   // capture_stream_ is initialized in constructor
   bool need_restore_stream = false;
 
-  // Check if current stream is default stream, if so switch to capture stream
-  if (c10::cuda::getCurrentCUDAStream(device_index_) ==
-      c10::cuda::getDefaultCUDAStream(device_index_)) {
-    c10::cuda::getCurrentCUDAStream(device_index_).synchronize();
+  // CRITICAL FIX: Force all graphs to use the same capture_stream_ to avoid
+  // multi-stream dependency issues. Previously, different rounds
+  // (round=1,2,...) could be captured on different streams (stream 9, stream
+  // 41, etc.), causing stream synchronization deadlock during replay. By always
+  // using capture_stream_, all graphs share the same stream, eliminating the
+  // need for complex inter-stream event dependencies.
+  // TODO(maxiaolong): Consider per-graph-key stream pool if performance
+  // bottleneck.
+  const auto current_stream = c10::cuda::getCurrentCUDAStream(device_index_);
+  if (current_stream != capture_stream_.value()) {
+    current_stream.synchronize();
     c10::cuda::setCurrentCUDAStream(capture_stream_.value());
     capture_stream_.value().synchronize();
     need_restore_stream = true;
   }
+
+  // Record the actual stream used for graph capture. Replay must respect this
+  // stream (or add a stream dependency) to avoid cross-stream races.
+  graph_stream_ = c10::cuda::getCurrentCUDAStream(device_index_);
+  VLOG(1) << "CUDA graph capture stream: " << graph_stream_.value()
+          << ", default_stream="
+          << c10::cuda::getDefaultCUDAStream(device_index_)
+          << ", need_restore_stream=" << need_restore_stream;
 
   // Begin graph capture (capture_mode defaults to cudaStreamCaptureModeGlobal)
   // Use shared pool passed from executor
@@ -599,6 +615,11 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
       << "num_tokens mismatch: expected <= " << padded_num_tokens_ << ", got "
       << actual_num_tokens;
 
+  VLOG(1) << "CUDA graph replay begin, padded_num_tokens: "
+          << padded_num_tokens_ << ", actual_num_tokens: " << actual_num_tokens
+          << ", kv_max_seq_len: " << params.kv_max_seq_len
+          << ", current_round: " << params.current_round;
+
   // Update persistent parameters with new input data
   const torch::Tensor& k_cache = kv_cache[0].get_k_cache();
   const torch::Tensor& v_cache = kv_cache[0].get_v_cache();
@@ -611,7 +632,41 @@ torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
                            /*return_capture_params=*/false);
 
   // Replay captured graph
+  // NOTE: Some CUDA graph runtimes replay on the capture stream. Make sure the
+  // caller's current stream observes replay completion to avoid data hazards
+  // with subsequent eager CUDA ops in the same thread.
+  const auto caller_stream = c10::cuda::getCurrentCUDAStream(device_index_);
+  const auto replay_stream =
+      graph_stream_.has_value() ? graph_stream_.value() : caller_stream;
+  VLOG(1) << "CUDA graph replay stream select: caller_stream=" << caller_stream
+          << ", replay_stream=" << replay_stream
+          << ", graph_stream_set=" << graph_stream_.has_value();
+  bool need_restore_stream = false;
+  if (replay_stream != caller_stream) {
+    c10::cuda::setCurrentCUDAStream(replay_stream);
+    need_restore_stream = true;
+  }
+
   graph_.replay();
+
+  if (need_restore_stream) {
+    // Bridge stream dependency: caller_stream waits for replay_stream.
+    cudaEvent_t replay_done{};
+    CHECK_EQ(cudaEventCreateWithFlags(&replay_done, cudaEventDisableTiming),
+             cudaSuccess)
+        << "cudaEventCreateWithFlags failed";
+    CHECK_EQ(cudaEventRecord(replay_done, replay_stream.stream()), cudaSuccess)
+        << "cudaEventRecord failed";
+
+    c10::cuda::setCurrentCUDAStream(caller_stream);
+    CHECK_EQ(cudaStreamWaitEvent(caller_stream.stream(), replay_done, 0),
+             cudaSuccess)
+        << "cudaStreamWaitEvent failed";
+    CHECK_EQ(cudaEventDestroy(replay_done), cudaSuccess)
+        << "cudaEventDestroy failed";
+  }
+
+  VLOG(1) << "CUDA graph replay end, actual_num_tokens: " << actual_num_tokens;
 
   // Return only the actual num_tokens portion of hidden states
   return get_hidden_states(actual_num_tokens);
@@ -676,6 +731,19 @@ torch::Tensor CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
     bucket_num_tokens = n_tokens;
   }
   const uint64_t graph_key = make_graph_key(bucket_num_tokens, params);
+  if (pure_device_decode && FLAGS_enable_xattention_two_stage_decode) {
+    constexpr uint32_t kKvBucketSize = 128;
+    const uint32_t kv_max_seq_len =
+        static_cast<uint32_t>(std::max(0, params.kv_max_seq_len));
+    const uint32_t kv_bucket =
+        (kv_max_seq_len + kKvBucketSize - 1) / kKvBucketSize;
+    VLOG(1) << "CudaGraphExecutorImpl::run() two-stage key fields: "
+            << "bucket_num_tokens=" << bucket_num_tokens
+            << ", current_round=" << params.current_round
+            << ", beam_width=" << params.beam_width
+            << ", kv_max_seq_len=" << params.kv_max_seq_len
+            << ", kv_bucket=" << kv_bucket;
+  }
 
   // Check if conditions are suitable for graph execution (replay or capture)
   const auto max_seq_len = FLAGS_max_seq_len_for_graph_mode > 0
@@ -704,7 +772,20 @@ torch::Tensor CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   // Graph doesn't exist for this key, try to create it lazily
-  auto graph = std::make_unique<CudaGraph>(*persistent_param_, device_.index());
+  // CRITICAL FIX: Pass shared_capture_stream_ to CudaGraph constructor to
+  // ensure all graphs use the same stream, avoiding multi-stream dependency
+  // deadlock
+  if (!shared_capture_stream_.has_value()) {
+    shared_capture_stream_ =
+        c10::cuda::getStreamFromPool(true, device_.index());
+    LOG(INFO) << "Initialized shared_capture_stream: "
+              << shared_capture_stream_.value()
+              << " for device: " << device_.index();
+  }
+
+  auto graph = std::make_unique<CudaGraph>(
+      *persistent_param_, device_.index(), shared_capture_stream_);
+
   VLOG(kGraphExecutorLogVerboseLevel)
       << "CudaGraphExecutorImpl::run() in capture mode";
   bool capture_success = graph->capture(model_,
@@ -768,8 +849,8 @@ uint64_t CudaGraphExecutorImpl::make_graph_key(
       pure_device && FLAGS_enable_xattention_two_stage_decode;
 
   const int32_t round = pure_device ? params.current_round : -1;
-  const uint16_t round_key =
-      static_cast<uint16_t>(std::max(-1, std::min(round, 65534)) + 1);
+  const uint8_t round_key =
+      static_cast<uint8_t>(std::max(-1, std::min(round, 254)) + 1);
   const uint8_t beam_key =
       pure_device
           ? static_cast<uint8_t>(std::max(0, std::min(params.beam_width, 255)))
@@ -778,10 +859,23 @@ uint64_t CudaGraphExecutorImpl::make_graph_key(
   flags |= pure_device ? 0x1 : 0;
   flags |= enable_two_stage ? 0x2 : 0;
 
+  constexpr uint32_t kKvBucketSize = 128;
+  uint32_t kv_bucket = 0;
+  if (enable_two_stage) {
+    const uint32_t kv_max_seq_len =
+        static_cast<uint32_t>(std::max(0, params.kv_max_seq_len));
+    kv_bucket = (kv_max_seq_len + kKvBucketSize - 1) / kKvBucketSize;
+    kv_bucket = std::min(kv_bucket, 4095u);
+  }
+
+  uint32_t meta = 0;
+  meta |= static_cast<uint32_t>(round_key);
+  meta |= static_cast<uint32_t>(beam_key) << 8;
+  meta |= static_cast<uint32_t>(flags & 0xF) << 16;
+  meta |= static_cast<uint32_t>(kv_bucket & 0xFFF) << 20;
+
   uint64_t key = static_cast<uint64_t>(bucket_num_tokens);
-  key |= (static_cast<uint64_t>(round_key) << 32);
-  key |= (static_cast<uint64_t>(beam_key) << 48);
-  key |= (static_cast<uint64_t>(flags) << 56);
+  key |= (static_cast<uint64_t>(meta) << 32);
   return key;
 }
 

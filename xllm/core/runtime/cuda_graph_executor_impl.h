@@ -181,11 +181,20 @@ class CudaGraphPersistentParam {
 // CUDA graph executor using libtorch CUDAGraph for memory management
 class CudaGraph {
  public:
-  explicit CudaGraph(CudaGraphPersistentParam& persistent_param,
-                     c10::DeviceIndex device_index)
-      : persistent_param_(persistent_param), device_index_(device_index) {
-    // Initialize capture stream in constructor
-    initialize_capture_stream(device_index);
+  // CRITICAL FIX: Accept optional shared_capture_stream from executor to ensure
+  // all CudaGraph instances use the same stream, avoiding multi-stream deadlock
+  explicit CudaGraph(
+      CudaGraphPersistentParam& persistent_param,
+      c10::DeviceIndex device_index,
+      std::optional<c10::cuda::CUDAStream> shared_stream = std::nullopt)
+      : persistent_param_(persistent_param),
+        device_index_(device_index),
+        capture_stream_(shared_stream) {
+    // If shared_stream is provided, use it; otherwise initialize_capture_stream
+    // will create a new one on first capture
+    if (!capture_stream_.has_value()) {
+      initialize_capture_stream(device_index);
+    }
   }
 
   // Capture computation graph for given bucket num_tokens
@@ -227,6 +236,10 @@ class CudaGraph {
 
   // Cached capture stream, initialized on first capture
   std::optional<c10::cuda::CUDAStream> capture_stream_;
+  // The CUDA stream used during capture (and expected to be the replay stream).
+  // This can differ from capture_stream_ if the caller's current stream is
+  // already non-default when capturing.
+  std::optional<c10::cuda::CUDAStream> graph_stream_;
   c10::DeviceIndex device_index_;
 };
 
@@ -264,6 +277,11 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
 
   // CUDA graph memory pool shared across all CudaGraph instances
   decltype(at::cuda::graph_pool_handle()) graph_pool_;
+
+  // CRITICAL FIX: Shared capture stream for all CudaGraph instances to avoid
+  // multi-stream dependency deadlock. Previously, each CudaGraph had its own
+  // capture_stream_, causing different rounds to use different streams.
+  std::optional<c10::cuda::CUDAStream> shared_capture_stream_;
 
   // Get bucket num_tokens for given num_tokens
   // For num_tokens < 8: use 1, 2, 4, 8
