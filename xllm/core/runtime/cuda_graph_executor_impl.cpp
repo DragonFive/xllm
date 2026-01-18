@@ -308,6 +308,27 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
   // before updating plan_info, which requires reading from GPU tensors
   torch::cuda::synchronize();
 
+  // CRITICAL FIX: Update paged_kv_last_page_len_expanded BEFORE replay.
+  // This value depends on current_round, and multiple graphs (round 1, round 2)
+  // share the same persistent_two_stage_decode_cache_. Without this update,
+  // round 1 replay would read the wrong value (set by round 2 capture), causing
+  // kernel to access out-of-bounds memory and hang.
+  // This must happen regardless of return_capture_params.
+  const bool pure_device_decode_for_update = (params.current_round >= 0) &&
+                                             !params.full_k_caches.empty() &&
+                                             !params.unshared_k_caches.empty();
+  const bool enable_two_stage_for_update =
+      pure_device_decode_for_update && FLAGS_enable_xattention_two_stage_decode;
+  if (enable_two_stage_for_update &&
+      persistent_two_stage_decode_cache_.has_value()) {
+    // Update the dynamic value that depends on current_round
+    persistent_two_stage_decode_cache_->paged_kv_last_page_len_expanded.fill_(
+        static_cast<int32_t>(params.current_round + 1));
+    VLOG(1) << "Updated paged_kv_last_page_len_expanded to "
+            << (params.current_round + 1)
+            << " for current_round=" << params.current_round;
+  }
+
   // Update plan_info only before capture. Replay does not invoke model forward,
   // so updating plan_info here has no effect on graph replay.
   if (return_capture_params) {
