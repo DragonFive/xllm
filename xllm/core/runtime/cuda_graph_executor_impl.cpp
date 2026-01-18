@@ -50,6 +50,21 @@ CudaGraphPersistentParam::CudaGraphPersistentParam(
   const int64_t max_tokens_per_batch = FLAGS_max_tokens_per_batch;
   // num_sequences
   const int64_t max_seqs_per_batch = options.max_seqs_per_batch();
+
+  // CRITICAL FIX: Pre-allocate buffers with beam expansion.
+  // In two-stage decode, actual_batch_size = request_batch_size * beam_width.
+  // Without pre-allocation, runtime resize would change buffer addresses,
+  // invalidating captured CUDA graphs and causing illegal memory access.
+  // Use FLAGS_beam_width for precise calculation.
+  const int64_t beam_width =
+      std::max(static_cast<int64_t>(1), static_cast<int64_t>(FLAGS_beam_width));
+  const int64_t max_batch_with_beam = max_seqs_per_batch * beam_width;
+
+  LOG(INFO) << "CudaGraphPersistentParam: pre-allocating buffers with "
+            << "beam_width=" << beam_width
+            << ", max_seqs_per_batch=" << max_seqs_per_batch
+            << ", max_batch_with_beam=" << max_batch_with_beam;
+
   auto tensor_options = torch::TensorOptions().device(device);
 
   const int64_t max_seq_len = FLAGS_max_seq_len_for_graph_mode > 0
@@ -91,20 +106,23 @@ CudaGraphPersistentParam::CudaGraphPersistentParam(
                                 torch::dtype(dtype).device(device));
 
   // FlashInfer decode mode parameters
-  // paged_kv_indptr: shape [max_seqs_per_batch + 1]
-  persistent_paged_kv_indptr_ = torch::zeros(
-      {max_seqs_per_batch + 1}, torch::dtype(torch::kInt).device(device));
+  // CRITICAL FIX: Use max_batch_with_beam to pre-allocate buffers large enough
+  // for beam-expanded batch sizes, avoiding runtime resize that would change
+  // buffer addresses and invalidate captured CUDA graphs.
 
-  // paged_kv_indices: maximum size based on max blocks
-  // Estimate max blocks: max_seqs_per_batch * max_block_table_len
+  // paged_kv_indptr: shape [max_batch_with_beam + 1]
+  persistent_paged_kv_indptr_ = torch::zeros(
+      {max_batch_with_beam + 1}, torch::dtype(torch::kInt).device(device));
+
+  // paged_kv_indices: maximum size based on max blocks with beam expansion
   const int64_t max_paged_kv_indices_size =
-      max_seqs_per_batch * max_block_table_len;
+      max_batch_with_beam * max_block_table_len;
   persistent_paged_kv_indices_ = torch::zeros(
       {max_paged_kv_indices_size}, torch::dtype(torch::kInt).device(device));
 
-  // paged_kv_last_page_len: shape [max_seqs_per_batch]
+  // paged_kv_last_page_len: shape [max_batch_with_beam]
   persistent_paged_kv_last_page_len_ = torch::zeros(
-      {max_seqs_per_batch}, torch::dtype(torch::kInt).device(device));
+      {max_batch_with_beam}, torch::dtype(torch::kInt).device(device));
 
   // For decode mode, each sequence has 1 token, so qo_indptr = [0, 1, 2, ...,
   // max_seqs_per_batch]
@@ -166,68 +184,34 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
       !params.unshared_k_caches.empty() &&
       FLAGS_enable_xattention_two_stage_decode;
 
+  // CRITICAL FIX: After pre-allocation with beam expansion (using
+  // FLAGS_beam_width), runtime resize should NEVER happen. Convert resize logic
+  // to CHECK assertions. If these CHECKs fail, verify that FLAGS_beam_width
+  // matches actual beam_width.
   if (needs_buffer_resize) {
-    // Protect buffer resize operations with mutex to prevent concurrent access
-    // Multiple requests may share this persistent_param_ and concurrently call
-    // update()
-    std::lock_guard<std::mutex> lock(buffer_resize_mutex_);
-
-    // Double-check after acquiring lock (another thread may have already
-    // resized)
     const int64_t required_indptr_size = actual_batch_size + 1;
-    VLOG(50) << "[DEBUG] Two-stage decode requires buffer resize: "
-             << "actual_batch_size=" << actual_batch_size
-             << ", request_batch_size=" << request_batch_size
-             << ", required_indptr_size=" << required_indptr_size
-             << ", current_indptr_size=" << persistent_paged_kv_indptr_.size(0)
-             << ", thread_id=" << std::this_thread::get_id();
+    CHECK_GE(persistent_paged_kv_indptr_.size(0), required_indptr_size)
+        << "persistent_paged_kv_indptr_ pre-allocation insufficient. "
+        << "buffer_size=" << persistent_paged_kv_indptr_.size(0)
+        << ", required=" << required_indptr_size
+        << ", actual_batch_size=" << actual_batch_size
+        << ". Verify FLAGS_beam_width matches actual beam_width.";
 
-    if (persistent_paged_kv_indptr_.size(0) < required_indptr_size) {
-      VLOG(50) << "[DEBUG] [RESIZE] Resizing persistent_paged_kv_indptr_ from "
-               << persistent_paged_kv_indptr_.size(0) << " to "
-               << required_indptr_size
-               << ", old_data_ptr=" << persistent_paged_kv_indptr_.data_ptr()
-               << ", thread_id=" << std::this_thread::get_id();
-      persistent_paged_kv_indptr_ = torch::zeros(
-          {required_indptr_size}, torch::dtype(torch::kInt).device(device_));
-      VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
-               << persistent_paged_kv_indptr_.data_ptr();
-    }
-
-    if (persistent_paged_kv_last_page_len_.size(0) < actual_batch_size) {
-      VLOG(50) << "[DEBUG] [RESIZE] Resizing "
-                  "persistent_paged_kv_last_page_len_ from "
-               << persistent_paged_kv_last_page_len_.size(0) << " to "
-               << actual_batch_size << ", old_data_ptr="
-               << persistent_paged_kv_last_page_len_.data_ptr()
-               << ", thread_id=" << std::this_thread::get_id();
-      persistent_paged_kv_last_page_len_ = torch::zeros(
-          {actual_batch_size}, torch::dtype(torch::kInt).device(device_));
-      VLOG(50) << "[DEBUG] [RESIZE] After resize, new_data_ptr="
-               << persistent_paged_kv_last_page_len_.data_ptr();
-    }
+    CHECK_GE(persistent_paged_kv_last_page_len_.size(0), actual_batch_size)
+        << "persistent_paged_kv_last_page_len_ pre-allocation insufficient. "
+        << "buffer_size=" << persistent_paged_kv_last_page_len_.size(0)
+        << ", required=" << actual_batch_size
+        << ". Verify FLAGS_beam_width matches actual beam_width.";
   }
 
-  // CRITICAL FIX: paged_kv_indices resize must be independent of batch size
-  // check because the indices buffer size depends on total KV cache pages, not
-  // batch size. In high-concurrency scenarios, indices can exceed buffer even
-  // when batch is small. This fixes the error:
-  // "persistent_paged_kv_indices_ buffer too small: buffer_size=1284,
-  // required=1672"
+  // paged_kv_indices CHECK (independent of batch size, depends on KV pages)
   if (params.paged_kv_indices.defined()) {
-    std::lock_guard<std::mutex> lock(buffer_resize_mutex_);
     const int64_t required_indices_size = params.paged_kv_indices.size(0);
-    if (persistent_paged_kv_indices_.size(0) < required_indices_size) {
-      VLOG(1) << "[RESIZE] Resizing persistent_paged_kv_indices_ from "
-              << persistent_paged_kv_indices_.size(0) << " to "
-              << required_indices_size
-              << ", old_data_ptr=" << persistent_paged_kv_indices_.data_ptr()
-              << ", thread_id=" << std::this_thread::get_id();
-      persistent_paged_kv_indices_ = torch::zeros(
-          {required_indices_size}, torch::dtype(torch::kInt).device(device_));
-      VLOG(1) << "[RESIZE] After resize, new_data_ptr="
-              << persistent_paged_kv_indices_.data_ptr();
-    }
+    CHECK_GE(persistent_paged_kv_indices_.size(0), required_indices_size)
+        << "persistent_paged_kv_indices_ pre-allocation insufficient. "
+        << "buffer_size=" << persistent_paged_kv_indices_.size(0)
+        << ", required=" << required_indices_size
+        << ". Verify FLAGS_beam_width matches actual beam_width.";
   }
 
   // Copy data from input parameters to persistent graph tensors
