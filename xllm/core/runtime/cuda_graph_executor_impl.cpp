@@ -426,6 +426,11 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
     VLOG(1) << "Updated paged_kv_last_page_len_expanded to "
             << (params.current_round + 1)
             << " for current_round=" << params.current_round;
+    // CRITICAL: Synchronize to ensure fill_() completes before graph replay.
+    // fill_() is async on default stream (stream 0), but graph replays on
+    // capture stream (stream 9). Without sync, graph kernel may read stale
+    // value from paged_kv_last_page_len_expanded.
+    torch::cuda::synchronize();
   }
 
   // Update plan_info only before capture. Replay does not invoke model forward,
