@@ -884,7 +884,6 @@ bool CudaGraph::capture(CausalLM* model,
 
   return true;
 }
-}
 
 torch::Tensor CudaGraph::replay(const torch::Tensor& tokens,
                                 const torch::Tensor& positions,
