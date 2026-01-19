@@ -87,6 +87,9 @@ struct SequenceParams {
   // stopping checker
   // reference from request
   StoppingChecker* stopping_checker;  // not owned
+
+  // request created time for latency tracking
+  absl::Time created_time = absl::InfinitePast();
 };
 
 class Sequence final {
@@ -132,6 +135,9 @@ class Sequence final {
   std::optional<RemoteToken>& first_token() { return first_token_; }
   // get the total number of tokens
   size_t num_tokens() const { return num_tokens_; }
+
+  // get request created time for latency tracking
+  absl::Time created_time() const { return sequence_params_.created_time; }
   // get the number of prompt tokens
   size_t num_prompt_tokens() const { return num_prompt_tokens_; }
   // get the number of generated tokens

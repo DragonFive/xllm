@@ -218,6 +218,7 @@ ForwardInput RecWorkerImpl::LlmRecPureDevicePipeline::prepare_inputs(
 void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_work_before_execute(
     const ForwardInput& inputs,
     ForwardInput& processed_inputs) {
+  Timer prepare_timer;
   worker_.WorkerImpl::prepare_work_before_execute(inputs, processed_inputs);
 
   worker_.prepare_multi_modal_data(processed_inputs);
@@ -225,6 +226,8 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::prepare_work_before_execute(
 #if defined(USE_NPU) || defined(USE_CUDA)
   prepare_kv_caches_related_for_input(inputs, processed_inputs);
 #endif
+  HISTOGRAM_OBSERVE(rec_pure_device_prepare_input_latency_us,
+                    prepare_timer.elapsed_microseconds());
 }
 
 void RecWorkerImpl::LlmRecPureDevicePipeline::allocate_kv_caches_related() {
@@ -408,16 +411,23 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
 
     torch::Tensor hidden_states;
 
+    // Forward timing
+    Timer forward_timer;
     hidden_states =
         worker_.model_executor_->forward(mutable_input.token_ids,
                                          mutable_input.positions,
                                          worker_.kv_caches_,
                                          mutable_input.input_params);
+    MULTI_HISTOGRAM_OBSERVE(rec_pure_device_forward_latency_us,
+                            std::to_string(round),
+                            forward_timer.elapsed_microseconds());
 
     if (!hidden_states.defined()) {
       return std::nullopt;
     }
 
+    // Logits and sampler timing
+    Timer logits_sampler_timer;
     if (sampling_params.selected_token_idxes.defined()) {
       logits = worker_.model_->logits(hidden_states,
                                       sampling_params.selected_token_idxes);
@@ -425,8 +435,13 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
       top_tokens = sample_output.top_tokens.to(torch::kInt32)
                        .reshape({-1, mutable_input.beam_width});
     }
+    MULTI_HISTOGRAM_OBSERVE(rec_pure_device_logits_sampler_latency_us,
+                            std::to_string(round),
+                            logits_sampler_timer.elapsed_microseconds());
 
     if (sample_output.top_tokens.defined()) {
+      // Beam search timing
+      Timer beam_search_timer;
       torch::Tensor top_logprobs =
           sample_output.top_logprobs.reshape({-1, beam_width});
       execute_beam_search(
@@ -436,8 +451,13 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                                         /*non_blocking=*/true);
       beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
                                      /*non_blocking=*/true);
+      MULTI_HISTOGRAM_OBSERVE(rec_pure_device_beam_search_latency_us,
+                              std::to_string(round),
+                              beam_search_timer.elapsed_microseconds());
 
       if (round < total_rounds - 1) {
+        // Update input timing
+        Timer update_input_timer;
         // Use async results if available, otherwise fallback to sync
         // computation
         if (next_round_async_result.has_value()) {
@@ -464,11 +484,17 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
           execute_cache_select(
               beam_tensors, mutable_input, round, beam_width, layer_num);
         }
+        MULTI_HISTOGRAM_OBSERVE(rec_pure_device_update_input_latency_us,
+                                std::to_string(round),
+                                update_input_timer.elapsed_microseconds());
       }
 
       if (round == total_rounds - 1) {
+        Timer build_output_timer;
         build_final_output(
             logits, sample_output, sampling_params, beam_tensors, output);
+        HISTOGRAM_OBSERVE(rec_pure_device_build_output_latency_us,
+                          build_output_timer.elapsed_microseconds());
       }
     }
   }

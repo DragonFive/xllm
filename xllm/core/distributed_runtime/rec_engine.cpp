@@ -815,6 +815,23 @@ ForwardOutput RecEngine::PureDeviceEnginePipeline::step(
     return {};
   }
 
+  // Compute request wait latency from earliest created_time in batch
+  auto sequences = batches[0].get_sequences();
+  if (!sequences.empty()) {
+    absl::Time earliest_created_time = absl::InfiniteFuture();
+    for (auto* seq : sequences) {
+      if (seq->created_time() < earliest_created_time) {
+        earliest_created_time = seq->created_time();
+      }
+    }
+    if (earliest_created_time != absl::InfiniteFuture() &&
+        earliest_created_time != absl::InfinitePast()) {
+      int64_t wait_us =
+          absl::ToInt64Microseconds(absl::Now() - earliest_created_time);
+      HISTOGRAM_OBSERVE(rec_pure_device_request_wait_latency_us, wait_us);
+    }
+  }
+
   Timer timer;
   // Call worker's prepare_inputs (multi-round logic is inside worker)
   auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
@@ -853,12 +870,15 @@ ForwardOutput RecEngine::PureDeviceEnginePipeline::get_model_output(
   CHECK(forward_output.has_value()) << "Failed to execute model";
 
   // D2H transfer for beam_sequence_group (multi-round results)
+  Timer d2h_timer;
   auto& output = forward_output.value();
   output.beam_sequence_group = safe_to(output.beam_sequence_group, torch::kCPU);
   if (output.beam_search_output.out_logprobs.defined()) {
     output.beam_search_output.out_logprobs =
         safe_to(output.beam_search_output.out_logprobs, torch::kCPU);
   }
+  HISTOGRAM_OBSERVE(rec_pure_device_d2h_latency_us,
+                    d2h_timer.elapsed_microseconds());
 
   return output;
 }

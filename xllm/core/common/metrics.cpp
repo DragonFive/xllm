@@ -218,3 +218,26 @@ DEFINE_MULTI_HISTOGRAM(
     decode_active_activation_size_in_kilobytes,
     "dp_rank",
     "Active activation size in kilobytes per dp rank during decode phase");
+
+// pure device pipeline metrics
+DEFINE_HISTOGRAM(rec_pure_device_request_wait_latency_us,
+                 "Latency from request creation to step execution in us");
+DEFINE_HISTOGRAM(rec_pure_device_prepare_input_latency_us,
+                 "Latency of prepare_work_before_execute in us");
+DEFINE_HISTOGRAM(rec_pure_device_d2h_latency_us,
+                 "Latency of D2H transfer for beam_sequence_group in us");
+DEFINE_HISTOGRAM(rec_pure_device_build_output_latency_us,
+                 "Latency of build_final_output in us");
+DEFINE_MULTI_HISTOGRAM(rec_pure_device_forward_latency_us,
+                       "round",
+                       "Latency of forward execution per round in us");
+DEFINE_MULTI_HISTOGRAM(rec_pure_device_logits_sampler_latency_us,
+                       "round",
+                       "Latency of logits and sampler per round in us");
+DEFINE_MULTI_HISTOGRAM(rec_pure_device_beam_search_latency_us,
+                       "round",
+                       "Latency of beam search per round in us");
+DEFINE_MULTI_HISTOGRAM(
+    rec_pure_device_update_input_latency_us,
+    "round",
+    "Latency of update_input and cache_select per round in us");
