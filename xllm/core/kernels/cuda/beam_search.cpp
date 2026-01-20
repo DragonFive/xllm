@@ -3,6 +3,8 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 
+#include "air_topk_last_dim.h"
+#include "core/common/global_flags.h"
 #include "cuda.h"
 
 namespace xllm::kernel::cuda {
@@ -53,16 +55,28 @@ void beam_search(torch::Tensor acc_logprob,
     auto combined_probs =
         (acc_logprob + top_logprobs).view({batch_size, beam_size * top_k});
 
-    auto topk_result = torch::topk(combined_probs, beam_size, -1);
-    auto new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
-    auto new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
+    torch::Tensor new_probs;
+    torch::Tensor new_indices;
+    if (FLAGS_enable_air_topk && combined_probs.is_cuda()) {
+      const bool sorted_by_value = (current_step >= total_rounds - 1);
+      std::tie(new_probs, new_indices) =
+          air_topk_last_dim(combined_probs,
+                            static_cast<int32_t>(beam_size),
+                            /*largest=*/true,
+                            /*sorted_by_value=*/sorted_by_value);
+    } else {
+      auto topk_result = torch::topk(combined_probs, beam_size, -1);
+      new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
+      new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
 
-    auto ordered_indices = new_indices.argsort(static_cast<int64_t>(1), false);
-    // Reorder new_probs (and corresponding new_indices) by ordered_indices to
-    // keep alignment.
-    if (current_step < total_rounds - 1) {
-      new_probs = new_probs.gather(1, ordered_indices);
-      new_indices = new_indices.gather(1, ordered_indices);
+      auto ordered_indices =
+          new_indices.argsort(static_cast<int64_t>(1), false);
+      // Reorder new_probs (and corresponding new_indices) by ordered_indices to
+      // keep alignment.
+      if (current_step < total_rounds - 1) {
+        new_probs = new_probs.gather(1, ordered_indices);
+        new_indices = new_indices.gather(1, ordered_indices);
+      }
     }
 
     auto parent_beam = (new_indices / top_k).to(torch::kLong);

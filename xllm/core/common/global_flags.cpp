@@ -514,6 +514,11 @@ DEFINE_int32(max_decode_rounds,
              "Maximum number of decode rounds for multi-step decoding. "
              "0 means disabled.");
 
+DEFINE_bool(enable_air_topk,
+            false,
+            "Enable AIR stable-radix TopK + fused log_softmax for REC "
+            "pure-device multi-round beam search.");
+
 DEFINE_int32(beam_width, 1, "Beam width for beam search.");
 
 DEFINE_int64(max_token_per_req, 1024, "Max token per request.");
