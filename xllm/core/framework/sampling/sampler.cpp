@@ -43,14 +43,14 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
         logits, params.unique_token_ids, params.repetition_penalties);
   }
 
-  // Fast path for rec beam search:
+  // Fast path for pure-device multi-round REC beam search:
+  // - FLAGS_max_decode_rounds > 0
   // - no top_p
-  // - top_k == max_top_logprobs (e.g. beam_width == 128)
   // We only need top_tokens/top_logprobs for beam search scoring, so avoid:
   // full-vocab apply_top_k_top_p + full-vocab log_softmax + extra topk.
   if (params.use_beam_search && params.logprobs &&
-      params.max_top_logprobs > 0 && params.top_k.defined() &&
-      !params.top_p.defined() && !FLAGS_enable_qwen3_reranker) {
+      params.max_top_logprobs > 0 && !params.top_p.defined() &&
+      !FLAGS_enable_qwen3_reranker && FLAGS_max_decode_rounds > 0) {
     torch::Tensor sample_logits = logits;
     if (params.selected_token_idxes.numel() != params.sample_idxes.numel()) {
       sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
@@ -63,7 +63,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
         sample_logits.topk(params.max_top_logprobs,
                            /*dim=*/-1,
                            /*largest=*/true,
-                           /*sorted=*/true);
+                           /*sorted=*/false);
 
     torch::Tensor topk_logits = topk_values.to(torch::kFloat32);
 
@@ -86,11 +86,6 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
 
     output.top_tokens = topk_indices;
     output.top_logprobs = torch::log_softmax(topk_logits, /*dim=*/-1);
-
-    // Optional: keep next_tokens/logprobs defined to be safe for generic
-    // post-processing.
-    output.next_tokens = output.top_tokens.select(/*dim=*/-1, /*index=*/0);
-    output.logprobs = output.top_logprobs.select(/*dim=*/-1, /*index=*/0);
     return output;
   }
 
