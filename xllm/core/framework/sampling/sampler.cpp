@@ -69,7 +69,8 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
               sample_logits,
               static_cast<int32_t>(params.max_top_logprobs),
               /*largest=*/true,
-              /*sorted_by_value=*/false);
+              /*sorted_by_value=*/false,
+              /*stable=*/false);
     } else {
       std::tie(topk_values, topk_indices) =
           sample_logits.topk(params.max_top_logprobs,

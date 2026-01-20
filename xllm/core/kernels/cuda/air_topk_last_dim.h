@@ -26,11 +26,16 @@ namespace xllm::kernel::cuda {
 //
 // If sorted_by_value is true, outputs are sorted by value (descending for
 // largest=true, ascending for largest=false).
-// Otherwise, outputs are sorted by index (ascending).
+// Otherwise, outputs are sorted by index (ascending) when stable=true,
+// or in an unspecified order when stable=false.
+//
+// stable: If true, outputs with the same value maintain their original order.
+//         If false, the order is unspecified (faster, skips CUB sort).
 std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
     const torch::Tensor& input,
     int32_t k,
     bool largest,
-    bool sorted_by_value);
+    bool sorted_by_value,
+    bool stable = true);
 
 }  // namespace xllm::kernel::cuda

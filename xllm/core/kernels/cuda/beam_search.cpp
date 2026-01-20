@@ -63,7 +63,8 @@ void beam_search(torch::Tensor acc_logprob,
           air_topk_last_dim(combined_probs,
                             static_cast<int32_t>(beam_size),
                             /*largest=*/true,
-                            /*sorted_by_value=*/sorted_by_value);
+                            /*sorted_by_value=*/sorted_by_value,
+                            /*stable=*/false);
     } else {
       auto topk_result = torch::topk(combined_probs, beam_size, -1);
       new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]

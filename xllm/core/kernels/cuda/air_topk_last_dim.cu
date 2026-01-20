@@ -1604,7 +1604,8 @@ void standalone_stable_radix_topk_one_block_(void* buf,
                                              IdxT* out_idx,
                                              bool select_min,
                                              cudaStream_t stream,
-                                             bool sorted = false) {
+                                             bool sorted = false,
+                                             bool stable = true) {
   static_assert(air_topk_stable::calc_num_passes<T, BitsPerPass>() > 1);
 
   char* bufs = nullptr;
@@ -1703,17 +1704,35 @@ void standalone_stable_radix_topk_one_block_(void* buf,
 
   T* idx_sort_out = sorted ? sort_in : out;
   IdxT* idx_sort_out_idx = sorted ? sort_in_idx : out_idx;
-  cub::DeviceSegmentedSort::SortPairs(sort_temp_storage,
-                                      temp_storage_bytes,
-                                      topk_out_idx,
-                                      idx_sort_out_idx,
-                                      topk_out,
-                                      idx_sort_out,
-                                      k * batch_size,
-                                      batch_size,
-                                      transform_iter,
-                                      transform_iter + 1,
-                                      stream);
+
+  if (stable) {
+    // Stable mode: sort by index to maintain original order for equal values
+    cub::DeviceSegmentedSort::SortPairs(sort_temp_storage,
+                                        temp_storage_bytes,
+                                        topk_out_idx,
+                                        idx_sort_out_idx,
+                                        topk_out,
+                                        idx_sort_out,
+                                        k * batch_size,
+                                        batch_size,
+                                        transform_iter,
+                                        transform_iter + 1,
+                                        stream);
+  } else {
+    // Non-stable mode: skip index sort, directly copy results
+    // Use cudaMemcpyAsync for D2D copy
+    cudaMemcpyAsync(idx_sort_out,
+                    topk_out,
+                    sizeof(T) * k * batch_size,
+                    cudaMemcpyDeviceToDevice,
+                    stream);
+    cudaMemcpyAsync(idx_sort_out_idx,
+                    topk_out_idx,
+                    sizeof(IdxT) * k * batch_size,
+                    cudaMemcpyDeviceToDevice,
+                    stream);
+  }
+
   if (sorted) {
     if (select_min) {
       cub::DeviceSegmentedSort::StableSortPairs(sort_temp_storage,
@@ -1753,7 +1772,8 @@ void standalone_stable_radix_11bits(void* buf,
                                     T* out,
                                     IdxT* out_idx,
                                     bool greater,
-                                    cudaStream_t stream = 0) {
+                                    cudaStream_t stream = 0,
+                                    bool stable = true) {
   constexpr int items_per_thread = 32;
   constexpr int block_dim = 512;
   constexpr bool fused_last_filter = false;
@@ -1770,7 +1790,8 @@ void standalone_stable_radix_11bits(void* buf,
         out_idx,
         !greater,
         stream,
-        sorted);
+        sorted,
+        stable);
   } else {
     int sm_cnt = get_multi_processor_count();
     unsigned grid_dim = air_topk_stable::calc_grid_dim<T, IdxT, 11, block_dim>(
@@ -1789,7 +1810,8 @@ void standalone_stable_radix_11bits(void* buf,
           out_idx,
           !greater,
           stream,
-          sorted);
+          sorted,
+          stable);
     } else {
       standalone_stable_radix_topk_<T, IdxT, 11, block_dim>(
           buf,
@@ -1814,7 +1836,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
     const torch::Tensor& input,
     int32_t k,
     bool largest,
-    bool sorted_by_value) {
+    bool sorted_by_value,
+    bool stable) {
   TORCH_CHECK(input.is_cuda(), "air_topk_last_dim: input must be CUDA");
   TORCH_CHECK(input.dim() == 2, "air_topk_last_dim: input must be 2D [B, L]");
   TORCH_CHECK(k > 0, "air_topk_last_dim: k must be > 0");
@@ -1854,7 +1877,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_val,
                                                        out_idx,
                                                        largest,
-                                                       stream);
+                                                       stream,
+                                                       stable);
       auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, true>(workspace.data_ptr(),
                                                        workspace_bytes,
@@ -1865,7 +1889,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_val,
                                                        out_idx,
                                                        largest,
-                                                       stream);
+                                                       stream,
+                                                       stable);
     } else {
       standalone_stable_radix_11bits<T, int64_t, false>(nullptr,
                                                         workspace_bytes,
@@ -1876,7 +1901,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_val,
                                                         out_idx,
                                                         largest,
-                                                        stream);
+                                                        stream,
+                                                        stable);
       auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, false>(workspace.data_ptr(),
                                                         workspace_bytes,
@@ -1887,7 +1913,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_val,
                                                         out_idx,
                                                         largest,
-                                                        stream);
+                                                        stream,
+                                                        stable);
     }
     return {values, indices};
   }
@@ -1908,7 +1935,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_val,
                                                        out_idx,
                                                        largest,
-                                                       stream);
+                                                       stream,
+                                                       stable);
       auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, true>(workspace.data_ptr(),
                                                        workspace_bytes,
@@ -1919,7 +1947,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_val,
                                                        out_idx,
                                                        largest,
-                                                       stream);
+                                                       stream,
+                                                       stable);
     } else {
       standalone_stable_radix_11bits<T, int64_t, false>(nullptr,
                                                         workspace_bytes,
@@ -1930,7 +1959,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_val,
                                                         out_idx,
                                                         largest,
-                                                        stream);
+                                                        stream,
+                                                        stable);
       auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, false>(workspace.data_ptr(),
                                                         workspace_bytes,
@@ -1941,7 +1971,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_val,
                                                         out_idx,
                                                         largest,
-                                                        stream);
+                                                        stream,
+                                                        stable);
     }
     return {values, indices};
   }
@@ -1961,7 +1992,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_val,
                                                        out_idx,
                                                        largest,
-                                                       stream);
+                                                       stream,
+                                                       stable);
       auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, true>(workspace.data_ptr(),
                                                        workspace_bytes,
@@ -1972,7 +2004,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_val,
                                                        out_idx,
                                                        largest,
-                                                       stream);
+                                                       stream,
+                                                       stable);
     } else {
       standalone_stable_radix_11bits<T, int64_t, false>(nullptr,
                                                         workspace_bytes,
@@ -1983,7 +2016,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_val,
                                                         out_idx,
                                                         largest,
-                                                        stream);
+                                                        stream,
+                                                        stable);
       auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, false>(workspace.data_ptr(),
                                                         workspace_bytes,
@@ -1994,7 +2028,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_val,
                                                         out_idx,
                                                         largest,
-                                                        stream);
+                                                        stream,
+                                                        stable);
     }
     return {values, indices};
   }
