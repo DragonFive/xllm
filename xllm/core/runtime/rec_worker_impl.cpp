@@ -200,7 +200,35 @@ RecWorkerImpl::LlmRecPureDevicePipeline::LlmRecPureDevicePipeline(
 bool RecWorkerImpl::LlmRecPureDevicePipeline::create_model(
     RecWorkerImpl& worker,
     ModelContext& context) {
-  return worker.LLMWorkerImpl::init_model(context);
+  bool success = worker.LLMWorkerImpl::init_model(context);
+
+  if (success) {
+    // Initialize CUDA Graph executors after model is created
+    const auto& model_args = context.get_model_args();
+    const uint32_t vocab_size = model_args.vocab_size();
+    const uint32_t max_batch = worker.options_.max_seqs_per_batch();
+    const uint32_t max_beam = worker.options_.beam_width();
+    const uint32_t max_rounds = FLAGS_max_decode_rounds;
+    const uint32_t max_k = 128;  // max_top_logprobs
+
+    // Initialize BeamSearchGraphExecutor
+    if (FLAGS_enable_beam_search_graph && worker.device_.is_cuda()) {
+      beam_search_graph_executor_ = std::make_unique<BeamSearchGraphExecutor>(
+          max_batch, max_beam, max_rounds, worker.device_.torch_device());
+      LOG(INFO)
+          << "BeamSearchGraphExecutor initialized for CUDA Graph optimization";
+    }
+
+    // Initialize SamplerGraphExecutor
+    if (FLAGS_enable_sampler_graph && worker.device_.is_cuda()) {
+      sampler_graph_executor_ = std::make_unique<SamplerGraphExecutor>(
+          max_batch, vocab_size, max_k, worker.device_.torch_device());
+      LOG(INFO)
+          << "SamplerGraphExecutor initialized for CUDA Graph optimization";
+    }
+  }
+
+  return success;
 }
 
 ForwardInput RecWorkerImpl::LlmRecPureDevicePipeline::prepare_inputs(
@@ -421,7 +449,15 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     if (sampling_params.selected_token_idxes.defined()) {
       logits = worker_.model_->logits(hidden_states,
                                       sampling_params.selected_token_idxes);
-      sample_output = worker_.sampler_->forward(logits, sampling_params);
+
+      // Use SamplerGraphExecutor if available, otherwise fallback to eager mode
+      if (sampler_graph_executor_) {
+        sample_output =
+            sampler_graph_executor_->forward(logits, sampling_params);
+      } else {
+        sample_output = worker_.sampler_->forward(logits, sampling_params);
+      }
+
       top_tokens = sample_output.top_tokens.to(torch::kInt32)
                        .reshape({-1, mutable_input.beam_width});
     }
@@ -542,17 +578,39 @@ void RecWorkerImpl::LlmRecPureDevicePipeline::execute_beam_search(
 #if defined(USE_NPU)
 // TODO: implement beam search for NPU
 #elif defined(USE_CUDA)
-  xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
-                                  beam_tensors.sequence_group,
-                                  top_tokens,
-                                  top_logprobs,
-                                  beam_tensors.out_log_probs,
-                                  beam_tensors.out_token_ids,
-                                  beam_tensors.out_token_index,
-                                  beam_tensors.out_beam_count_prefix_sums,
-                                  beam_tensors.out_seqgroup,
-                                  batch_size,
-                                  round);
+  // Use BeamSearchGraphExecutor if available, otherwise fallback to eager mode
+  if (beam_search_graph_executor_) {
+    auto output =
+        beam_search_graph_executor_->forward(beam_tensors.acc_logprob,
+                                             beam_tensors.sequence_group,
+                                             top_tokens,
+                                             top_logprobs,
+                                             batch_size,
+                                             round);
+
+    // Copy results back to beam_tensors
+    beam_tensors.out_log_probs.copy_(output.out_acc_logprob,
+                                     /*non_blocking=*/true);
+    beam_tensors.out_token_ids.copy_(output.out_token_ids,
+                                     /*non_blocking=*/true);
+    beam_tensors.out_token_index.copy_(output.out_token_index,
+                                       /*non_blocking=*/true);
+    beam_tensors.out_seqgroup.copy_(output.out_sequence_group,
+                                    /*non_blocking=*/true);
+  } else {
+    // Fallback to eager mode (direct kernel call)
+    xllm::kernel::cuda::beam_search(beam_tensors.acc_logprob,
+                                    beam_tensors.sequence_group,
+                                    top_tokens,
+                                    top_logprobs,
+                                    beam_tensors.out_log_probs,
+                                    beam_tensors.out_token_ids,
+                                    beam_tensors.out_token_index,
+                                    beam_tensors.out_beam_count_prefix_sums,
+                                    beam_tensors.out_seqgroup,
+                                    batch_size,
+                                    round);
+  }
 #endif
 }
 

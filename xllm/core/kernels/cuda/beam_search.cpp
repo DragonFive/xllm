@@ -9,6 +9,56 @@
 
 namespace xllm::kernel::cuda {
 
+namespace {
+// Thread-local cache for torch::arange results to avoid repeated allocations
+// This is critical for CUDA Graph compatibility
+struct ArangeCache {
+  torch::Tensor cached_tensor;
+  int32_t cached_size = 0;
+  torch::ScalarType cached_dtype = torch::kInt32;
+  torch::Device cached_device = torch::kCPU;
+
+  void clear() {
+    cached_tensor = torch::Tensor();
+    cached_size = 0;
+    cached_dtype = torch::kInt32;
+    cached_device = torch::kCPU;
+  }
+};
+
+thread_local ArangeCache g_arange_cache;
+
+// Get cached arange tensor or create new one if cache miss
+torch::Tensor get_cached_arange(int32_t size,
+                                torch::ScalarType dtype,
+                                const torch::Device& device) {
+  // Check if cache is valid
+  if (g_arange_cache.cached_size >= size &&
+      g_arange_cache.cached_dtype == dtype &&
+      g_arange_cache.cached_device == device &&
+      g_arange_cache.cached_tensor.defined()) {
+    // Return slice of cached tensor
+    return g_arange_cache.cached_tensor.slice(/*dim=*/0,
+                                              /*start=*/0,
+                                              /*end=*/size);
+  }
+
+  // Cache miss or insufficient size - create new tensor
+  // Allocate slightly larger size to reduce future reallocations
+  const int32_t alloc_size = ((size + 15) / 16) * 16;  // Round up to 16
+  g_arange_cache.cached_tensor = torch::arange(
+      alloc_size, torch::TensorOptions().dtype(dtype).device(device));
+  g_arange_cache.cached_size = alloc_size;
+  g_arange_cache.cached_dtype = dtype;
+  g_arange_cache.cached_device = device;
+
+  // Return slice of newly created tensor
+  return g_arange_cache.cached_tensor.slice(/*dim=*/0,
+                                            /*start=*/0,
+                                            /*end=*/size);
+}
+}  // namespace
+
 void beam_search(torch::Tensor acc_logprob,
                  torch::Tensor in_sequence_group,
                  torch::Tensor top_tokens,
@@ -38,13 +88,11 @@ void beam_search(torch::Tensor acc_logprob,
     out_token_ids.view({batch_size, beam_size}).copy_(tokens_view);
     out_acc_logprob.view({batch_size, beam_size}).copy_(init_probs_view);
 
-    auto indices =
-        torch::arange(
-            beam_size,
-            torch::TensorOptions().dtype(torch::kInt32).device(device))
-            .unsqueeze(0)
-            .expand({batch_size, -1})
-            .reshape({-1, 1});
+    // Use cached arange instead of torch::arange for CUDA Graph compatibility
+    auto indices = get_cached_arange(beam_size, torch::kInt32, device)
+                       .unsqueeze(0)
+                       .expand({batch_size, -1})
+                       .reshape({-1, 1});
     out_token_index.copy_(indices);
 
     auto sequence_view =
@@ -85,11 +133,10 @@ void beam_search(torch::Tensor acc_logprob,
 
     auto top_tokens_reshaped = top_tokens.view({batch_size, beam_size, top_k});
 
-    auto batch_idx =
-        torch::arange(batch_size,
-                      torch::TensorOptions().dtype(torch::kLong).device(device))
-            .unsqueeze(1)
-            .expand_as(parent_beam);
+    // Use cached arange instead of torch::arange for CUDA Graph compatibility
+    auto batch_idx = get_cached_arange(batch_size, torch::kLong, device)
+                         .unsqueeze(1)
+                         .expand_as(parent_beam);
 
     using torch::indexing::TensorIndex;
     auto new_tokens = top_tokens_reshaped.index({TensorIndex(batch_idx),
@@ -101,18 +148,13 @@ void beam_search(torch::Tensor acc_logprob,
         .copy_(new_indices.to(torch::kInt32));
     out_token_ids.view({batch_size, beam_size}).copy_(new_tokens);
 
-    auto batch_range =
-        torch::arange(
-            batch_size,
-            torch::TensorOptions().dtype(torch::kInt32).device(device))
-            .unsqueeze(1)
-            .expand({-1, beam_size});
-    auto beam_range =
-        torch::arange(
-            beam_size,
-            torch::TensorOptions().dtype(torch::kInt32).device(device))
-            .unsqueeze(0)
-            .expand({batch_size, -1});
+    // Use cached arange instead of torch::arange for CUDA Graph compatibility
+    auto batch_range = get_cached_arange(batch_size, torch::kInt32, device)
+                           .unsqueeze(1)
+                           .expand({-1, beam_size});
+    auto beam_range = get_cached_arange(beam_size, torch::kInt32, device)
+                          .unsqueeze(0)
+                          .expand({batch_size, -1});
 
     using torch::indexing::Slice;
     using torch::indexing::TensorIndex;
