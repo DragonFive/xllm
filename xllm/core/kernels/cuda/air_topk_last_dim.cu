@@ -589,7 +589,7 @@ __device__ void last_filter(T const* in_buf,
   IdxT* p_out_cnt = &counter->out_cnt;
   IdxT* p_out_back_cnt = &counter->out_back_cnt;
   IdxT* p_equal = out_idx + k - num_of_kth_needed;
-  cuda::atomic_ref<IdxT, cuda::thread_scope_block> ref_last(
+  ::cuda::atomic_ref<IdxT, ::cuda::thread_scope_block> ref_last(
       p_equal[num_of_kth_needed - 1]);
   for (IdxT i = threadIdx.x; i < current_len; i += blockDim.x) {
     const T value = in_buf[i];
@@ -612,7 +612,7 @@ __device__ void last_filter(T const* in_buf,
         }
       }
       if constexpr (prioritize_smaller_indice) {
-        if (new_idx < ref_last.load(cuda::memory_order_relaxed)) {
+        if (new_idx < ref_last.load(::cuda::memory_order_relaxed)) {
           for (int j = 0; j < num_of_kth_needed; j++) {
             IdxT pre_idx = atomicMin(&p_equal[j], new_idx);
             if (pre_idx > new_idx) {
@@ -667,7 +667,7 @@ __global__ void last_filter_kernel(T const* in,
   IdxT* p_out_cnt = &counter->out_cnt;
   IdxT* p_out_back_cnt = &counter->out_back_cnt;
   IdxT* p_equal = out_idx + k - num_of_kth_needed;
-  cuda::atomic_ref<IdxT> ref_last(p_equal[num_of_kth_needed - 1]);
+  ::cuda::atomic_ref<IdxT> ref_last(p_equal[num_of_kth_needed - 1]);
   auto f = [k,
             select_min,
             kth_value_bits,
@@ -695,7 +695,7 @@ __global__ void last_filter_kernel(T const* in,
         }
       }
       if constexpr (prioritize_smaller_indice) {
-        if (new_idx < ref_last.load(cuda::memory_order_relaxed)) {
+        if (new_idx < ref_last.load(::cuda::memory_order_relaxed)) {
           for (int j = 0; j < num_of_kth_needed; j++) {
             IdxT pre_idx = atomicMin(&p_equal[j], new_idx);
             if (pre_idx > new_idx) {
@@ -890,7 +890,7 @@ __global__ void radix_kernel(T const* in,
       const volatile IdxT num_of_kth_needed = counter->k;
       for (IdxT i = threadIdx.x; i < num_of_kth_needed; i += blockDim.x) {
         out_idx[k - num_of_kth_needed + i] =
-            cuda::std::numeric_limits<IdxT>::max();
+            ::cuda::std::numeric_limits<IdxT>::max();
       }
       __syncthreads();
       if constexpr (fused_last_filter) {
@@ -1203,7 +1203,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
         const IdxT num_of_kth_needed = counter.k;
         for (IdxT i = threadIdx.x; i < num_of_kth_needed; i += blockDim.x) {
           out_idx[k - num_of_kth_needed + i] =
-              cuda::std::numeric_limits<IdxT>::max();
+              ::cuda::std::numeric_limits<IdxT>::max();
         }
         __syncthreads();
       }
