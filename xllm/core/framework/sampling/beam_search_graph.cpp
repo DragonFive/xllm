@@ -108,13 +108,11 @@ void BeamSearchGraphPersistentParam::update(
       .slice(2, 0, rounds)
       .copy_(in_sequence_group, /*non_blocking=*/true);
 
-  // top_tokens: [actual_batch * actual_beam, actual_beam]
-  const uint32_t batch_beam = actual_batch * actual_beam;
+  const uint32_t batch_beam = static_cast<uint32_t>(top_tokens.size(0));
   persistent_top_tokens_.slice(0, 0, batch_beam)
       .slice(1, 0, actual_beam)
       .copy_(top_tokens, /*non_blocking=*/true);
 
-  // top_logprobs: [actual_batch * actual_beam, actual_beam]
   persistent_top_logprobs_.slice(0, 0, batch_beam)
       .slice(1, 0, actual_beam)
       .copy_(top_logprobs, /*non_blocking=*/true);
@@ -163,10 +161,10 @@ bool BeamSearchGraph::capture(
       persistent_param_.persistent_acc_logprob(bucket_batch, beam);
   auto in_sequence_group = persistent_param_.persistent_in_sequence_group(
       bucket_batch, beam, total_rounds);
-  auto top_tokens =
-      persistent_param_.persistent_top_tokens(bucket_batch * beam, beam);
+  const uint32_t batch_beam = (step == 0) ? bucket_batch : bucket_batch * beam;
+  auto top_tokens = persistent_param_.persistent_top_tokens(batch_beam, beam);
   auto top_logprobs =
-      persistent_param_.persistent_top_logprobs(bucket_batch * beam, beam);
+      persistent_param_.persistent_top_logprobs(batch_beam, beam);
   auto out_acc_logprob =
       persistent_param_.persistent_out_acc_logprob(bucket_batch, beam);
   auto out_token_ids =
