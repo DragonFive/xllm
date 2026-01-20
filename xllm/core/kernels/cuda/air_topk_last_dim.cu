@@ -64,6 +64,54 @@ torch::Tensor get_workspace(size_t required_bytes,
   return cache.buffer;
 }
 
+// Thread-local output cache per device for AIR TopK
+// Caches values and indices tensors to avoid repeated allocations
+struct OutputCache {
+  torch::Tensor values;
+  torch::Tensor indices;
+  int64_t batch = 0;
+  int64_t k = 0;
+  int device_index = -1;
+  torch::ScalarType dtype = torch::kFloat32;
+};
+
+// Get or create cached output tensors
+// Returns a pair of (values, indices) tensors with shape [batch, k]
+std::pair<torch::Tensor, torch::Tensor> get_cached_output(
+    int64_t batch,
+    int64_t k,
+    const torch::Device& device,
+    torch::ScalarType dtype) {
+  thread_local std::unordered_map<int, OutputCache> caches;
+
+  int dev_idx = device.index();
+  auto& cache = caches[dev_idx];
+
+  // Check if cache is valid (same batch, k, device, dtype)
+  bool need_realloc = (cache.batch < batch || cache.k < k ||
+                       cache.device_index != dev_idx || cache.dtype != dtype);
+
+  if (need_realloc) {
+    // Allocate new tensors (only when cache is insufficient)
+    cache.values = torch::empty(
+        {batch, k}, torch::TensorOptions().dtype(dtype).device(device));
+    cache.indices = torch::empty(
+        {batch, k}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+    cache.batch = batch;
+    cache.k = k;
+    cache.device_index = dev_idx;
+    cache.dtype = dtype;
+  }
+
+  // Return sliced view if current request is smaller than cached size
+  if (cache.batch == batch && cache.k == k) {
+    return {cache.values, cache.indices};
+  } else {
+    return {cache.values.slice(0, 0, batch).slice(1, 0, k),
+            cache.indices.slice(0, 0, batch).slice(1, 0, k)};
+  }
+}
+
 int get_multi_processor_count() {
   int device = 0;
   C10_CUDA_CHECK(cudaGetDevice(&device));
@@ -1784,10 +1832,8 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
   c10::cuda::CUDAGuard device_guard(input.device());
   auto in = input.contiguous();
 
-  auto values = torch::empty({batch64, static_cast<int64_t>(k)}, in.options());
-  auto indices = torch::empty(
-      {batch64, static_cast<int64_t>(k)},
-      torch::TensorOptions().dtype(torch::kInt64).device(in.device()));
+  auto [values, indices] = get_cached_output(
+      batch64, static_cast<int64_t>(k), in.device(), in.scalar_type());
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
