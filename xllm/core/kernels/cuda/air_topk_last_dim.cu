@@ -25,6 +25,7 @@
 #include <cuda/std/limits>
 #include <limits>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "air_topk_last_dim.h"
@@ -32,6 +33,36 @@
 namespace xllm::kernel::cuda {
 
 namespace {
+
+// Thread-local workspace cache per device for AIR TopK
+// This avoids repeated memory allocations which are the main performance
+// bottleneck
+struct WorkspaceCache {
+  torch::Tensor buffer;
+  size_t capacity = 0;
+  int device_index = -1;
+};
+
+// Get or create workspace with at least `required_bytes` capacity
+// Uses thread_local storage for thread safety without locks
+torch::Tensor get_workspace(size_t required_bytes,
+                            const torch::Device& device) {
+  thread_local std::unordered_map<int, WorkspaceCache> caches;
+
+  int dev_idx = device.index();
+  auto& cache = caches[dev_idx];
+
+  if (cache.capacity < required_bytes || cache.device_index != dev_idx) {
+    // Allocate new buffer (only when insufficient or device changed)
+    cache.buffer = torch::empty(
+        {static_cast<int64_t>(required_bytes)},
+        torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    cache.capacity = required_bytes;
+    cache.device_index = dev_idx;
+  }
+
+  return cache.buffer;
+}
 
 int get_multi_processor_count() {
   int device = 0;
@@ -1778,9 +1809,7 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_idx,
                                                        largest,
                                                        stream);
-      auto workspace = torch::empty(
-          {static_cast<int64_t>(workspace_bytes)},
-          torch::TensorOptions().dtype(torch::kUInt8).device(in.device()));
+      auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, true>(workspace.data_ptr(),
                                                        workspace_bytes,
                                                        in_ptr,
@@ -1802,9 +1831,7 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_idx,
                                                         largest,
                                                         stream);
-      auto workspace = torch::empty(
-          {static_cast<int64_t>(workspace_bytes)},
-          torch::TensorOptions().dtype(torch::kUInt8).device(in.device()));
+      auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, false>(workspace.data_ptr(),
                                                         workspace_bytes,
                                                         in_ptr,
@@ -1836,9 +1863,7 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_idx,
                                                        largest,
                                                        stream);
-      auto workspace = torch::empty(
-          {static_cast<int64_t>(workspace_bytes)},
-          torch::TensorOptions().dtype(torch::kUInt8).device(in.device()));
+      auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, true>(workspace.data_ptr(),
                                                        workspace_bytes,
                                                        in_ptr,
@@ -1860,9 +1885,7 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_idx,
                                                         largest,
                                                         stream);
-      auto workspace = torch::empty(
-          {static_cast<int64_t>(workspace_bytes)},
-          torch::TensorOptions().dtype(torch::kUInt8).device(in.device()));
+      auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, false>(workspace.data_ptr(),
                                                         workspace_bytes,
                                                         in_ptr,
@@ -1893,9 +1916,7 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                        out_idx,
                                                        largest,
                                                        stream);
-      auto workspace = torch::empty(
-          {static_cast<int64_t>(workspace_bytes)},
-          torch::TensorOptions().dtype(torch::kUInt8).device(in.device()));
+      auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, true>(workspace.data_ptr(),
                                                        workspace_bytes,
                                                        in_ptr,
@@ -1917,9 +1938,7 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
                                                         out_idx,
                                                         largest,
                                                         stream);
-      auto workspace = torch::empty(
-          {static_cast<int64_t>(workspace_bytes)},
-          torch::TensorOptions().dtype(torch::kUInt8).device(in.device()));
+      auto workspace = get_workspace(workspace_bytes, in.device());
       standalone_stable_radix_11bits<T, int64_t, false>(workspace.data_ptr(),
                                                         workspace_bytes,
                                                         in_ptr,
