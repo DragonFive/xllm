@@ -15,6 +15,7 @@
 
 #include "sampler_graph.h"
 
+#include <c10/cuda/CUDAGuard.h>
 #include <glog/logging.h>
 
 #include "core/common/global_flags.h"
@@ -132,7 +133,8 @@ bool SamplerGraph::capture(
 
   try {
     // 开始捕获 CUDA Graph
-    graph_.capture_begin(pool, capture_stream_);
+    c10::cuda::CUDAStreamGuard stream_guard(capture_stream_.value());
+    graph_.capture_begin(pool);
 
     // 根据不同模式捕获不同的计算图
     if (mode == SamplerGraphMode::BEAM_SEARCH_FAST_PATH) {

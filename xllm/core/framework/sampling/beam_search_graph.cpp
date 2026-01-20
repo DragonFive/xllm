@@ -15,10 +15,11 @@
 
 #include "beam_search_graph.h"
 
+#include <c10/cuda/CUDAGuard.h>
 #include <glog/logging.h>
 
-#include "core/common/global_flags.h"
-#include "core/kernels/cuda/beam_search.h"
+#include "common/global_flags.h"
+#include "kernels/cuda/cuda_ops_api.h"
 
 namespace xllm {
 
@@ -182,7 +183,8 @@ bool BeamSearchGraph::capture(
 
   try {
     // 开始捕获 CUDA Graph
-    graph_.capture_begin(pool, capture_stream_);
+    c10::cuda::CUDAStreamGuard stream_guard(capture_stream_.value());
+    graph_.capture_begin(pool);
 
     // 调用 beam_search kernel
     xllm::kernel::cuda::beam_search(acc_logprob,
@@ -209,12 +211,13 @@ bool BeamSearchGraph::capture(
   }
 }
 
-BeamSearchOutput BeamSearchGraph::replay(const torch::Tensor& acc_logprob,
-                                         const torch::Tensor& in_sequence_group,
-                                         const torch::Tensor& top_tokens,
-                                         const torch::Tensor& top_logprobs,
-                                         uint32_t batch_size,
-                                         uint32_t current_step) {
+BeamSearchGraphOutput BeamSearchGraph::replay(
+    const torch::Tensor& acc_logprob,
+    const torch::Tensor& in_sequence_group,
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    uint32_t batch_size,
+    uint32_t current_step) {
   const uint32_t beam_size = in_sequence_group.size(1);
 
   // 更新 persistent buffers
@@ -229,7 +232,7 @@ BeamSearchOutput BeamSearchGraph::replay(const torch::Tensor& acc_logprob,
   graph_.replay();
 
   // 从 persistent buffers 中提取结果（使用实际 batch_size）
-  BeamSearchOutput output;
+  BeamSearchGraphOutput output;
   output.out_acc_logprob =
       persistent_param_.persistent_out_acc_logprob(batch_size, beam_size)
           .clone();
@@ -311,7 +314,7 @@ uint32_t BeamSearchGraphExecutor::get_bucket_batch_size(
   }
 }
 
-BeamSearchOutput BeamSearchGraphExecutor::forward(
+BeamSearchGraphOutput BeamSearchGraphExecutor::forward(
     const torch::Tensor& acc_logprob,
     const torch::Tensor& in_sequence_group,
     const torch::Tensor& top_tokens,
@@ -324,7 +327,7 @@ BeamSearchOutput BeamSearchGraphExecutor::forward(
   // 判断是否使用 CUDA Graph
   if (!should_use_graph(batch_size, current_step)) {
     // 回退到 eager 模式（直接调用 beam_search kernel）
-    BeamSearchOutput output;
+    BeamSearchGraphOutput output;
     output.out_acc_logprob =
         torch::empty_like(acc_logprob, acc_logprob.options());
     output.out_token_ids = torch::empty({batch_size, beam_size},
@@ -381,7 +384,7 @@ BeamSearchOutput BeamSearchGraphExecutor::forward(
           << "BeamSearchGraphExecutor: Failed to capture graph, falling back "
              "to eager mode";
       // 回退到 eager 模式
-      BeamSearchOutput output;
+      BeamSearchGraphOutput output;
       output.out_acc_logprob =
           torch::empty_like(acc_logprob, acc_logprob.options());
       output.out_token_ids = torch::empty({batch_size, beam_size},

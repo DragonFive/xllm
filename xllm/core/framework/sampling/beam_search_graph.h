@@ -27,8 +27,8 @@
 
 namespace xllm {
 
-// BeamSearch 输出结构
-struct BeamSearchOutput {
+// BeamSearch CUDA Graph output structure
+struct BeamSearchGraphOutput {
   torch::Tensor out_acc_logprob;
   torch::Tensor out_token_ids;
   torch::Tensor out_token_index;
@@ -188,12 +188,12 @@ class BeamSearchGraph {
                const decltype(at::cuda::graph_pool_handle())& pool);
 
   // 重放捕获的计算图
-  BeamSearchOutput replay(const torch::Tensor& acc_logprob,
-                          const torch::Tensor& in_sequence_group,
-                          const torch::Tensor& top_tokens,
-                          const torch::Tensor& top_logprobs,
-                          uint32_t batch_size,
-                          uint32_t current_step);
+  BeamSearchGraphOutput replay(const torch::Tensor& acc_logprob,
+                               const torch::Tensor& in_sequence_group,
+                               const torch::Tensor& top_tokens,
+                               const torch::Tensor& top_logprobs,
+                               uint32_t batch_size,
+                               uint32_t current_step);
 
  private:
   // 初始化 capture stream
@@ -226,12 +226,12 @@ class BeamSearchGraphExecutor {
   ~BeamSearchGraphExecutor() = default;
 
   // 执行 beam_search（使用 CUDA Graph 或回退到 eager 模式）
-  BeamSearchOutput forward(const torch::Tensor& acc_logprob,
-                           const torch::Tensor& in_sequence_group,
-                           const torch::Tensor& top_tokens,
-                           const torch::Tensor& top_logprobs,
-                           uint32_t batch_size,
-                           uint32_t current_step);
+  BeamSearchGraphOutput forward(const torch::Tensor& acc_logprob,
+                                const torch::Tensor& in_sequence_group,
+                                const torch::Tensor& top_tokens,
+                                const torch::Tensor& top_logprobs,
+                                uint32_t batch_size,
+                                uint32_t current_step);
 
  private:
   // 判断是否应该使用 CUDA Graph

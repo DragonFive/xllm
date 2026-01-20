@@ -212,17 +212,17 @@ bool RecWorkerImpl::LlmRecPureDevicePipeline::create_model(
     const uint32_t max_k = 128;  // max_top_logprobs
 
     // Initialize BeamSearchGraphExecutor
-    if (FLAGS_enable_beam_search_graph && worker.device_.is_cuda()) {
+    if (FLAGS_enable_beam_search_graph && worker.device_.unwrap().is_cuda()) {
       beam_search_graph_executor_ = std::make_unique<BeamSearchGraphExecutor>(
-          max_batch, max_beam, max_rounds, worker.device_.torch_device());
+          max_batch, max_beam, max_rounds, worker.device_.unwrap());
       LOG(INFO)
           << "BeamSearchGraphExecutor initialized for CUDA Graph optimization";
     }
 
     // Initialize SamplerGraphExecutor
-    if (FLAGS_enable_sampler_graph && worker.device_.is_cuda()) {
+    if (FLAGS_enable_sampler_graph && worker.device_.unwrap().is_cuda()) {
       sampler_graph_executor_ = std::make_unique<SamplerGraphExecutor>(
-          max_batch, vocab_size, max_k, worker.device_.torch_device());
+          max_batch, vocab_size, max_k, worker.device_.unwrap());
       LOG(INFO)
           << "SamplerGraphExecutor initialized for CUDA Graph optimization";
     }
