@@ -58,6 +58,22 @@ struct TorchCudaScalar<at::BFloat16> {
 
 }  // namespace
 
+// 辅助函数:类型安全的原子加法(支持int64_t等任意整数类型)
+template <typename IdxT,
+          ::cuda::thread_scope Scope = ::cuda::thread_scope_device>
+__device__ __forceinline__ IdxT atomic_add_idx(IdxT* addr, IdxT val) {
+  ::cuda::atomic_ref<IdxT, Scope> ref(*addr);
+  return ref.fetch_add(val, ::cuda::memory_order_relaxed);
+}
+
+// 辅助函数:类型安全的原子最小值(支持int64_t等任意整数类型)
+template <typename IdxT,
+          ::cuda::thread_scope Scope = ::cuda::thread_scope_device>
+__device__ __forceinline__ IdxT atomic_min_idx(IdxT* addr, IdxT val) {
+  ::cuda::atomic_ref<IdxT, Scope> ref(*addr);
+  return ref.fetch_min(val, ::cuda::memory_order_relaxed);
+}
+
 namespace air_topk_stable {
 using WideT = float4;
 constexpr int VECTORIZED_READ_SIZE = 16;
@@ -405,7 +421,8 @@ __device__ void filter_and_histogram(T const* in_buf,
     auto f = [select_min, start_bit, mask](T value, IdxT) {
       int bucket =
           calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-      atomicAdd(histogram_smem + bucket, static_cast<IdxT>(1));
+      atomic_add_idx<IdxT, ::cuda::thread_scope_block>(histogram_smem + bucket,
+                                                       static_cast<IdxT>(1));
     };
     vectorized_process(
         static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
@@ -439,19 +456,20 @@ __device__ void filter_and_histogram(T const* in_buf,
           << previous_start_bit;
       if (previous_bits == kth_value_bits) {
         if (early_stop) {
-          IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+          IdxT pos = atomic_add_idx(p_out_cnt, static_cast<IdxT>(1));
           out[pos] = value;
           out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
         } else {
           if (out_buf) {
-            IdxT pos = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+            IdxT pos = atomic_add_idx(p_filter_cnt, static_cast<IdxT>(1));
             out_buf[pos] = value;
             out_idx_buf[pos] = in_idx_buf ? in_idx_buf[i] : i;
           }
 
           int bucket =
               calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-          atomicAdd(histogram_smem + bucket, static_cast<IdxT>(1));
+          atomic_add_idx<IdxT, ::cuda::thread_scope_block>(
+              histogram_smem + bucket, static_cast<IdxT>(1));
         }
       }
       // the condition `(out_buf || early_stop)` is a little tricky:
@@ -462,7 +480,7 @@ __device__ void filter_and_histogram(T const* in_buf,
       // when `early_stop` is true, we need to write to `out` since it's the
       // last chance.
       else if ((out_buf || early_stop) && previous_bits < kth_value_bits) {
-        IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+        IdxT pos = atomic_add_idx(p_out_cnt, static_cast<IdxT>(1));
         out[pos] = value;
         out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
       }
@@ -482,7 +500,7 @@ __device__ void filter_and_histogram(T const* in_buf,
   // merge histograms produced by individual blocks
   for (int i = threadIdx.x; i < num_buckets; i += blockDim.x) {
     if (histogram_smem[i] != 0) {
-      atomicAdd(histogram + i, histogram_smem[i]);
+      atomic_add_idx(histogram + i, histogram_smem[i]);
     }
   }
 }
@@ -595,7 +613,7 @@ __device__ void last_filter(T const* in_buf,
     const T value = in_buf[i];
     auto const bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
     if (bits < kth_value_bits) {
-      IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+      IdxT pos = atomic_add_idx(p_out_cnt, static_cast<IdxT>(1));
       out[pos] = value;
       // For one-block version, `in_idx_buf` could be nullptr at pass 0.
       // For non one-block version, if writing has been skipped, `in_idx_buf`
@@ -603,7 +621,7 @@ __device__ void last_filter(T const* in_buf,
       out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
     } else if (bits == kth_value_bits) {
       IdxT new_idx = in_idx_buf ? in_idx_buf[i] : i;
-      IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
+      IdxT back_pos = atomic_add_idx(p_out_back_cnt, static_cast<IdxT>(1));
       if (back_pos < num_of_kth_needed) {
         IdxT pos = k - 1 - back_pos;
         out[pos] = value;
@@ -614,7 +632,7 @@ __device__ void last_filter(T const* in_buf,
       if constexpr (prioritize_smaller_indice) {
         if (new_idx < ref_last.load(::cuda::memory_order_relaxed)) {
           for (int j = 0; j < num_of_kth_needed; j++) {
-            IdxT pre_idx = atomicMin(&p_equal[j], new_idx);
+            IdxT pre_idx = atomic_min_idx(&p_equal[j], new_idx);
             if (pre_idx > new_idx) {
               new_idx = pre_idx;
             }
@@ -681,12 +699,12 @@ __global__ void last_filter_kernel(T const* in,
             ref_last](T value, IdxT i) {
     const auto bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
     if (bits < kth_value_bits) {
-      IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+      IdxT pos = atomic_add_idx(p_out_cnt, static_cast<IdxT>(1));
       out[pos] = value;
       out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
     } else if (bits == kth_value_bits) {
       IdxT new_idx = in_idx_buf ? in_idx_buf[i] : i;
-      IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
+      IdxT back_pos = atomic_add_idx(p_out_back_cnt, static_cast<IdxT>(1));
       if (back_pos < num_of_kth_needed) {
         IdxT pos = k - 1 - back_pos;
         out[pos] = value;
@@ -697,7 +715,7 @@ __global__ void last_filter_kernel(T const* in,
       if constexpr (prioritize_smaller_indice) {
         if (new_idx < ref_last.load(::cuda::memory_order_relaxed)) {
           for (int j = 0; j < num_of_kth_needed; j++) {
-            IdxT pre_idx = atomicMin(&p_equal[j], new_idx);
+            IdxT pre_idx = atomic_min_idx(&p_equal[j], new_idx);
             if (pre_idx > new_idx) {
               new_idx = pre_idx;
             }
@@ -1055,7 +1073,8 @@ __device__ void filter_and_histogram_for_one_block(T const* in_buf,
     auto f = [histogram, select_min, start_bit, mask](T value, IdxT) {
       int bucket =
           calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-      atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+      atomic_add_idx<IdxT, ::cuda::thread_scope_block>(histogram + bucket,
+                                                       static_cast<IdxT>(1));
     };
     vectorized_process(threadIdx.x, blockDim.x, in_buf, previous_len, f);
   } else if (!out_buf) {
@@ -1071,7 +1090,8 @@ __device__ void filter_and_histogram_for_one_block(T const* in_buf,
       if (previous_bits == kth_value_bits) {
         int bucket =
             calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-        atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+        atomic_add_idx<IdxT, ::cuda::thread_scope_block>(histogram + bucket,
+                                                         static_cast<IdxT>(1));
       }
     }
   } else {
@@ -1090,15 +1110,16 @@ __device__ void filter_and_histogram_for_one_block(T const* in_buf,
         // Avoiding potential compiler bug in CUDA 11
         volatile
 #endif
-            IdxT pos = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+            IdxT pos = atomic_add_idx(p_filter_cnt, static_cast<IdxT>(1));
         out_buf[pos] = value;
         out_idx_buf[pos] = in_idx_buf ? in_idx_buf[i] : i;
 
         int bucket =
             calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-        atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+        atomic_add_idx<IdxT, ::cuda::thread_scope_block>(histogram + bucket,
+                                                         static_cast<IdxT>(1));
       } else if (previous_bits < kth_value_bits) {
-        IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+        IdxT pos = atomic_add_idx(p_out_cnt, static_cast<IdxT>(1));
         out[pos] = value;
         out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
       }
