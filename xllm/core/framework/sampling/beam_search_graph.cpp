@@ -51,11 +51,11 @@ BeamSearchGraphPersistentParam::BeamSearchGraphPersistentParam(
 
   // 输出张量
   persistent_out_acc_logprob_ =
-      torch::empty({max_batch, max_beam}, options.dtype(torch::kFloat32));
+      torch::empty({max_batch * max_beam, 1}, options.dtype(torch::kFloat32));
   persistent_out_token_ids_ =
-      torch::empty({max_batch, max_beam}, options.dtype(torch::kInt32));
+      torch::empty({max_batch * max_beam, 1}, options.dtype(torch::kInt32));
   persistent_out_token_index_ =
-      torch::empty({max_batch, max_beam}, options.dtype(torch::kInt32));
+      torch::empty({max_batch * max_beam, 1}, options.dtype(torch::kInt32));
   persistent_out_sequence_group_ = torch::empty(
       {max_batch, max_beam, max_rounds}, options.dtype(torch::kInt32));
 

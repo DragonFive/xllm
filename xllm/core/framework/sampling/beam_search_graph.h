@@ -93,14 +93,16 @@ class BeamSearchGraphPersistentParam {
   torch::Tensor persistent_out_acc_logprob(uint32_t batch,
                                            uint32_t beam) const {
     if (batch > 0 && beam > 0) {
-      return persistent_out_acc_logprob_.slice(0, 0, batch).slice(1, 0, beam);
+      const uint32_t batch_beam = batch * beam;
+      return persistent_out_acc_logprob_.slice(0, 0, batch_beam);
     }
     return persistent_out_acc_logprob_;
   }
 
   torch::Tensor persistent_out_token_ids(uint32_t batch, uint32_t beam) const {
     if (batch > 0 && beam > 0) {
-      return persistent_out_token_ids_.slice(0, 0, batch).slice(1, 0, beam);
+      const uint32_t batch_beam = batch * beam;
+      return persistent_out_token_ids_.slice(0, 0, batch_beam);
     }
     return persistent_out_token_ids_;
   }
@@ -108,7 +110,8 @@ class BeamSearchGraphPersistentParam {
   torch::Tensor persistent_out_token_index(uint32_t batch,
                                            uint32_t beam) const {
     if (batch > 0 && beam > 0) {
-      return persistent_out_token_index_.slice(0, 0, batch).slice(1, 0, beam);
+      const uint32_t batch_beam = batch * beam;
+      return persistent_out_token_index_.slice(0, 0, batch_beam);
     }
     return persistent_out_token_index_;
   }
@@ -160,9 +163,9 @@ class BeamSearchGraphPersistentParam {
   torch::Tensor persistent_top_logprobs_;  // [max_batch * max_beam, max_beam]
 
   // Persistent buffers - 输出张量
-  torch::Tensor persistent_out_acc_logprob_;  // [max_batch, max_beam]
-  torch::Tensor persistent_out_token_ids_;    // [max_batch, max_beam]
-  torch::Tensor persistent_out_token_index_;  // [max_batch, max_beam]
+  torch::Tensor persistent_out_acc_logprob_;  // [max_batch * max_beam, 1]
+  torch::Tensor persistent_out_token_ids_;    // [max_batch * max_beam, 1]
+  torch::Tensor persistent_out_token_index_;  // [max_batch * max_beam, 1]
   torch::Tensor
       persistent_out_sequence_group_;  // [max_batch, max_beam, max_rounds]
 
