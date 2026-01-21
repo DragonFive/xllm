@@ -96,10 +96,17 @@ void BeamSearchGraphPersistentParam::update(
   // 将实际输入数据复制到 persistent buffers 的对应位置
   // 使用 non_blocking=true 以提高性能
 
-  // acc_logprob: [actual_batch, actual_beam]
+  // acc_logprob: expected [actual_batch, actual_beam], but rec pipeline passes
+  // [actual_batch * actual_beam, 1]. Reshape if needed.
+  torch::Tensor acc_logprob_view = acc_logprob;
+  if (acc_logprob.dim() == 2 && acc_logprob.size(1) == 1 &&
+      acc_logprob.size(0) == static_cast<int64_t>(actual_batch * actual_beam)) {
+    acc_logprob_view = acc_logprob.view({static_cast<int64_t>(actual_batch),
+                                         static_cast<int64_t>(actual_beam)});
+  }
   persistent_acc_logprob_.slice(0, 0, actual_batch)
       .slice(1, 0, actual_beam)
-      .copy_(acc_logprob, /*non_blocking=*/true);
+      .copy_(acc_logprob_view, /*non_blocking=*/true);
 
   // in_sequence_group: [actual_batch, actual_beam, rounds]
   const uint32_t rounds = in_sequence_group.size(2);
