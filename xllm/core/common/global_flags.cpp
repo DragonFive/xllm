@@ -532,6 +532,13 @@ DEFINE_bool(enable_sampler_graph,
             "to reduce kernel launch overhead. Expected 20-40% latency "
             "reduction for greedy sampling.");
 
+DEFINE_bool(enable_beam_search_optimized,
+            false,
+            "Enable optimized beam search without ordering overhead. "
+            "Removes argsort/gather and uses unsorted topk. "
+            "Only effective in rec backend with pure_device mode. "
+            "Expected 15-25% latency reduction.");
+
 DEFINE_int32(beam_width, 1, "Beam width for beam search.");
 
 DEFINE_int64(max_token_per_req, 1024, "Max token per request.");
