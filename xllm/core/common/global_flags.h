@@ -249,7 +249,7 @@ DECLARE_bool(enable_constrained_decoding);
 
 DECLARE_int32(max_decode_rounds);
 
-DECLARE_bool(enable_beam_search_optimized);
+DECLARE_bool(enable_topk_sorted);
 
 DECLARE_int32(beam_width);
 

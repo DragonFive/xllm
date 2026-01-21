@@ -520,12 +520,11 @@ DEFINE_int32(max_decode_rounds,
              "Maximum number of decode rounds for multi-step decoding. "
              "0 means disabled.");
 
-DEFINE_bool(enable_beam_search_optimized,
+DEFINE_bool(enable_topk_sorted,
             false,
-            "Enable optimized beam search without ordering overhead. "
-            "Removes argsort/gather and uses unsorted topk. "
-            "Only effective in rec backend with pure_device mode. "
-            "Expected 15-25% latency reduction.");
+            "Controls topk output ordering. Beam search treats true as the "
+            "previous unsorted fast path (skip argsort/gather), while sampler "
+            "uses it as topk(sorted=...).");
 
 DEFINE_int32(beam_width, 1, "Beam width for beam search.");
 

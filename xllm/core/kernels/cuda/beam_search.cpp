@@ -55,7 +55,7 @@ void beam_search(torch::Tensor acc_logprob,
         (acc_logprob + top_logprobs).view({batch_size, beam_size * top_k});
 
     const bool enable_optimized =
-        FLAGS_enable_beam_search_optimized && FLAGS_max_decode_rounds > 0;
+        FLAGS_enable_topk_sorted && FLAGS_max_decode_rounds > 0;
     auto topk_result = torch::topk(combined_probs,
                                    beam_size,
                                    /*dim=*/-1,

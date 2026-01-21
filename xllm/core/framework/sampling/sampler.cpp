@@ -63,7 +63,7 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
         sample_logits.topk(params.max_top_logprobs,
                            /*dim=*/-1,
                            /*largest=*/true,
-                           /*sorted=*/false);
+                           /*sorted=*/FLAGS_enable_topk_sorted);
 
     torch::Tensor topk_logits = topk_values.to(torch::kFloat32);
 
