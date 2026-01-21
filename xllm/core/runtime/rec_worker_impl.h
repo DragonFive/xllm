@@ -24,8 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/rec_model_utils.h"
-#include "framework/sampling/beam_search_graph.h"
-#include "framework/sampling/sampler_graph.h"
+#include "framework/sampling/beam_search_sampler_graph.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/threadpool.h"
 
@@ -233,9 +232,9 @@ class RecWorkerImpl : public LLMWorkerImpl {
                                   worker_.options_.max_token_per_req()};
     int32_t beam_width_{worker_.options_.beam_width()};
 
-    // CUDA Graph executors for performance optimization
-    std::unique_ptr<BeamSearchGraphExecutor> beam_search_graph_executor_;
-    std::unique_ptr<SamplerGraphExecutor> sampler_graph_executor_;
+    // CUDA Graph executor for combined beamsearch + sampler optimization
+    std::unique_ptr<BeamSearchSamplerGraphExecutor>
+        beam_search_sampler_graph_executor_;
   };
 
   // Factory method to create pipeline (can access private classes)

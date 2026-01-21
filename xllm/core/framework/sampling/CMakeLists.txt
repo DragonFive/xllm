@@ -10,6 +10,7 @@ cc_library(
     rejection_sampler.h
     sampler.h
     beam_searcher.h
+    beam_search_sampler_graph.h
     beam_search_graph.h
     sampler_graph.h
     rec_constrained_decoding.h
@@ -19,6 +20,7 @@ cc_library(
     rejection_sampler.cpp
     sampler.cpp
     beam_searcher.cpp
+    beam_search_sampler_graph.cpp
     beam_search_graph.cpp
     sampler_graph.cpp
     rec_constrained_decoding.cpp
