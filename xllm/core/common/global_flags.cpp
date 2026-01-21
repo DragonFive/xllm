@@ -520,6 +520,18 @@ DEFINE_int32(max_decode_rounds,
              "Maximum number of decode rounds for multi-step decoding. "
              "0 means disabled.");
 
+DEFINE_bool(enable_beam_search_graph,
+            false,
+            "Enable CUDA Graph for beam search to reduce kernel launch "
+            "overhead. Expected 30-50% latency reduction for multi-round "
+            "decode scenarios.");
+
+DEFINE_bool(enable_sampler_graph,
+            false,
+            "Enable CUDA Graph for sampler (greedy and beamsearch fast path) "
+            "to reduce kernel launch overhead. Expected 20-40% latency "
+            "reduction for greedy sampling.");
+
 DEFINE_bool(enable_topk_sorted,
             false,
             "Controls topk output ordering. Beam search treats true as the "
