@@ -19,6 +19,7 @@
 #include <glog/logging.h>
 
 #include "common/global_flags.h"
+#include "framework/model/causal_lm.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/air_log_softmax_last_dim.h"
 #include "kernels/cuda/air_topk_last_dim.h"
@@ -35,22 +36,25 @@ BeamSearchSamplerGraphPersistentParam::BeamSearchSamplerGraphPersistentParam(
     uint32_t max_batch,
     uint32_t max_beam,
     uint32_t max_rounds,
-    uint32_t max_vocab,
+    uint32_t hidden_size,
+    torch::ScalarType hidden_dtype,
     const torch::Device& device)
     : device_(device),
       max_batch_(max_batch),
       max_beam_(max_beam),
       max_rounds_(max_rounds),
-      max_vocab_(max_vocab),
+      hidden_size_(hidden_size),
       max_batch_beam_(max_batch * max_beam) {
   auto options = torch::TensorOptions().device(device);
 
-  persistent_logits_ = torch::empty({max_batch_beam_, max_vocab_},
-                                    options.dtype(torch::kFloat32));
+  persistent_hidden_states_ = torch::empty({max_batch_beam_, hidden_size_},
+                                           options.dtype(hidden_dtype));
+  persistent_selected_token_idxes_ =
+      torch::empty({max_batch_beam_}, options.dtype(torch::kInt32));
   persistent_top_values_ = torch::empty({max_batch_beam_, max_beam_},
                                         options.dtype(torch::kFloat32));
   persistent_top_indices_ =
-      torch::empty({max_batch_beam_, max_beam_}, options.dtype(torch::kInt64));
+      torch::empty({max_batch_beam_, max_beam_}, options.dtype(torch::kInt32));
   persistent_top_logprobs_ = torch::empty({max_batch_beam_, max_beam_},
                                           options.dtype(torch::kFloat32));
   persistent_temperatures_ =
@@ -72,22 +76,23 @@ BeamSearchSamplerGraphPersistentParam::BeamSearchSamplerGraphPersistentParam(
 
   LOG(INFO) << "BeamSearchSamplerGraphPersistentParam initialized: max_batch="
             << max_batch_ << ", max_beam=" << max_beam_
-            << ", max_rounds=" << max_rounds_ << ", max_vocab=" << max_vocab_;
+            << ", max_rounds=" << max_rounds_
+            << ", hidden_size=" << hidden_size_
+            << ", hidden_dtype=" << static_cast<int>(hidden_dtype);
 }
 
 void BeamSearchSamplerGraphPersistentParam::update(
-    const torch::Tensor& logits,
+    const torch::Tensor& hidden_states,
     const SamplingParameters& params,
     const torch::Tensor& acc_logprob,
     const torch::Tensor& in_sequence_group,
     uint32_t actual_batch,
     uint32_t actual_beam) {
   const uint32_t batch_beam = actual_batch * actual_beam;
-  const uint32_t vocab = logits.size(1);
-
-  persistent_logits_.slice(0, 0, batch_beam)
-      .slice(1, 0, vocab)
-      .copy_(logits, /*non_blocking=*/true);
+  persistent_hidden_states_.slice(0, 0, batch_beam)
+      .copy_(hidden_states, /*non_blocking=*/true);
+  persistent_selected_token_idxes_.slice(0, 0, batch_beam)
+      .copy_(params.selected_token_idxes, /*non_blocking=*/true);
 
   torch::Tensor acc_logprob_view = acc_logprob;
   if (acc_logprob.dim() == 2 && acc_logprob.size(1) != 1) {
@@ -129,12 +134,12 @@ void BeamSearchSamplerGraph::initialize_capture_stream(
 }
 
 bool BeamSearchSamplerGraph::capture(
+    CausalLM* model,
     uint32_t batch,
     uint32_t beam,
     uint32_t step,
     uint32_t total_rounds,
     uint32_t bucket_batch,
-    uint32_t vocab_size,
     const SamplingParameters& params,
     const decltype(at::cuda::graph_pool_handle())& pool) {
   initialize_capture_stream(device_index_);
@@ -148,8 +153,10 @@ bool BeamSearchSamplerGraph::capture(
             << ", beam=" << beam << ", step=" << step
             << ", total_rounds=" << total_rounds;
 
-  auto logits =
-      persistent_param_.persistent_logits(bucket_batch_beam, vocab_size);
+  auto hidden_states =
+      persistent_param_.persistent_hidden_states(bucket_batch_beam);
+  auto selected_token_idxes =
+      persistent_param_.persistent_selected_token_idxes(bucket_batch_beam);
   auto acc_logprob =
       persistent_param_.persistent_acc_logprob(bucket_batch_beam);
   auto in_sequence_group = persistent_param_.persistent_in_sequence_group(
@@ -168,29 +175,32 @@ bool BeamSearchSamplerGraph::capture(
   auto out_sequence_group = persistent_param_.persistent_out_sequence_group(
       bucket_batch, beam, total_rounds);
 
-  auto out_beam_count_prefix_sums = torch::empty(
-      {bucket_batch + 1},
-      torch::TensorOptions().device(logits.device()).dtype(torch::kInt32));
+  out_beam_count_prefix_sums_ = torch::empty({bucket_batch + 1},
+                                             torch::TensorOptions()
+                                                 .device(hidden_states.device())
+                                                 .dtype(torch::kInt32));
 
   try {
     c10::cuda::CUDAStreamGuard stream_guard(capture_stream_.value());
     graph_.capture_begin(pool);
 
+    logits_buf_ = model->logits(hidden_states, selected_token_idxes);
+
     torch::Tensor top_values;
     torch::Tensor top_indices;
 #if defined(USE_CUDA)
-    if (FLAGS_enable_air_topk && logits.is_cuda()) {
+    if (FLAGS_enable_air_topk && logits_buf_.is_cuda()) {
       std::tie(top_values, top_indices) = xllm::kernel::cuda::air_topk_last_dim(
-          logits,
+          logits_buf_,
           static_cast<int32_t>(beam),
           /*largest=*/true,
           /*sorted_by_value=*/FLAGS_enable_topk_sorted);
     } else {
 #endif
-      auto topk_result = logits.topk(beam,
-                                     /*dim=*/-1,
-                                     /*largest=*/true,
-                                     /*sorted=*/FLAGS_enable_topk_sorted);
+      auto topk_result = logits_buf_.topk(beam,
+                                          /*dim=*/-1,
+                                          /*largest=*/true,
+                                          /*sorted=*/FLAGS_enable_topk_sorted);
       top_values = std::get<0>(topk_result);
       top_indices = std::get<1>(topk_result);
 #if defined(USE_CUDA)
@@ -235,7 +245,7 @@ bool BeamSearchSamplerGraph::capture(
                                     out_acc_logprob,
                                     out_token_ids,
                                     out_token_index,
-                                    out_beam_count_prefix_sums,
+                                    out_beam_count_prefix_sums_,
                                     out_sequence_group,
                                     bucket_batch,
                                     step);
@@ -254,7 +264,7 @@ bool BeamSearchSamplerGraph::capture(
 }
 
 BeamSearchSamplerGraphOutput BeamSearchSamplerGraph::replay(
-    const torch::Tensor& logits,
+    const torch::Tensor& hidden_states,
     const SamplingParameters& params,
     const torch::Tensor& acc_logprob,
     const torch::Tensor& in_sequence_group,
@@ -263,27 +273,28 @@ BeamSearchSamplerGraphOutput BeamSearchSamplerGraph::replay(
     uint32_t current_step) {
   const uint32_t batch_beam = batch_size * beam_size;
 
-  persistent_param_.update(
-      logits, params, acc_logprob, in_sequence_group, batch_size, beam_size);
+  persistent_param_.update(hidden_states,
+                           params,
+                           acc_logprob,
+                           in_sequence_group,
+                           batch_size,
+                           beam_size);
 
   graph_.replay();
 
   BeamSearchSamplerGraphOutput output;
+  output.logits = logits_buf_.slice(0, 0, batch_beam);
   output.top_tokens =
-      persistent_param_.persistent_top_indices(batch_beam, beam_size).clone();
+      persistent_param_.persistent_top_indices(batch_beam, beam_size);
   output.top_logprobs =
-      persistent_param_.persistent_top_logprobs(batch_beam, beam_size).clone();
+      persistent_param_.persistent_top_logprobs(batch_beam, beam_size);
   output.out_acc_logprob =
-      persistent_param_.persistent_out_acc_logprob(batch_beam).clone();
-  output.out_token_ids =
-      persistent_param_.persistent_out_token_ids(batch_beam).clone();
+      persistent_param_.persistent_out_acc_logprob(batch_beam);
+  output.out_token_ids = persistent_param_.persistent_out_token_ids(batch_beam);
   output.out_token_index =
-      persistent_param_.persistent_out_token_index(batch_beam).clone();
-  output.out_sequence_group =
-      persistent_param_
-          .persistent_out_sequence_group(
-              batch_size, beam_size, in_sequence_group.size(2))
-          .clone();
+      persistent_param_.persistent_out_token_index(batch_beam);
+  output.out_sequence_group = persistent_param_.persistent_out_sequence_group(
+      batch_size, beam_size, in_sequence_group.size(2));
 
   return output;
 }
@@ -293,24 +304,28 @@ BeamSearchSamplerGraphOutput BeamSearchSamplerGraph::replay(
 // ============================================================================
 
 BeamSearchSamplerGraphExecutor::BeamSearchSamplerGraphExecutor(
+    CausalLM* model,
     uint32_t max_batch,
     uint32_t max_beam,
     uint32_t max_rounds,
-    uint32_t max_vocab,
+    uint32_t hidden_size,
+    torch::ScalarType hidden_dtype,
     const torch::Device& device)
-    : device_(device),
+    : model_(model),
+      device_(device),
       max_batch_(max_batch),
       max_beam_(max_beam),
       max_rounds_(max_rounds),
-      max_vocab_(max_vocab) {
+      hidden_size_(hidden_size),
+      hidden_dtype_(hidden_dtype) {
   persistent_param_ = std::make_unique<BeamSearchSamplerGraphPersistentParam>(
-      max_batch, max_beam, max_rounds, max_vocab, device);
+      max_batch, max_beam, max_rounds, hidden_size, hidden_dtype, device);
 
   graph_pool_ = at::cuda::graph_pool_handle();
 
   LOG(INFO) << "BeamSearchSamplerGraphExecutor initialized: max_batch="
             << max_batch << ", max_beam=" << max_beam
-            << ", max_rounds=" << max_rounds << ", max_vocab=" << max_vocab;
+            << ", max_rounds=" << max_rounds << ", hidden_size=" << hidden_size;
 }
 
 bool BeamSearchSamplerGraphExecutor::should_use_graph(
@@ -318,12 +333,20 @@ bool BeamSearchSamplerGraphExecutor::should_use_graph(
     uint32_t batch_size,
     uint32_t beam_size,
     uint32_t total_rounds,
-    const torch::Tensor& logits) const {
+    const torch::Tensor& hidden_states) const {
+  if (model_ == nullptr) {
+    return false;
+  }
+
   if (!FLAGS_enable_beam_search_graph || !FLAGS_enable_sampler_graph) {
     return false;
   }
 
   if (!device_.is_cuda()) {
+    return false;
+  }
+
+  if (!params.selected_token_idxes.defined()) {
     return false;
   }
 
@@ -339,6 +362,14 @@ bool BeamSearchSamplerGraphExecutor::should_use_graph(
     return false;
   }
 
+  if (hidden_states.dim() != 2) {
+    return false;
+  }
+
+  if (hidden_states.size(1) != static_cast<int64_t>(hidden_size_)) {
+    return false;
+  }
+
   // BeamSearch fast path constraints
   if (!params.use_beam_search || !params.logprobs ||
       params.max_top_logprobs <= 0 || params.top_p.defined() ||
@@ -351,7 +382,13 @@ bool BeamSearchSamplerGraphExecutor::should_use_graph(
   }
 
   const uint32_t expected_batch_beam = batch_size * beam_size;
-  if (logits.size(0) != static_cast<int64_t>(expected_batch_beam)) {
+  if (hidden_states.size(0) != static_cast<int64_t>(expected_batch_beam)) {
+    return false;
+  }
+
+  if (params.selected_token_idxes.defined() &&
+      params.selected_token_idxes.numel() !=
+          static_cast<int64_t>(expected_batch_beam)) {
     return false;
   }
 
@@ -378,7 +415,7 @@ uint32_t BeamSearchSamplerGraphExecutor::get_bucket_batch_size(
 }
 
 std::optional<BeamSearchSamplerGraphOutput>
-BeamSearchSamplerGraphExecutor::forward(torch::Tensor& logits,
+BeamSearchSamplerGraphExecutor::forward(const torch::Tensor& hidden_states,
                                         const SamplingParameters& params,
                                         const torch::Tensor& acc_logprob,
                                         const torch::Tensor& in_sequence_group,
@@ -387,7 +424,8 @@ BeamSearchSamplerGraphExecutor::forward(torch::Tensor& logits,
                                         uint32_t current_step) {
   const uint32_t total_rounds = in_sequence_group.size(2);
 
-  if (!should_use_graph(params, batch_size, beam_size, total_rounds, logits)) {
+  if (!should_use_graph(
+          params, batch_size, beam_size, total_rounds, hidden_states)) {
     return std::nullopt;
   }
 
@@ -405,12 +443,12 @@ BeamSearchSamplerGraphExecutor::forward(torch::Tensor& logits,
     auto graph = std::make_unique<BeamSearchSamplerGraph>(*persistent_param_,
                                                           device_.index());
 
-    bool success = graph->capture(bucket_batch,
+    bool success = graph->capture(model_,
+                                  bucket_batch,
                                   beam_size,
                                   current_step,
                                   total_rounds,
                                   bucket_batch,
-                                  logits.size(1),
                                   params,
                                   graph_pool_);
 
@@ -424,7 +462,7 @@ BeamSearchSamplerGraphExecutor::forward(torch::Tensor& logits,
     it = graphs_.emplace(graph_key, std::move(graph)).first;
   }
 
-  return it->second->replay(logits,
+  return it->second->replay(hidden_states,
                             params,
                             acc_logprob,
                             in_sequence_group,

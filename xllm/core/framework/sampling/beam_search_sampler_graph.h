@@ -29,8 +29,11 @@
 
 namespace xllm {
 
+class CausalLM;
+
 // BeamSearch + Sampler CUDA Graph output structure
 struct BeamSearchSamplerGraphOutput {
+  torch::Tensor logits;
   torch::Tensor top_tokens;
   torch::Tensor top_logprobs;
   torch::Tensor out_acc_logprob;
@@ -45,23 +48,31 @@ class BeamSearchSamplerGraphPersistentParam {
   BeamSearchSamplerGraphPersistentParam(uint32_t max_batch,
                                         uint32_t max_beam,
                                         uint32_t max_rounds,
-                                        uint32_t max_vocab,
+                                        uint32_t hidden_size,
+                                        torch::ScalarType hidden_dtype,
                                         const torch::Device& device);
 
   ~BeamSearchSamplerGraphPersistentParam() = default;
 
-  void update(const torch::Tensor& logits,
+  void update(const torch::Tensor& hidden_states,
               const SamplingParameters& params,
               const torch::Tensor& acc_logprob,
               const torch::Tensor& in_sequence_group,
               uint32_t actual_batch,
               uint32_t actual_beam);
 
-  torch::Tensor persistent_logits(uint32_t batch_beam, uint32_t vocab) const {
-    if (batch_beam > 0 && vocab > 0) {
-      return persistent_logits_.slice(0, 0, batch_beam).slice(1, 0, vocab);
+  torch::Tensor persistent_hidden_states(uint32_t batch_beam) const {
+    if (batch_beam > 0) {
+      return persistent_hidden_states_.slice(0, 0, batch_beam);
     }
-    return persistent_logits_;
+    return persistent_hidden_states_;
+  }
+
+  torch::Tensor persistent_selected_token_idxes(uint32_t batch_beam) const {
+    if (batch_beam > 0) {
+      return persistent_selected_token_idxes_.slice(0, 0, batch_beam);
+    }
+    return persistent_selected_token_idxes_;
   }
 
   torch::Tensor persistent_top_values(uint32_t batch_beam,
@@ -150,15 +161,16 @@ class BeamSearchSamplerGraphPersistentParam {
   uint32_t max_batch_;
   uint32_t max_beam_;
   uint32_t max_rounds_;
-  uint32_t max_vocab_;
+  uint32_t hidden_size_;
   uint32_t max_batch_beam_;
 
-  torch::Tensor persistent_logits_;             // [max_batch_beam, max_vocab]
-  torch::Tensor persistent_top_values_;         // [max_batch_beam, max_beam]
-  torch::Tensor persistent_top_indices_;        // [max_batch_beam, max_beam]
-  torch::Tensor persistent_top_logprobs_;       // [max_batch_beam, max_beam]
-  torch::Tensor persistent_temperatures_;       // [max_batch_beam]
-  torch::Tensor persistent_acc_logprob_;        // [max_batch_beam, 1]
+  torch::Tensor persistent_hidden_states_;  // [max_batch_beam, hidden_size]
+  torch::Tensor persistent_selected_token_idxes_;  // [max_batch_beam]
+  torch::Tensor persistent_top_values_;            // [max_batch_beam, max_beam]
+  torch::Tensor persistent_top_indices_;           // [max_batch_beam, max_beam]
+  torch::Tensor persistent_top_logprobs_;          // [max_batch_beam, max_beam]
+  torch::Tensor persistent_temperatures_;          // [max_batch_beam]
+  torch::Tensor persistent_acc_logprob_;           // [max_batch_beam, 1]
   torch::Tensor persistent_in_sequence_group_;  // [max_batch, max_beam, rounds]
 
   torch::Tensor persistent_out_acc_logprob_;  // [max_batch_beam, 1]
@@ -175,16 +187,16 @@ class BeamSearchSamplerGraph {
       BeamSearchSamplerGraphPersistentParam& persistent_param,
       c10::DeviceIndex device_index);
 
-  bool capture(uint32_t batch,
+  bool capture(CausalLM* model,
+               uint32_t batch,
                uint32_t beam,
                uint32_t step,
                uint32_t total_rounds,
                uint32_t bucket_batch,
-               uint32_t vocab_size,
                const SamplingParameters& params,
                const decltype(at::cuda::graph_pool_handle())& pool);
 
-  BeamSearchSamplerGraphOutput replay(const torch::Tensor& logits,
+  BeamSearchSamplerGraphOutput replay(const torch::Tensor& hidden_states,
                                       const SamplingParameters& params,
                                       const torch::Tensor& acc_logprob,
                                       const torch::Tensor& in_sequence_group,
@@ -199,6 +211,9 @@ class BeamSearchSamplerGraph {
 
   BeamSearchSamplerGraphPersistentParam& persistent_param_;
 
+  torch::Tensor logits_buf_;
+  torch::Tensor out_beam_count_prefix_sums_;
+
   uint32_t bucket_batch_;
   uint32_t current_step_;
   uint32_t total_rounds_;
@@ -210,16 +225,18 @@ class BeamSearchSamplerGraph {
 // BeamSearch + Sampler CUDA Graph Executor
 class BeamSearchSamplerGraphExecutor {
  public:
-  BeamSearchSamplerGraphExecutor(uint32_t max_batch,
+  BeamSearchSamplerGraphExecutor(CausalLM* model,
+                                 uint32_t max_batch,
                                  uint32_t max_beam,
                                  uint32_t max_rounds,
-                                 uint32_t max_vocab,
+                                 uint32_t hidden_size,
+                                 torch::ScalarType hidden_dtype,
                                  const torch::Device& device);
 
   ~BeamSearchSamplerGraphExecutor() = default;
 
   std::optional<BeamSearchSamplerGraphOutput> forward(
-      torch::Tensor& logits,
+      const torch::Tensor& hidden_states,
       const SamplingParameters& params,
       const torch::Tensor& acc_logprob,
       const torch::Tensor& in_sequence_group,
@@ -232,9 +249,11 @@ class BeamSearchSamplerGraphExecutor {
                         uint32_t batch_size,
                         uint32_t beam_size,
                         uint32_t total_rounds,
-                        const torch::Tensor& logits) const;
+                        const torch::Tensor& hidden_states) const;
 
   uint32_t get_bucket_batch_size(uint32_t batch_size) const;
+
+  CausalLM* model_;
 
   std::unique_ptr<BeamSearchSamplerGraphPersistentParam> persistent_param_;
 
@@ -248,7 +267,8 @@ class BeamSearchSamplerGraphExecutor {
   uint32_t max_batch_;
   uint32_t max_beam_;
   uint32_t max_rounds_;
-  uint32_t max_vocab_;
+  uint32_t hidden_size_;
+  torch::ScalarType hidden_dtype_;
 };
 
 }  // namespace xllm

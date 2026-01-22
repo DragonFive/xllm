@@ -299,20 +299,24 @@ bool RecWorkerImpl::LlmRecPureDevicePipeline::create_model(
   if (success) {
     // Initialize CUDA Graph executors after model is created
     const auto& model_args = context.get_model_args();
-    const uint32_t vocab_size = model_args.vocab_size();
+    const uint32_t hidden_size =
+        static_cast<uint32_t>(model_args.hidden_size());
     const uint32_t max_batch = worker.options_.max_seqs_per_batch();
     const uint32_t max_beam = worker.options_.beam_width();
     const uint32_t max_rounds = FLAGS_max_decode_rounds;
+    const auto hidden_dtype = worker.dtype();
 
     // Initialize combined BeamSearch + Sampler CUDA Graph executor
     if (FLAGS_enable_beam_search_graph && FLAGS_enable_sampler_graph &&
         worker.device_.unwrap().is_cuda()) {
       beam_search_sampler_graph_executor_ =
           std::make_unique<BeamSearchSamplerGraphExecutor>(
+              worker.model_.get(),
               max_batch,
               max_beam,
               max_rounds,
-              vocab_size,
+              hidden_size,
+              hidden_dtype,
               worker.device_.unwrap());
       LOG(INFO) << "BeamSearchSamplerGraphExecutor initialized for CUDA Graph "
                    "optimization";
@@ -550,8 +554,6 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     }
 
     if (sampling_params.selected_token_idxes.defined()) {
-      logits = worker_.model_->logits(hidden_states,
-                                      sampling_params.selected_token_idxes);
       // Use combined BeamSearch + Sampler CUDA Graph if available.
       if (beam_search_sampler_graph_executor_) {
         NvtxRange range("rsg",
@@ -560,7 +562,7 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                         beam_sampler_graph_enabled,
                         round);
         auto graph_output = beam_search_sampler_graph_executor_->forward(
-            logits,
+            hidden_states,
             sampling_params,
             beam_tensors.acc_logprob,
             beam_tensors.sequence_group,
@@ -570,9 +572,18 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
         if (graph_output.has_value()) {
           used_combined_graph = true;
           sample_output.top_tokens = graph_output->top_tokens;
-          sample_output.top_logprobs = graph_output->top_logprobs;
-          top_tokens = sample_output.top_tokens.to(torch::kInt32)
-                           .reshape({-1, beam_width});
+          sample_output.top_logprobs = graph_output->top_logprobs.clone();
+          top_tokens = graph_output->top_tokens.reshape({-1, beam_width});
+          // Keep SampleOutput semantics consistent with eager sampler:
+          // top_tokens is expected to be a LongTensor.
+          if (sample_output.top_tokens.scalar_type() != torch::kLong) {
+            sample_output.top_tokens =
+                sample_output.top_tokens.to(torch::kLong);
+          }
+          // Graph path does not return an owning logits tensor (graph replays
+          // will overwrite the internal buffer). Leave output.logits empty to
+          // avoid returning a tensor with unstable lifetime.
+          logits = torch::Tensor();
           beam_tensors.out_log_probs.copy_(graph_output->out_acc_logprob,
                                            /*non_blocking=*/true);
           beam_tensors.out_token_ids.copy_(graph_output->out_token_ids,
@@ -585,6 +596,8 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
       }
 
       if (!used_combined_graph) {
+        logits = worker_.model_->logits(hidden_states,
+                                        sampling_params.selected_token_idxes);
         NvtxRange range("rsamp",
                         is_multi_stream,
                         graph_enabled,
