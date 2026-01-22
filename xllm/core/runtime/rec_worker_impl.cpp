@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -27,6 +29,12 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/metrics.h"
 #include "common/types.h"
+#if defined(USE_CUDA) && __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define XLLM_NVTX_ENABLED 1
+#else
+#define XLLM_NVTX_ENABLED 0
+#endif
 #include "framework/model/model_input_params.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/cuda_ops_api.h"
@@ -39,6 +47,92 @@ limitations under the License.
 DEFINE_int32(max_batch_size, 20, "max batch size");
 
 namespace xllm {
+
+namespace {
+constexpr uint32_t kNvtxColorForward = 0xFF4CAF50;
+constexpr uint32_t kNvtxColorSampler = 0xFF42A5F5;
+constexpr uint32_t kNvtxColorBeam = 0xFFFF7043;
+constexpr uint32_t kNvtxColorGraph = 0xFF7E57C2;
+constexpr uint32_t kNvtxColorDefault = 0xFF9E9E9E;
+
+constexpr uint64_t kNvtxPayloadMultiStream = 1ull << 0;
+constexpr uint64_t kNvtxPayloadGraph = 1ull << 1;
+constexpr uint64_t kNvtxPayloadBeamSamplerGraph = 1ull << 2;
+constexpr uint64_t kNvtxPayloadRoundShift = 16;
+
+uint32_t MakeNvtxColor(const char* name) {
+  if (std::strcmp(name, "rfwd") == 0) {
+    return kNvtxColorForward;
+  }
+  if (std::strcmp(name, "rsamp") == 0) {
+    return kNvtxColorSampler;
+  }
+  if (std::strcmp(name, "rbeam") == 0) {
+    return kNvtxColorBeam;
+  }
+  if (std::strcmp(name, "rsg") == 0) {
+    return kNvtxColorGraph;
+  }
+  return kNvtxColorDefault;
+}
+
+uint64_t MakeNvtxPayload(bool is_multi_stream,
+                         bool graph_enabled,
+                         bool beam_sampler_graph_enabled,
+                         int32_t round) {
+  uint64_t payload = 0;
+  if (is_multi_stream) {
+    payload |= kNvtxPayloadMultiStream;
+  }
+  if (graph_enabled) {
+    payload |= kNvtxPayloadGraph;
+  }
+  if (beam_sampler_graph_enabled) {
+    payload |= kNvtxPayloadBeamSamplerGraph;
+  }
+  payload |= (static_cast<uint64_t>(static_cast<uint32_t>(round) & 0xFFFF)
+              << kNvtxPayloadRoundShift);
+  return payload;
+}
+
+class NvtxRange {
+ public:
+  NvtxRange(const char* name,
+            bool is_multi_stream,
+            bool graph_enabled,
+            bool beam_sampler_graph_enabled,
+            int32_t round)
+      : name_(name) {
+#if XLLM_NVTX_ENABLED
+    nvtxEventAttributes_t attr{};
+    attr.version = NVTX_VERSION;
+    attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.colorType = NVTX_COLOR_ARGB;
+    attr.color = MakeNvtxColor(name);
+    attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    attr.message.ascii = name_;
+    attr.payloadType = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
+    attr.payload.ullValue = MakeNvtxPayload(
+        is_multi_stream, graph_enabled, beam_sampler_graph_enabled, round);
+    nvtxRangePushEx(&attr);
+#else
+    (void)is_multi_stream;
+    (void)graph_enabled;
+    (void)beam_sampler_graph_enabled;
+    (void)round;
+#endif
+  }
+
+  ~NvtxRange() {
+#if XLLM_NVTX_ENABLED
+    nvtxRangePop();
+#endif
+  }
+
+ private:
+  const char* name_;
+};
+}  // namespace
 
 RecWorkerImpl::LlmRecWorkPipeline::LlmRecWorkPipeline(RecWorkerImpl& worker)
     : worker_(worker) {}
@@ -409,6 +503,10 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
   torch::Tensor top_tokens;
   std::optional<folly::SemiFuture<NextRoundInputResults>>
       next_round_async_result;
+  const bool is_multi_stream = FLAGS_rec_worker_max_concurrency > 1;
+  const bool graph_enabled = FLAGS_enable_graph;
+  const bool beam_sampler_graph_enabled =
+      FLAGS_enable_beam_search_graph && FLAGS_enable_sampler_graph;
 
   for (int32_t round = 0; round < total_rounds; ++round) {
     bool used_combined_graph = false;
@@ -434,11 +532,18 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
 
     torch::Tensor hidden_states;
 
-    hidden_states =
-        worker_.model_executor_->forward(mutable_input.token_ids,
-                                         mutable_input.positions,
-                                         worker_.kv_caches_,
-                                         mutable_input.input_params);
+    {
+      NvtxRange range("rfwd",
+                      is_multi_stream,
+                      graph_enabled,
+                      beam_sampler_graph_enabled,
+                      round);
+      hidden_states =
+          worker_.model_executor_->forward(mutable_input.token_ids,
+                                           mutable_input.positions,
+                                           worker_.kv_caches_,
+                                           mutable_input.input_params);
+    }
 
     if (!hidden_states.defined()) {
       return std::nullopt;
@@ -449,6 +554,11 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
                                       sampling_params.selected_token_idxes);
       // Use combined BeamSearch + Sampler CUDA Graph if available.
       if (beam_search_sampler_graph_executor_) {
+        NvtxRange range("rsg",
+                        is_multi_stream,
+                        graph_enabled,
+                        beam_sampler_graph_enabled,
+                        round);
         auto graph_output = beam_search_sampler_graph_executor_->forward(
             logits,
             sampling_params,
@@ -475,6 +585,11 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
       }
 
       if (!used_combined_graph) {
+        NvtxRange range("rsamp",
+                        is_multi_stream,
+                        graph_enabled,
+                        beam_sampler_graph_enabled,
+                        round);
         sample_output = worker_.sampler_->forward(logits, sampling_params);
         top_tokens = sample_output.top_tokens.to(torch::kInt32)
                          .reshape({-1, beam_width});
@@ -485,6 +600,11 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
       torch::Tensor top_logprobs =
           sample_output.top_logprobs.reshape({-1, beam_width});
       if (!used_combined_graph) {
+        NvtxRange range("rbeam",
+                        is_multi_stream,
+                        graph_enabled,
+                        beam_sampler_graph_enabled,
+                        round);
         execute_beam_search(
             top_tokens, top_logprobs, beam_tensors, round, batch_size);
       }
