@@ -19,6 +19,10 @@
 #include <glog/logging.h>
 
 #include "common/global_flags.h"
+#if defined(USE_CUDA)
+#include "kernels/cuda/air_log_softmax_last_dim.h"
+#include "kernels/cuda/air_topk_last_dim.h"
+#endif
 #include "kernels/cuda/cuda_ops_api.h"
 
 namespace xllm {
@@ -172,28 +176,57 @@ bool BeamSearchSamplerGraph::capture(
     c10::cuda::CUDAStreamGuard stream_guard(capture_stream_.value());
     graph_.capture_begin(pool);
 
-    auto topk_result = logits.topk(beam,
-                                   /*dim=*/-1,
-                                   /*largest=*/true,
-                                   /*sorted=*/FLAGS_enable_topk_sorted);
-    auto top_values = std::get<0>(topk_result);
-    auto top_indices = std::get<1>(topk_result);
+    torch::Tensor top_values;
+    torch::Tensor top_indices;
+#if defined(USE_CUDA)
+    if (FLAGS_enable_air_topk && logits.is_cuda()) {
+      std::tie(top_values, top_indices) = xllm::kernel::cuda::air_topk_last_dim(
+          logits,
+          static_cast<int32_t>(beam),
+          /*largest=*/true,
+          /*sorted_by_value=*/FLAGS_enable_topk_sorted);
+    } else {
+#endif
+      auto topk_result = logits.topk(beam,
+                                     /*dim=*/-1,
+                                     /*largest=*/true,
+                                     /*sorted=*/FLAGS_enable_topk_sorted);
+      top_values = std::get<0>(topk_result);
+      top_indices = std::get<1>(topk_result);
+#if defined(USE_CUDA)
+    }
+#endif
 
     top_indices_buf.copy_(top_indices);
 
-    auto topk_logits = top_values.to(torch::kFloat32);
-    if (params.temperatures.defined()) {
-      auto temperatures =
-          persistent_param_.persistent_temperatures(bucket_batch_beam);
-      auto unsqueezed_temperatures = temperatures.unsqueeze(1);
-      unsqueezed_temperatures =
-          torch::where(unsqueezed_temperatures == 0,
-                       torch::ones_like(unsqueezed_temperatures),
-                       unsqueezed_temperatures);
-      topk_logits.div_(unsqueezed_temperatures);
+#if defined(USE_CUDA)
+    if (FLAGS_enable_air_topk && top_values.is_cuda()) {
+      torch::Tensor temperatures;
+      if (params.temperatures.defined()) {
+        temperatures =
+            persistent_param_.persistent_temperatures(bucket_batch_beam);
+      }
+      auto top_logprobs = xllm::kernel::cuda::air_log_softmax_last_dim(
+          top_values, temperatures);
+      top_logprobs_buf.copy_(top_logprobs);
+    } else {
+#endif
+      auto topk_logits = top_values.to(torch::kFloat32);
+      if (params.temperatures.defined()) {
+        auto temperatures =
+            persistent_param_.persistent_temperatures(bucket_batch_beam);
+        auto unsqueezed_temperatures = temperatures.unsqueeze(1);
+        unsqueezed_temperatures =
+            torch::where(unsqueezed_temperatures == 0,
+                         torch::ones_like(unsqueezed_temperatures),
+                         unsqueezed_temperatures);
+        topk_logits.div_(unsqueezed_temperatures);
+      }
+      auto top_logprobs = torch::log_softmax(topk_logits, /*dim=*/-1);
+      top_logprobs_buf.copy_(top_logprobs);
+#if defined(USE_CUDA)
     }
-    auto top_logprobs = torch::log_softmax(topk_logits, /*dim=*/-1);
-    top_logprobs_buf.copy_(top_logprobs);
+#endif
 
     xllm::kernel::cuda::beam_search(acc_logprob,
                                     in_sequence_group,

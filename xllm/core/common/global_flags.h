@@ -249,6 +249,10 @@ DECLARE_bool(enable_constrained_decoding);
 
 DECLARE_int32(max_decode_rounds);
 
+DECLARE_bool(enable_air_topk);
+
+DECLARE_int32(warp_topk_threshold);
+
 DECLARE_bool(enable_beam_search_graph);
 
 DECLARE_bool(enable_sampler_graph);

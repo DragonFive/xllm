@@ -20,6 +20,10 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include "common/global_flags.h"
+#if defined(USE_CUDA)
+#include "kernels/cuda/air_log_softmax_last_dim.h"
+#include "kernels/cuda/air_topk_last_dim.h"
+#endif
 #include "logits_utils.h"
 #include "sampling_params.h"
 
@@ -59,33 +63,71 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     // same batch size
     CHECK_EQ(sample_logits.size(0), params.do_sample.size(0));
 
-    auto [topk_values, topk_indices] =
-        sample_logits.topk(params.max_top_logprobs,
-                           /*dim=*/-1,
-                           /*largest=*/true,
-                           /*sorted=*/FLAGS_enable_topk_sorted);
-
-    torch::Tensor topk_logits = topk_values.to(torch::kFloat32);
-
-    // Apply temperature on the top-k logits only (temperature does not affect
-    // ordering).
-    if (params.temperatures.defined()) {
-      torch::Tensor temperatures = params.temperatures;
-      if (params.selected_token_idxes.numel() != params.sample_idxes.numel()) {
-        temperatures =
-            temperatures.index_select(/*dim=*/0, params.sample_idxes);
-      }
-      auto unsqueezed_temperatures =
-          temperatures.to(torch::kFloat32).unsqueeze(1);
-      unsqueezed_temperatures =
-          torch::where(unsqueezed_temperatures == 0,
-                       torch::ones_like(unsqueezed_temperatures),
-                       unsqueezed_temperatures);
-      topk_logits.div_(unsqueezed_temperatures);
+    torch::Tensor topk_values;
+    torch::Tensor topk_indices;
+#if defined(USE_CUDA)
+    if (FLAGS_enable_air_topk && sample_logits.is_cuda()) {
+      std::tie(topk_values, topk_indices) =
+          xllm::kernel::cuda::air_topk_last_dim(
+              sample_logits,
+              static_cast<int32_t>(params.max_top_logprobs),
+              /*largest=*/true,
+              /*sorted_by_value=*/FLAGS_enable_topk_sorted);
+    } else {
+#endif
+      std::tie(topk_values, topk_indices) =
+          sample_logits.topk(params.max_top_logprobs,
+                             /*dim=*/-1,
+                             /*largest=*/true,
+                             /*sorted=*/FLAGS_enable_topk_sorted);
+#if defined(USE_CUDA)
     }
+#endif
 
-    output.top_tokens = topk_indices;
-    output.top_logprobs = torch::log_softmax(topk_logits, /*dim=*/-1);
+    output.top_tokens = (topk_indices.scalar_type() == torch::kLong)
+                            ? topk_indices
+                            : topk_indices.to(torch::kLong);
+
+#if defined(USE_CUDA)
+    if (FLAGS_enable_air_topk && topk_values.is_cuda()) {
+      torch::Tensor temperatures;
+      if (params.temperatures.defined()) {
+        temperatures = params.temperatures;
+        if (params.selected_token_idxes.numel() !=
+            params.sample_idxes.numel()) {
+          temperatures =
+              temperatures.index_select(/*dim=*/0, params.sample_idxes);
+        }
+        temperatures = temperatures.to(torch::kFloat32);
+      }
+      output.top_logprobs = xllm::kernel::cuda::air_log_softmax_last_dim(
+          topk_values, temperatures);
+    } else {
+#endif
+      torch::Tensor topk_logits = topk_values.to(torch::kFloat32);
+
+      // Apply temperature on the top-k logits only (temperature does not affect
+      // ordering).
+      if (params.temperatures.defined()) {
+        torch::Tensor temperatures = params.temperatures;
+        if (params.selected_token_idxes.numel() !=
+            params.sample_idxes.numel()) {
+          temperatures =
+              temperatures.index_select(/*dim=*/0, params.sample_idxes);
+        }
+        auto unsqueezed_temperatures =
+            temperatures.to(torch::kFloat32).unsqueeze(1);
+        unsqueezed_temperatures =
+            torch::where(unsqueezed_temperatures == 0,
+                         torch::ones_like(unsqueezed_temperatures),
+                         unsqueezed_temperatures);
+        topk_logits.div_(unsqueezed_temperatures);
+      }
+
+      output.top_logprobs = torch::log_softmax(topk_logits, /*dim=*/-1);
+#if defined(USE_CUDA)
+    }
+#endif
     return output;
   }
 

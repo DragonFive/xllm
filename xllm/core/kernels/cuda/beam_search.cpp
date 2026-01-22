@@ -3,6 +3,7 @@
 #include <torch/script.h>
 #include <torch/torch.h>
 
+#include "air_topk_last_dim.h"
 #include "common/global_flags.h"
 #include "cuda.h"
 
@@ -104,13 +105,23 @@ void beam_search(torch::Tensor acc_logprob,
 
     const bool enable_optimized =
         FLAGS_enable_topk_sorted && FLAGS_max_decode_rounds > 0;
-    auto topk_result = torch::topk(combined_probs,
-                                   beam_size,
-                                   /*dim=*/-1,
-                                   /*largest=*/true,
-                                   /*sorted=*/!enable_optimized);
-    auto new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
-    auto new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
+    torch::Tensor new_probs;
+    torch::Tensor new_indices;
+    if (FLAGS_enable_air_topk && combined_probs.is_cuda()) {
+      std::tie(new_probs, new_indices) =
+          air_topk_last_dim(combined_probs,
+                            static_cast<int32_t>(beam_size),
+                            /*largest=*/true,
+                            /*sorted_by_value=*/!enable_optimized);
+    } else {
+      auto topk_result = torch::topk(combined_probs,
+                                     beam_size,
+                                     /*dim=*/-1,
+                                     /*largest=*/true,
+                                     /*sorted=*/!enable_optimized);
+      new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
+      new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
+    }
 
     if (!enable_optimized) {
       auto ordered_indices =
@@ -124,8 +135,9 @@ void beam_search(torch::Tensor acc_logprob,
     }
 
     const auto top_k_i64 = static_cast<int64_t>(top_k);
-    auto parent_beam = (new_indices / top_k_i64).to(torch::kLong);
-    auto token_in_beam = (new_indices % top_k_i64).to(torch::kLong);
+    auto new_indices_i64 = new_indices.to(torch::kLong);
+    auto parent_beam = (new_indices_i64 / top_k_i64);
+    auto token_in_beam = (new_indices_i64 % top_k_i64);
 
     auto top_tokens_reshaped = top_tokens.view({batch_size, beam_size, top_k});
 

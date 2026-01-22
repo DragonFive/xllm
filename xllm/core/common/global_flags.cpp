@@ -520,6 +520,18 @@ DEFINE_int32(max_decode_rounds,
              "Maximum number of decode rounds for multi-step decoding. "
              "0 means disabled.");
 
+DEFINE_bool(
+    enable_air_topk,
+    false,
+    "Enable AIR TopK/LogSoftmax CUDA kernels for pure-device multi-step "
+    "beam search to improve performance.");
+
+DEFINE_int32(warp_topk_threshold,
+             32,
+             "Threshold for using warp-level TopK. When k <= threshold, use "
+             "warp-level reduction (fastest). When k > threshold, fallback to "
+             "torch::topk.");
+
 DEFINE_bool(enable_beam_search_graph,
             false,
             "Enable CUDA Graph for beam search to reduce kernel launch "
