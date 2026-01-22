@@ -15,24 +15,34 @@
  *
  * This file includes optimized TopK implementations:
  * - Warp-level TopK for k <= 32 (fastest path)
- * - Radix Select TopK for k > 32 (fallback)
+ * - Radix TopK (derived from TensorRT-LLM) for k > 32 (fast path for k=128)
+ * - torch::topk fallback for very large k
  */
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <torch/extension.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cub/cub.cuh>
+#include <cuda/atomic>
+#include <cuda/std/limits>
 #include <limits>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include "air_topk_last_dim.h"
+#include "air_topk_stable_radix_11bits.cuh"
 #include "core/common/global_flags.h"
 
 namespace xllm::kernel::cuda {
@@ -44,6 +54,33 @@ namespace {
 // ============================================================================
 constexpr int WARP_SIZE = 32;
 constexpr unsigned FULL_WARP_MASK = 0xffffffff;
+
+// ============================================================================
+// Thread-local Workspace Cache (bytes)
+// ============================================================================
+struct WorkspaceCache {
+  torch::Tensor buffer;
+  size_t capacity = 0;
+  int device_index = -1;
+};
+
+torch::Tensor get_workspace(size_t required_bytes,
+                            const torch::Device& device) {
+  thread_local std::unordered_map<int, WorkspaceCache> caches;
+
+  int dev_idx = device.index();
+  auto& cache = caches[dev_idx];
+
+  if (cache.capacity < required_bytes || cache.device_index != dev_idx) {
+    cache.buffer = torch::empty(
+        {static_cast<int64_t>(required_bytes)},
+        torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    cache.capacity = required_bytes;
+    cache.device_index = dev_idx;
+  }
+
+  return cache.buffer;
+}
 
 // ============================================================================
 // Thread-local Output Cache (for int32 indices)
@@ -569,11 +606,203 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
     }
 
     return {values, indices};
-  } else {
-    // Fallback 路径：使用 torch::topk
-    // 对于大 k 场景，PyTorch 的实现已经足够优化
-    return torch_topk_fallback(in, k, largest, sorted_by_value);
   }
+
+  const int32_t large_k_threshold = FLAGS_air_topk_large_k_threshold;
+  if (k <= large_k_threshold) {
+    auto [values, indices] = get_cached_output(
+        batch64, static_cast<int64_t>(k), in.device(), in.scalar_type());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const auto dtype = in.scalar_type();
+    if (dtype == torch::kFloat32) {
+      using T = float;
+      auto* out_val = reinterpret_cast<T*>(values.data_ptr<float>());
+      auto* out_idx = reinterpret_cast<int32_t*>(indices.data_ptr<int32_t>());
+      const auto* in_ptr = reinterpret_cast<const T*>(in.data_ptr<float>());
+
+      size_t workspace_bytes = 0;
+      if (sorted_by_value) {
+        standalone_stable_radix_11bits<T, int32_t, true>(nullptr,
+                                                         workspace_bytes,
+                                                         in_ptr,
+                                                         batch,
+                                                         len,
+                                                         k,
+                                                         out_val,
+                                                         out_idx,
+                                                         largest,
+                                                         stream,
+                                                         /*stable=*/false);
+        auto workspace = get_workspace(workspace_bytes, in.device());
+        standalone_stable_radix_11bits<T, int32_t, true>(workspace.data_ptr(),
+                                                         workspace_bytes,
+                                                         in_ptr,
+                                                         batch,
+                                                         len,
+                                                         k,
+                                                         out_val,
+                                                         out_idx,
+                                                         largest,
+                                                         stream,
+                                                         /*stable=*/false);
+      } else {
+        standalone_stable_radix_11bits<T, int32_t, false>(nullptr,
+                                                          workspace_bytes,
+                                                          in_ptr,
+                                                          batch,
+                                                          len,
+                                                          k,
+                                                          out_val,
+                                                          out_idx,
+                                                          largest,
+                                                          stream,
+                                                          /*stable=*/false);
+        auto workspace = get_workspace(workspace_bytes, in.device());
+        standalone_stable_radix_11bits<T, int32_t, false>(workspace.data_ptr(),
+                                                          workspace_bytes,
+                                                          in_ptr,
+                                                          batch,
+                                                          len,
+                                                          k,
+                                                          out_val,
+                                                          out_idx,
+                                                          largest,
+                                                          stream,
+                                                          /*stable=*/false);
+      }
+
+      return {values, indices};
+    }
+
+    if (dtype == torch::kBFloat16) {
+      using T = __nv_bfloat16;
+      auto* out_val = reinterpret_cast<T*>(values.data_ptr<at::BFloat16>());
+      auto* out_idx = reinterpret_cast<int32_t*>(indices.data_ptr<int32_t>());
+      const auto* in_ptr =
+          reinterpret_cast<const T*>(in.data_ptr<at::BFloat16>());
+
+      size_t workspace_bytes = 0;
+      if (sorted_by_value) {
+        standalone_stable_radix_11bits<T, int32_t, true>(nullptr,
+                                                         workspace_bytes,
+                                                         in_ptr,
+                                                         batch,
+                                                         len,
+                                                         k,
+                                                         out_val,
+                                                         out_idx,
+                                                         largest,
+                                                         stream,
+                                                         /*stable=*/false);
+        auto workspace = get_workspace(workspace_bytes, in.device());
+        standalone_stable_radix_11bits<T, int32_t, true>(workspace.data_ptr(),
+                                                         workspace_bytes,
+                                                         in_ptr,
+                                                         batch,
+                                                         len,
+                                                         k,
+                                                         out_val,
+                                                         out_idx,
+                                                         largest,
+                                                         stream,
+                                                         /*stable=*/false);
+      } else {
+        standalone_stable_radix_11bits<T, int32_t, false>(nullptr,
+                                                          workspace_bytes,
+                                                          in_ptr,
+                                                          batch,
+                                                          len,
+                                                          k,
+                                                          out_val,
+                                                          out_idx,
+                                                          largest,
+                                                          stream,
+                                                          /*stable=*/false);
+        auto workspace = get_workspace(workspace_bytes, in.device());
+        standalone_stable_radix_11bits<T, int32_t, false>(workspace.data_ptr(),
+                                                          workspace_bytes,
+                                                          in_ptr,
+                                                          batch,
+                                                          len,
+                                                          k,
+                                                          out_val,
+                                                          out_idx,
+                                                          largest,
+                                                          stream,
+                                                          /*stable=*/false);
+      }
+
+      return {values, indices};
+    }
+
+    if (dtype == torch::kFloat16) {
+      using T = half;
+      auto* out_val = reinterpret_cast<T*>(values.data_ptr<at::Half>());
+      auto* out_idx = reinterpret_cast<int32_t*>(indices.data_ptr<int32_t>());
+      const auto* in_ptr = reinterpret_cast<const T*>(in.data_ptr<at::Half>());
+
+      size_t workspace_bytes = 0;
+      if (sorted_by_value) {
+        standalone_stable_radix_11bits<T, int32_t, true>(nullptr,
+                                                         workspace_bytes,
+                                                         in_ptr,
+                                                         batch,
+                                                         len,
+                                                         k,
+                                                         out_val,
+                                                         out_idx,
+                                                         largest,
+                                                         stream,
+                                                         /*stable=*/false);
+        auto workspace = get_workspace(workspace_bytes, in.device());
+        standalone_stable_radix_11bits<T, int32_t, true>(workspace.data_ptr(),
+                                                         workspace_bytes,
+                                                         in_ptr,
+                                                         batch,
+                                                         len,
+                                                         k,
+                                                         out_val,
+                                                         out_idx,
+                                                         largest,
+                                                         stream,
+                                                         /*stable=*/false);
+      } else {
+        standalone_stable_radix_11bits<T, int32_t, false>(nullptr,
+                                                          workspace_bytes,
+                                                          in_ptr,
+                                                          batch,
+                                                          len,
+                                                          k,
+                                                          out_val,
+                                                          out_idx,
+                                                          largest,
+                                                          stream,
+                                                          /*stable=*/false);
+        auto workspace = get_workspace(workspace_bytes, in.device());
+        standalone_stable_radix_11bits<T, int32_t, false>(workspace.data_ptr(),
+                                                          workspace_bytes,
+                                                          in_ptr,
+                                                          batch,
+                                                          len,
+                                                          k,
+                                                          out_val,
+                                                          out_idx,
+                                                          largest,
+                                                          stream,
+                                                          /*stable=*/false);
+      }
+
+      return {values, indices};
+    }
+
+    TORCH_CHECK(false, "air_topk_last_dim: unsupported dtype");
+    return {values, indices};
+  }
+
+  // Fallback 路径：使用 torch::topk（例如超大 k）
+  return torch_topk_fallback(in, k, largest, sorted_by_value);
 }
 
 }  // namespace xllm::kernel::cuda

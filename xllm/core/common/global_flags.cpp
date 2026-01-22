@@ -529,8 +529,13 @@ DEFINE_bool(
 DEFINE_int32(warp_topk_threshold,
              32,
              "Threshold for using warp-level TopK. When k <= threshold, use "
-             "warp-level reduction (fastest). When k > threshold, fallback to "
-             "torch::topk.");
+             "warp-level reduction (fastest, capped at k<=32).");
+
+DEFINE_int32(air_topk_large_k_threshold,
+             128,
+             "Threshold for using AIR radix TopK. When k > 32 and "
+             "k <= air_topk_large_k_threshold, use AIR radix selection. When "
+             "k > air_topk_large_k_threshold, fallback to torch::topk.");
 
 DEFINE_bool(enable_beam_search_graph,
             false,
@@ -546,9 +551,9 @@ DEFINE_bool(enable_sampler_graph,
 
 DEFINE_bool(enable_topk_sorted,
             false,
-            "Controls topk output ordering. Beam search treats true as the "
-            "previous unsorted fast path (skip argsort/gather), while sampler "
-            "uses it as topk(sorted=...).");
+            "Controls topk output ordering. When true, topk outputs are sorted "
+            "by value (descending for largest=true). When false, outputs are "
+            "in an unspecified order for better performance.");
 
 DEFINE_int32(beam_width, 1, "Beam width for beam search.");
 

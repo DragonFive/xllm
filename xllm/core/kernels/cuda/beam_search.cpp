@@ -103,8 +103,7 @@ void beam_search(torch::Tensor acc_logprob,
     auto combined_probs =
         (acc_logprob + top_logprobs).view({batch_size, beam_size * top_k});
 
-    const bool enable_optimized =
-        FLAGS_enable_topk_sorted && FLAGS_max_decode_rounds > 0;
+    const bool sorted_by_value = FLAGS_enable_topk_sorted;
     torch::Tensor new_probs;
     torch::Tensor new_indices;
     if (FLAGS_enable_air_topk && combined_probs.is_cuda()) {
@@ -112,26 +111,15 @@ void beam_search(torch::Tensor acc_logprob,
           air_topk_last_dim(combined_probs,
                             static_cast<int32_t>(beam_size),
                             /*largest=*/true,
-                            /*sorted_by_value=*/!enable_optimized);
+                            /*sorted_by_value=*/sorted_by_value);
     } else {
       auto topk_result = torch::topk(combined_probs,
                                      beam_size,
                                      /*dim=*/-1,
                                      /*largest=*/true,
-                                     /*sorted=*/!enable_optimized);
+                                     /*sorted=*/sorted_by_value);
       new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
       new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
-    }
-
-    if (!enable_optimized) {
-      auto ordered_indices =
-          new_indices.argsort(static_cast<int64_t>(1), false);
-      // Reorder new_probs (and corresponding new_indices) by ordered_indices to
-      // keep alignment.
-      if (current_step < total_rounds - 1) {
-        new_probs = new_probs.gather(1, ordered_indices);
-        new_indices = new_indices.gather(1, ordered_indices);
-      }
     }
 
     const auto top_k_i64 = static_cast<int64_t>(top_k);

@@ -253,6 +253,8 @@ DECLARE_bool(enable_air_topk);
 
 DECLARE_int32(warp_topk_threshold);
 
+DECLARE_int32(air_topk_large_k_threshold);
+
 DECLARE_bool(enable_beam_search_graph);
 
 DECLARE_bool(enable_sampler_graph);

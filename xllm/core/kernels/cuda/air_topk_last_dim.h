@@ -24,13 +24,16 @@ namespace xllm::kernel::cuda {
 
 // TopK selection on the last dimension for 2D input [B, L].
 //
-// Algorithm selection (controlled by FLAGS_warp_topk_threshold):
-// - k <= threshold (default 32): Warp-level reduction (fastest)
-// - k > threshold: Fallback to torch::topk
+// Algorithm selection:
+// - k <= min(FLAGS_warp_topk_threshold, 32): Warp-level reduction (fastest)
+// - 32 < k <= FLAGS_air_topk_large_k_threshold (default 128): AIR radix TopK
+// - k > FLAGS_air_topk_large_k_threshold: Fallback to torch::topk
 //
 // If sorted_by_value is true, outputs are sorted by value (descending for
 // largest=true, ascending for largest=false).
 // Otherwise, outputs are in an unspecified order.
+//
+// Note: stable ordering for equal values is NOT guaranteed (performance first).
 //
 // Returns:
 // - values: [B, k], same dtype as input
