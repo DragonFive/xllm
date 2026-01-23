@@ -122,20 +122,30 @@ void beam_search(torch::Tensor acc_logprob,
       new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
     }
 
-    if (!enable_optimized) {
+    // cache_select performs an in-place two-pass copy and assumes a safe
+    // ordering of beam_index:
+    // - cache_select is called in intermediate steps (current_step <
+    //   total_rounds - 1)
+    // - reorder new_indices (beam_index) by ascending index to avoid
+    //   overwriting a source beam that is still needed later
+    // The last step does not need cache_select, so keep the topk output order
+    // (optionally sorted by value).
+    if (current_step < total_rounds - 1) {
       auto ordered_indices =
-          new_indices.argsort(static_cast<int64_t>(1), false);
-      // Reorder new_probs (and corresponding new_indices) by ordered_indices to
-      // keep alignment.
-      if (current_step < total_rounds - 1) {
-        new_probs = new_probs.gather(1, ordered_indices);
-        new_indices = new_indices.gather(1, ordered_indices);
-      }
+          new_indices.argsort(static_cast<int64_t>(1), /*descending=*/false);
+      new_probs = new_probs.gather(1, ordered_indices);
+      new_indices = new_indices.gather(1, ordered_indices);
     }
 
     const auto top_k_i64 = static_cast<int64_t>(top_k);
     auto new_indices_i64 = new_indices.to(torch::kLong);
-    auto parent_beam = (new_indices_i64 / top_k_i64);
+    // NOTE: In some PyTorch versions/configurations, `/` may perform
+    // true_divide and return a floating tensor. Using it as an
+    // advanced-indexing tensor triggers:
+    // "tensors used as indices must be long, int, byte or bool tensors".
+    // We need explicit integer division here; trunc mode is sufficient since
+    // indices are non-negative.
+    auto parent_beam = torch::div(new_indices_i64, top_k_i64, "trunc");
     auto token_in_beam = (new_indices_i64 % top_k_i64);
 
     auto top_tokens_reshaped = top_tokens.view({batch_size, beam_size, top_k});
