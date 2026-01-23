@@ -19,22 +19,41 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <cstdlib>
+
 #include "common/global_flags.h"
 #include "logits_utils.h"
 #include "sampling_params.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/air_log_softmax_last_dim.h"
 #include "kernels/cuda/cuda_ops_api.h"
+#include "kernels/cuda/cuda_utils.h"
 #endif
 
 namespace xllm {
 namespace {
+static inline bool use_air_log_softmax_env() {
+  const char* v = std::getenv("XLLM_USE_AIR_LOG_SOFTMAX");
+  if (!v) {
+    return true;
+  }
+  if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') {
+    return false;
+  }
+  return true;
+}
+
 static inline torch::Tensor log_softmax_last_dim(
     const torch::Tensor& input,
     const torch::Tensor& temperatures) {
 #if defined(USE_CUDA)
   if (input.is_cuda()) {
-    return kernel::cuda::air_log_softmax_last_dim(input, temperatures);
+    if (use_air_log_softmax_env()) {
+      kernel::cuda::NvtxRange range("softmax.air");
+      return kernel::cuda::air_log_softmax_last_dim(input, temperatures);
+    }
+    kernel::cuda::NvtxRange range("softmax.torch");
+    return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
   }
 #endif
   return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
