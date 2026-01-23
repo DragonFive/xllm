@@ -23,10 +23,23 @@ limitations under the License.
 #include "logits_utils.h"
 #include "sampling_params.h"
 #if defined(USE_CUDA)
+#include "kernels/cuda/air_log_softmax_last_dim.h"
 #include "kernels/cuda/cuda_ops_api.h"
 #endif
 
 namespace xllm {
+namespace {
+static inline torch::Tensor log_softmax_last_dim(
+    const torch::Tensor& input,
+    const torch::Tensor& temperatures) {
+#if defined(USE_CUDA)
+  if (input.is_cuda()) {
+    return kernel::cuda::air_log_softmax_last_dim(input, temperatures);
+  }
+#endif
+  return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+}
+}  // namespace
 
 SampleOutput Sampler::forward(torch::Tensor& logits,
                               const SamplingParameters& params) const {
@@ -85,15 +98,13 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       auto indices =
           torch::tensor({false_id, true_id}, torch::kLong).to(samples.device());
       sample_logits = sample_logits.index_select(/*dim=*/1, indices);
-      auto logprobs = torch::log_softmax(
-          sample_logits, /*dim=*/1, /*dtype=*/torch::kFloat32);
+      auto logprobs = log_softmax_last_dim(sample_logits, torch::Tensor());
       logprobs = logprobs.index({torch::indexing::Slice(), 1});
       output.logprobs = logprobs.view({-1}).exp();
       return output;
     }
     // log_softmax is equivalent to log(softmax) but more numerically stable
-    const auto logprobs = torch::log_softmax(
-        sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+    auto logprobs = log_softmax_last_dim(sample_logits, torch::Tensor());
     // select the logprobs for each sequence
     auto selected_logprobs = logprobs.gather(/*dim=*/-1, samples.view({-1, 1}));
     output.logprobs = selected_logprobs.view({-1});
