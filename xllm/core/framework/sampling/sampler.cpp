@@ -20,12 +20,14 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdlib>
+#include <memory>
 
 #include "common/global_flags.h"
 #include "logits_utils.h"
 #include "sampling_params.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/air_log_softmax_last_dim.h"
+#include "kernels/cuda/air_topk_last_dim.h"
 #include "kernels/cuda/cuda_ops_api.h"
 #include "kernels/cuda/cuda_utils.h"
 #endif
@@ -35,7 +37,18 @@ namespace {
 static inline bool use_air_log_softmax_env() {
   const char* v = std::getenv("XLLM_USE_AIR_LOG_SOFTMAX");
   if (!v) {
-    return true;
+    return false;
+  }
+  if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') {
+    return false;
+  }
+  return true;
+}
+
+static inline bool use_air_topk_env() {
+  const char* v = std::getenv("XLLM_USE_AIR_TOPK");
+  if (!v) {
+    return false;
   }
   if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N') {
     return false;
@@ -46,6 +59,7 @@ static inline bool use_air_log_softmax_env() {
 static inline torch::Tensor log_softmax_last_dim(
     const torch::Tensor& input,
     const torch::Tensor& temperatures) {
+  const bool has_temps = temperatures.defined();
 #if defined(USE_CUDA)
   if (input.is_cuda()) {
     if (use_air_log_softmax_env()) {
@@ -53,16 +67,37 @@ static inline torch::Tensor log_softmax_last_dim(
       return kernel::cuda::air_log_softmax_last_dim(input, temperatures);
     }
     kernel::cuda::NvtxRange range("softmax.torch");
-    return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+    if (!has_temps) {
+      return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+    }
+    auto logits = input.to(torch::kFloat32);
+    auto temps =
+        temperatures.to(torch::kFloat32).to(input.device()).unsqueeze(1);
+    temps = torch::where(temps == 0, torch::ones_like(temps), temps);
+    logits.div_(temps);
+    return torch::log_softmax(logits, /*dim=*/-1);
   }
 #endif
-  return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+  if (!has_temps) {
+    return torch::log_softmax(input, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+  }
+  auto logits = input.to(torch::kFloat32);
+  auto temps = temperatures.to(torch::kFloat32).to(input.device()).unsqueeze(1);
+  temps = torch::where(temps == 0, torch::ones_like(temps), temps);
+  logits.div_(temps);
+  return torch::log_softmax(logits, /*dim=*/-1);
 }
 }  // namespace
 
 SampleOutput Sampler::forward(torch::Tensor& logits,
                               const SamplingParameters& params) const {
   SampleOutput output;
+#if defined(USE_CUDA)
+  std::unique_ptr<kernel::cuda::NvtxRange> sampler_range;
+  if (logits.is_cuda()) {
+    sampler_range = std::make_unique<kernel::cuda::NvtxRange>("sampler");
+  }
+#endif
   // apply frequency and presence penalties
   if (params.frequency_penalties.defined()) {
     apply_frequency_presence_penalties(logits,
@@ -76,6 +111,57 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   if (params.repetition_penalties.defined()) {
     apply_repetition_penalties(
         logits, params.unique_token_ids, params.repetition_penalties);
+  }
+
+  // Fast path for pure-device multi-round REC beam search.
+  if (params.use_beam_search && params.logprobs &&
+      params.top_k == params.max_top_logprobs && params.max_top_logprobs > 0 &&
+      !params.top_p.defined() && !FLAGS_enable_qwen3_reranker &&
+      FLAGS_max_decode_rounds > 0) {
+    torch::Tensor sample_logits = logits;
+    if (params.selected_token_idxes.numel() != params.sample_idxes.numel()) {
+      sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
+    }
+
+    CHECK_EQ(sample_logits.size(0), params.do_sample.size(0));
+
+    torch::Tensor topk_values;
+    torch::Tensor topk_indices;
+#if defined(USE_CUDA)
+    if (use_air_topk_env() && sample_logits.is_cuda()) {
+      std::tie(topk_values, topk_indices) =
+          xllm::kernel::cuda::air_topk_last_dim(
+              sample_logits,
+              static_cast<int32_t>(params.max_top_logprobs),
+              /*largest=*/true,
+              /*sorted_by_value=*/true);
+    } else {
+#endif
+      std::tie(topk_values, topk_indices) =
+          sample_logits.topk(params.max_top_logprobs,
+                             /*dim=*/-1,
+                             /*largest=*/true,
+                             /*sorted=*/true);
+#if defined(USE_CUDA)
+    }
+#endif
+
+    output.top_tokens = (topk_indices.scalar_type() == torch::kLong)
+                            ? topk_indices
+                            : topk_indices.to(torch::kLong);
+
+    torch::Tensor temperatures;
+    if (params.temperatures.defined()) {
+      temperatures = params.temperatures;
+      if (params.selected_token_idxes.numel() != params.sample_idxes.numel()) {
+        temperatures =
+            temperatures.index_select(/*dim=*/0, params.sample_idxes);
+      }
+      temperatures = temperatures.to(torch::kFloat32);
+    }
+
+    output.top_logprobs = log_softmax_last_dim(topk_values, temperatures);
+    return output;
   }
 
   // apply temperatures, top-k and top-p
