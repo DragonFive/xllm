@@ -122,6 +122,17 @@ void beam_search(torch::Tensor acc_logprob,
       new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
     }
 
+    if (!enable_optimized) {
+      auto ordered_indices =
+          new_indices.argsort(static_cast<int64_t>(1), false);
+      // Reorder new_probs (and corresponding new_indices) by ordered_indices to
+      // keep alignment.
+      if (current_step < total_rounds - 1) {
+        new_probs = new_probs.gather(1, ordered_indices);
+        new_indices = new_indices.gather(1, ordered_indices);
+      }
+    }
+
     const auto top_k_i64 = static_cast<int64_t>(top_k);
     auto new_indices_i64 = new_indices.to(torch::kLong);
     auto parent_beam = (new_indices_i64 / top_k_i64);

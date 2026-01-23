@@ -40,6 +40,9 @@ inline int get_multi_processor_count() {
   return prop.multiProcessorCount;
 }
 
+// 辅助函数:类型安全的原子加法(支持int64_t等任意整数类型)
+template <typename IdxT,
+          ::cuda::thread_scope Scope = ::cuda::thread_scope_device>
 __device__ __forceinline__ IdxT atomic_add_idx(IdxT* addr, IdxT val) {
   ::cuda::atomic_ref<IdxT, Scope> ref(*addr);
   return ref.fetch_add(val, ::cuda::memory_order_relaxed);
