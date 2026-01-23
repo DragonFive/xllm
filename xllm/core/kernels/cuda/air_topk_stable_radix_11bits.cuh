@@ -28,15 +28,29 @@
 #include <cuda/std/limits>
 #include <limits>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace xllm::kernel::cuda {
 
+// Cache SM count per device to avoid per-step device property query (may
+// implicitly synchronize).
+// cudaGetDeviceProperties is known to potentially synchronize CPU/GPU.
 inline int get_multi_processor_count() {
+  thread_local std::unordered_map<int, int> sm_cache;
+
   int device = 0;
   C10_CUDA_CHECK(cudaGetDevice(&device));
+
+  auto it = sm_cache.find(device);
+  if (it != sm_cache.end()) {
+    return it->second;  // cache hit, O(1)
+  }
+
+  // First query for this device.
   cudaDeviceProp prop{};
   C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  sm_cache[device] = prop.multiProcessorCount;
   return prop.multiProcessorCount;
 }
 
@@ -913,13 +927,24 @@ template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
 unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt) {
   static_assert(VECTORIZED_READ_SIZE / sizeof(T) >= 1);
 
-  int active_blocks;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_blocks,
-      radix_kernel<T, IdxT, BitsPerPass, BlockSize, false, true>,
-      BlockSize,
-      0);
-  active_blocks *= sm_cnt;
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  thread_local std::unordered_map<int, int> active_blocks_per_sm_cache;
+  auto it = active_blocks_per_sm_cache.find(device);
+
+  int active_blocks_per_sm = 0;
+  if (it != active_blocks_per_sm_cache.end()) {
+    active_blocks_per_sm = it->second;
+  } else {
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm,
+        radix_kernel<T, IdxT, BitsPerPass, BlockSize, false, true>,
+        BlockSize,
+        0));
+    active_blocks_per_sm_cache[device] = active_blocks_per_sm;
+  }
+
+  int active_blocks = active_blocks_per_sm * sm_cnt;
 
   IdxT best_num_blocks = 0;
   float best_tail_wave_penalty = 1.0f;

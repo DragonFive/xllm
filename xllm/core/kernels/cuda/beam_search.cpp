@@ -106,12 +106,17 @@ void beam_search(torch::Tensor acc_logprob,
     const bool sorted_by_value = FLAGS_enable_topk_sorted;
     torch::Tensor new_probs;
     torch::Tensor new_indices;
-    if (FLAGS_enable_air_topk && combined_probs.is_cuda()) {
+    torch::Tensor new_indices_i32;  // Keep an int32 copy to avoid conversions.
+    const bool use_air_topk = FLAGS_enable_air_topk && combined_probs.is_cuda();
+
+    if (use_air_topk) {
       std::tie(new_probs, new_indices) =
           air_topk_last_dim(combined_probs,
                             static_cast<int32_t>(beam_size),
                             /*largest=*/true,
                             /*sorted_by_value=*/sorted_by_value);
+      // air_topk_last_dim returns int32; keep the raw indices.
+      new_indices_i32 = new_indices;
     } else {
       auto topk_result = torch::topk(combined_probs,
                                      beam_size,
@@ -119,7 +124,7 @@ void beam_search(torch::Tensor acc_logprob,
                                      /*largest=*/true,
                                      /*sorted=*/sorted_by_value);
       new_probs = std::get<0>(topk_result);    // [batch_size, beam_size]
-      new_indices = std::get<1>(topk_result);  // [batch_size, beam_size]
+      new_indices = std::get<1>(topk_result);  // [batch_size, beam_size], int64
     }
 
     // cache_select performs an in-place two-pass copy and assumes a safe
@@ -135,10 +140,17 @@ void beam_search(torch::Tensor acc_logprob,
           new_indices.argsort(static_cast<int64_t>(1), /*descending=*/false);
       new_probs = new_probs.gather(1, ordered_indices);
       new_indices = new_indices.gather(1, ordered_indices);
+      // If using air_topk, ordered_indices reorders int32 indices, so refresh
+      // the int32 copy.
+      if (use_air_topk) {
+        new_indices_i32 = new_indices;  // still int32 after gather
+      }
     }
 
     const auto top_k_i64 = static_cast<int64_t>(top_k);
-    auto new_indices_i64 = new_indices.to(torch::kLong);
+    // Convert to int64 only when needed (advanced indexing).
+    auto new_indices_i64 =
+        use_air_topk ? new_indices.to(torch::kLong) : new_indices;
     // NOTE: In some PyTorch versions/configurations, `/` may perform
     // true_divide and return a floating tensor. Using it as an
     // advanced-indexing tensor triggers:
@@ -161,8 +173,9 @@ void beam_search(torch::Tensor acc_logprob,
                                                  TensorIndex(token_in_beam)});
 
     out_acc_logprob.view({batch_size, beam_size}).copy_(new_probs);
+    // Use the saved int32 copy to avoid an extra conversion.
     out_token_index.view({batch_size, beam_size})
-        .copy_(new_indices.to(torch::kInt32));
+        .copy_(use_air_topk ? new_indices_i32 : new_indices.to(torch::kInt32));
     out_token_ids.view({batch_size, beam_size}).copy_(new_tokens);
 
     // Use cached arange instead of torch::arange for CUDA Graph compatibility

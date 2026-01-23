@@ -83,6 +83,120 @@ torch::Tensor get_workspace(size_t required_bytes,
 }
 
 // ============================================================================
+// Thread-local Workspace Size Cache (avoid per-step CUB workspace size query)
+// ============================================================================
+struct WorkspaceSizeKey {
+  int32_t batch;
+  int32_t len;
+  int32_t k;
+  int dtype_code;  // 0=float, 1=bf16, 2=fp16
+  bool sorted;
+
+  bool operator==(const WorkspaceSizeKey& other) const {
+    return batch == other.batch && len == other.len && k == other.k &&
+           dtype_code == other.dtype_code && sorted == other.sorted;
+  }
+};
+
+struct WorkspaceSizeKeyHash {
+  size_t operator()(const WorkspaceSizeKey& key) const {
+    // A simple hash combine
+    size_t h = std::hash<int32_t>{}(key.batch);
+    h ^= std::hash<int32_t>{}(key.len) << 1;
+    h ^= std::hash<int32_t>{}(key.k) << 2;
+    h ^= std::hash<int>{}(key.dtype_code) << 3;
+    h ^= std::hash<bool>{}(key.sorted) << 4;
+    return h;
+  }
+};
+
+static inline std::
+    unordered_map<WorkspaceSizeKey, size_t, WorkspaceSizeKeyHash>&
+    get_workspace_size_cache() {
+  thread_local std::
+      unordered_map<WorkspaceSizeKey, size_t, WorkspaceSizeKeyHash>
+          size_cache;
+  return size_cache;
+}
+
+// Cache queried workspace sizes.
+size_t get_cached_workspace_size(int32_t batch,
+                                 int32_t len,
+                                 int32_t k,
+                                 int dtype_code,
+                                 bool sorted) {
+  WorkspaceSizeKey key{batch, len, k, dtype_code, sorted};
+  auto& size_cache = get_workspace_size_cache();
+  auto it = size_cache.find(key);
+  if (it != size_cache.end()) {
+    return it->second;  // cache hit
+  }
+
+  // Cache miss. Return 0 to trigger a size query.
+  return 0;
+}
+
+void cache_workspace_size(int32_t batch,
+                          int32_t len,
+                          int32_t k,
+                          int dtype_code,
+                          bool sorted,
+                          size_t size) {
+  WorkspaceSizeKey key{batch, len, k, dtype_code, sorted};
+  auto& size_cache = get_workspace_size_cache();
+  size_cache[key] = size;
+}
+
+// ============================================================================
+// Radix TopK helper: with cached workspace size.
+// ============================================================================
+template <typename T, bool sorted>
+void run_radix_topk_with_cache(const T* in_ptr,
+                               T* out_val,
+                               int32_t* out_idx,
+                               int32_t batch,
+                               int32_t len,
+                               int32_t k,
+                               int dtype_code,
+                               bool largest,
+                               const torch::Device& device,
+                               cudaStream_t stream) {
+  // Try getting the workspace size from cache.
+  size_t workspace_bytes =
+      get_cached_workspace_size(batch, len, k, dtype_code, sorted);
+
+  if (workspace_bytes == 0) {
+    // Cache miss. Query workspace size.
+    standalone_stable_radix_11bits<T, int32_t, sorted>(nullptr,
+                                                       workspace_bytes,
+                                                       in_ptr,
+                                                       batch,
+                                                       len,
+                                                       k,
+                                                       out_val,
+                                                       out_idx,
+                                                       largest,
+                                                       stream,
+                                                       /*stable=*/false);
+    // Cache the result.
+    cache_workspace_size(batch, len, k, dtype_code, sorted, workspace_bytes);
+  }
+
+  auto workspace = get_workspace(workspace_bytes, device);
+  standalone_stable_radix_11bits<T, int32_t, sorted>(workspace.data_ptr(),
+                                                     workspace_bytes,
+                                                     in_ptr,
+                                                     batch,
+                                                     len,
+                                                     k,
+                                                     out_val,
+                                                     out_idx,
+                                                     largest,
+                                                     stream,
+                                                     /*stable=*/false);
+}
+
+// ============================================================================
 // Thread-local Output Cache (for int32 indices)
 // ============================================================================
 struct OutputCache {
@@ -622,55 +736,29 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
       auto* out_idx = reinterpret_cast<int32_t*>(indices.data_ptr<int32_t>());
       const auto* in_ptr = reinterpret_cast<const T*>(in.data_ptr<float>());
 
-      size_t workspace_bytes = 0;
+      constexpr int dtype_code = 0;  // float
       if (sorted_by_value) {
-        standalone_stable_radix_11bits<T, int32_t, true>(nullptr,
-                                                         workspace_bytes,
-                                                         in_ptr,
-                                                         batch,
-                                                         len,
-                                                         k,
-                                                         out_val,
-                                                         out_idx,
-                                                         largest,
-                                                         stream,
-                                                         /*stable=*/false);
-        auto workspace = get_workspace(workspace_bytes, in.device());
-        standalone_stable_radix_11bits<T, int32_t, true>(workspace.data_ptr(),
-                                                         workspace_bytes,
-                                                         in_ptr,
-                                                         batch,
-                                                         len,
-                                                         k,
-                                                         out_val,
-                                                         out_idx,
-                                                         largest,
-                                                         stream,
-                                                         /*stable=*/false);
+        run_radix_topk_with_cache<T, true>(in_ptr,
+                                           out_val,
+                                           out_idx,
+                                           batch,
+                                           len,
+                                           k,
+                                           dtype_code,
+                                           largest,
+                                           in.device(),
+                                           stream);
       } else {
-        standalone_stable_radix_11bits<T, int32_t, false>(nullptr,
-                                                          workspace_bytes,
-                                                          in_ptr,
-                                                          batch,
-                                                          len,
-                                                          k,
-                                                          out_val,
-                                                          out_idx,
-                                                          largest,
-                                                          stream,
-                                                          /*stable=*/false);
-        auto workspace = get_workspace(workspace_bytes, in.device());
-        standalone_stable_radix_11bits<T, int32_t, false>(workspace.data_ptr(),
-                                                          workspace_bytes,
-                                                          in_ptr,
-                                                          batch,
-                                                          len,
-                                                          k,
-                                                          out_val,
-                                                          out_idx,
-                                                          largest,
-                                                          stream,
-                                                          /*stable=*/false);
+        run_radix_topk_with_cache<T, false>(in_ptr,
+                                            out_val,
+                                            out_idx,
+                                            batch,
+                                            len,
+                                            k,
+                                            dtype_code,
+                                            largest,
+                                            in.device(),
+                                            stream);
       }
 
       return {values, indices};
@@ -683,55 +771,29 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
       const auto* in_ptr =
           reinterpret_cast<const T*>(in.data_ptr<at::BFloat16>());
 
-      size_t workspace_bytes = 0;
+      constexpr int dtype_code = 1;  // bf16
       if (sorted_by_value) {
-        standalone_stable_radix_11bits<T, int32_t, true>(nullptr,
-                                                         workspace_bytes,
-                                                         in_ptr,
-                                                         batch,
-                                                         len,
-                                                         k,
-                                                         out_val,
-                                                         out_idx,
-                                                         largest,
-                                                         stream,
-                                                         /*stable=*/false);
-        auto workspace = get_workspace(workspace_bytes, in.device());
-        standalone_stable_radix_11bits<T, int32_t, true>(workspace.data_ptr(),
-                                                         workspace_bytes,
-                                                         in_ptr,
-                                                         batch,
-                                                         len,
-                                                         k,
-                                                         out_val,
-                                                         out_idx,
-                                                         largest,
-                                                         stream,
-                                                         /*stable=*/false);
+        run_radix_topk_with_cache<T, true>(in_ptr,
+                                           out_val,
+                                           out_idx,
+                                           batch,
+                                           len,
+                                           k,
+                                           dtype_code,
+                                           largest,
+                                           in.device(),
+                                           stream);
       } else {
-        standalone_stable_radix_11bits<T, int32_t, false>(nullptr,
-                                                          workspace_bytes,
-                                                          in_ptr,
-                                                          batch,
-                                                          len,
-                                                          k,
-                                                          out_val,
-                                                          out_idx,
-                                                          largest,
-                                                          stream,
-                                                          /*stable=*/false);
-        auto workspace = get_workspace(workspace_bytes, in.device());
-        standalone_stable_radix_11bits<T, int32_t, false>(workspace.data_ptr(),
-                                                          workspace_bytes,
-                                                          in_ptr,
-                                                          batch,
-                                                          len,
-                                                          k,
-                                                          out_val,
-                                                          out_idx,
-                                                          largest,
-                                                          stream,
-                                                          /*stable=*/false);
+        run_radix_topk_with_cache<T, false>(in_ptr,
+                                            out_val,
+                                            out_idx,
+                                            batch,
+                                            len,
+                                            k,
+                                            dtype_code,
+                                            largest,
+                                            in.device(),
+                                            stream);
       }
 
       return {values, indices};
@@ -743,55 +805,29 @@ std::tuple<torch::Tensor, torch::Tensor> air_topk_last_dim(
       auto* out_idx = reinterpret_cast<int32_t*>(indices.data_ptr<int32_t>());
       const auto* in_ptr = reinterpret_cast<const T*>(in.data_ptr<at::Half>());
 
-      size_t workspace_bytes = 0;
+      constexpr int dtype_code = 2;  // fp16
       if (sorted_by_value) {
-        standalone_stable_radix_11bits<T, int32_t, true>(nullptr,
-                                                         workspace_bytes,
-                                                         in_ptr,
-                                                         batch,
-                                                         len,
-                                                         k,
-                                                         out_val,
-                                                         out_idx,
-                                                         largest,
-                                                         stream,
-                                                         /*stable=*/false);
-        auto workspace = get_workspace(workspace_bytes, in.device());
-        standalone_stable_radix_11bits<T, int32_t, true>(workspace.data_ptr(),
-                                                         workspace_bytes,
-                                                         in_ptr,
-                                                         batch,
-                                                         len,
-                                                         k,
-                                                         out_val,
-                                                         out_idx,
-                                                         largest,
-                                                         stream,
-                                                         /*stable=*/false);
+        run_radix_topk_with_cache<T, true>(in_ptr,
+                                           out_val,
+                                           out_idx,
+                                           batch,
+                                           len,
+                                           k,
+                                           dtype_code,
+                                           largest,
+                                           in.device(),
+                                           stream);
       } else {
-        standalone_stable_radix_11bits<T, int32_t, false>(nullptr,
-                                                          workspace_bytes,
-                                                          in_ptr,
-                                                          batch,
-                                                          len,
-                                                          k,
-                                                          out_val,
-                                                          out_idx,
-                                                          largest,
-                                                          stream,
-                                                          /*stable=*/false);
-        auto workspace = get_workspace(workspace_bytes, in.device());
-        standalone_stable_radix_11bits<T, int32_t, false>(workspace.data_ptr(),
-                                                          workspace_bytes,
-                                                          in_ptr,
-                                                          batch,
-                                                          len,
-                                                          k,
-                                                          out_val,
-                                                          out_idx,
-                                                          largest,
-                                                          stream,
-                                                          /*stable=*/false);
+        run_radix_topk_with_cache<T, false>(in_ptr,
+                                            out_val,
+                                            out_idx,
+                                            batch,
+                                            len,
+                                            k,
+                                            dtype_code,
+                                            largest,
+                                            in.device(),
+                                            stream);
       }
 
       return {values, indices};
