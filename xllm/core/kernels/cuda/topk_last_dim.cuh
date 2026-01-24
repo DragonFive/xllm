@@ -96,7 +96,7 @@ __host__ __device__ constexpr int calc_num_passes() {
   return ceildiv<int>(sizeof(T) * 8, BitsPerPass);
 }
 
-__host__ __device__ int round(int num, int round_value) {
+__host__ __device__ __forceinline__ int round(int num, int round_value) {
   return ((num - 1) / round_value + 1) * round_value;
 }
 
@@ -1236,17 +1236,17 @@ static constexpr int kWARP_SIZE = 32;
 static constexpr int kWARPS_PER_BLOCK = kBLOCK_SIZE / kWARP_SIZE;
 
 template <typename T>
-__device__ T negativeInfinity() {
+__device__ __forceinline__ T negativeInfinity() {
   return -INFINITY;
 }
 
 template <>
-__device__ half negativeInfinity<half>() {
+__device__ __forceinline__ half negativeInfinity<half>() {
   return -CUDART_INF_FP16;
 }
 
 template <>
-__device__ __nv_bfloat16 negativeInfinity<__nv_bfloat16>() {
+__device__ __forceinline__ __nv_bfloat16 negativeInfinity<__nv_bfloat16>() {
   return -CUDART_INF_BF16;
 }
 
@@ -1786,7 +1786,7 @@ void standalone_stable_radix_11bits(void* buf,
   }
 }
 
-int nextPowerOfTwo(int num) {
+inline int nextPowerOfTwo(int num) {
   if (num <= 0) {
     return 1;  // Handle invalid input
   }
