@@ -113,14 +113,8 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
         logits, params.unique_token_ids, params.repetition_penalties);
   }
 
-  bool topk_matches_max = false;
-  if (params.top_k.defined()) {
-    topk_matches_max =
-        params.top_k.eq(params.max_top_logprobs).all().item<bool>();
-  }
-
   // Fast path for pure-device multi-round REC beam search.
-  if (params.use_beam_search && params.logprobs && topk_matches_max &&
+  if (params.use_beam_search && params.logprobs && FLAGS_enable_fast_sampler &&
       params.max_top_logprobs > 0 && !params.top_p.defined() &&
       !FLAGS_enable_qwen3_reranker && FLAGS_max_decode_rounds > 0) {
     torch::Tensor sample_logits = logits;
@@ -225,13 +219,23 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       auto vocab_size = static_cast<uint32_t>(logprobs.size(1));
       uint32_t k = static_cast<uint32_t>(params.max_top_logprobs);
 
-      auto [values, indices] =
-          kernel::cuda::compute_topk_general(logprobs,
-                                             batch_size,
-                                             vocab_size,
-                                             k,
-                                             logprobs.device(),
-                                             FLAGS_enable_topk_sorted);
+      torch::Tensor values;
+      torch::Tensor indices;
+      if (use_air_topk_env() && logprobs.is_cuda()) {
+        std::tie(values, indices) =
+            kernel::cuda::compute_topk_general(logprobs,
+                                               batch_size,
+                                               vocab_size,
+                                               k,
+                                               logprobs.device(),
+                                               FLAGS_enable_topk_sorted);
+      } else {
+        std::tie(values, indices) =
+            logprobs.topk(params.max_top_logprobs,
+                          /*dim=*/-1,
+                          /*largest=*/true,
+                          /*sorted=*/FLAGS_enable_topk_sorted);
+      }
 #else
       auto [values, indices] =
           logprobs.topk(params.max_top_logprobs,

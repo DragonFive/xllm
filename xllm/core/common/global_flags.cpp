@@ -429,6 +429,8 @@ DEFINE_bool(enable_beam_search_kernel,
             false,
             "Whether to enable beam search kernel.");
 
+DEFINE_bool(enable_fast_sampler, false, "Whether to enable fast sampler path.");
+
 DEFINE_bool(enable_topk_sorted,
             true,
             "Whether to enable sorted output for topk.");
