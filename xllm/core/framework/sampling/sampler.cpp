@@ -113,11 +113,16 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
         logits, params.unique_token_ids, params.repetition_penalties);
   }
 
+  bool topk_matches_max = false;
+  if (params.top_k.defined()) {
+    topk_matches_max =
+        params.top_k.eq(params.max_top_logprobs).all().item<bool>();
+  }
+
   // Fast path for pure-device multi-round REC beam search.
-  if (params.use_beam_search && params.logprobs &&
-      params.top_k == params.max_top_logprobs && params.max_top_logprobs > 0 &&
-      !params.top_p.defined() && !FLAGS_enable_qwen3_reranker &&
-      FLAGS_max_decode_rounds > 0) {
+  if (params.use_beam_search && params.logprobs && topk_matches_max &&
+      params.max_top_logprobs > 0 && !params.top_p.defined() &&
+      !FLAGS_enable_qwen3_reranker && FLAGS_max_decode_rounds > 0) {
     torch::Tensor sample_logits = logits;
     if (params.selected_token_idxes.numel() != params.sample_idxes.numel()) {
       sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
