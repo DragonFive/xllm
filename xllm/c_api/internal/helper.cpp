@@ -521,11 +521,6 @@ void override_global_flags_from_env(const std::string& env_prefix,
       static_cast<uint32_t>(xllm::util::get_int_env(
           env_prefix + "REC_WORKER_MAX_CONCURRENCY", rec_worker_default));
 
-  // Multi-step decode config
-  FLAGS_enable_beam_search_optimized =
-      xllm::util::get_bool_env(env_prefix + "ENABLE_BEAM_SEARCH_OPTIMIZED",
-                               FLAGS_enable_beam_search_optimized);
-
   // XAttention config
   FLAGS_enable_xattention_two_stage_decode = xllm::util::get_bool_env(
       env_prefix + "ENABLE_XATTENTION_TWO_STAGE_DECODE",
