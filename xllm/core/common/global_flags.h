@@ -216,6 +216,7 @@ DECLARE_int64(cache_size_per_token);
 DECLARE_int64(buffer_size_per_seq);
 
 DECLARE_bool(enable_beam_search_kernel);
+DECLARE_bool(enable_topk_sorted);
 
 DECLARE_bool(enable_qwen3_reranker);
 

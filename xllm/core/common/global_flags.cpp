@@ -429,6 +429,10 @@ DEFINE_bool(enable_beam_search_kernel,
             false,
             "Whether to enable beam search kernel.");
 
+DEFINE_bool(enable_topk_sorted,
+            true,
+            "Whether to enable sorted output for topk.");
+
 // --- reasoning parser config ---
 
 DEFINE_string(reasoning_parser,

@@ -139,14 +139,14 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
               sample_logits,
               static_cast<int32_t>(params.max_top_logprobs),
               /*largest=*/true,
-              /*sorted_by_value=*/true);
+              /*sorted_by_value=*/FLAGS_enable_topk_sorted);
     } else {
 #endif
       std::tie(topk_values, topk_indices) =
           sample_logits.topk(params.max_top_logprobs,
                              /*dim=*/-1,
                              /*largest=*/true,
-                             /*sorted=*/true);
+                             /*sorted=*/FLAGS_enable_topk_sorted);
 #if defined(USE_CUDA)
     }
 #endif
@@ -225,11 +225,19 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       auto vocab_size = static_cast<uint32_t>(logprobs.size(1));
       uint32_t k = static_cast<uint32_t>(params.max_top_logprobs);
 
-      auto [values, indices] = kernel::cuda::compute_topk_general(
-          logprobs, batch_size, vocab_size, k, logprobs.device());
+      auto [values, indices] =
+          kernel::cuda::compute_topk_general(logprobs,
+                                             batch_size,
+                                             vocab_size,
+                                             k,
+                                             logprobs.device(),
+                                             FLAGS_enable_topk_sorted);
 #else
       auto [values, indices] =
-          logprobs.topk(params.max_top_logprobs, /*dim=*/-1);
+          logprobs.topk(params.max_top_logprobs,
+                        /*dim=*/-1,
+                        /*largest=*/true,
+                        /*sorted=*/FLAGS_enable_topk_sorted);
 #endif
       output.top_logprobs = values;
       output.top_tokens = indices;
