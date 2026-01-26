@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/rec_model_utils.h"
+#include "framework/sampling/beam_search_sampler_graph.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/threadpool.h"
 
@@ -224,6 +225,10 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     // for async scheduler
     ThreadPool threadpool_;
+
+    // CUDA Graph executor for beam search + sampler fusion
+    std::unique_ptr<BeamSearchSamplerGraphExecutor>
+        beam_search_sampler_graph_executor_;
 
     int32_t max_seqs_per_batch_{worker_.options_.max_seqs_per_batch()};
     int32_t max_token_per_req_{worker_.options_.max_token_per_req()};

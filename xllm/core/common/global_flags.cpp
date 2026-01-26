@@ -440,6 +440,14 @@ DEFINE_bool(enable_topk_sorted,
             true,
             "Whether to enable sorted output for topk.");
 
+DEFINE_bool(
+    enable_sampler_beamsearch_graph,
+    false,
+    "Enable CUDA Graph for logits computation, sampler and beam search. "
+    "This captures the entire logits->topk->log_softmax->beam_search "
+    "pipeline into a single CUDA Graph to reduce kernel launch overhead. "
+    "Expected 20-40% latency reduction for multi-round decode scenarios.");
+
 // --- reasoning parser config ---
 
 DEFINE_string(reasoning_parser,

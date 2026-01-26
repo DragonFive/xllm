@@ -200,7 +200,47 @@ RecWorkerImpl::LlmRecPureDevicePipeline::LlmRecPureDevicePipeline(
 bool RecWorkerImpl::LlmRecPureDevicePipeline::create_model(
     RecWorkerImpl& worker,
     ModelContext& context) {
-  return worker.LLMWorkerImpl::init_model(context);
+  bool result = worker.LLMWorkerImpl::init_model(context);
+
+#if defined(USE_CUDA)
+  // Initialize BeamSearchSamplerGraphExecutor if enabled
+  if (result && FLAGS_enable_sampler_beamsearch_graph &&
+      worker.device_.is_cuda() && FLAGS_max_decode_rounds > 0) {
+    const auto& model_args = context.get_model_args();
+    uint32_t hidden_size = model_args.hidden_size();
+    torch::ScalarType hidden_dtype = worker.dtype();
+
+    // Determine max_prefill_tokens for prefill graph
+    const uint32_t max_prefill_tokens =
+        FLAGS_max_tokens_for_graph_mode_prefill > 0
+            ? static_cast<uint32_t>(FLAGS_max_tokens_for_graph_mode_prefill)
+            : 0;  // 0 means prefill graph disabled
+
+    // Determine max_seq_len for decode graph
+    const uint32_t max_seq_len =
+        FLAGS_max_seq_len_for_graph_mode > 0
+            ? static_cast<uint32_t>(FLAGS_max_seq_len_for_graph_mode)
+            : static_cast<uint32_t>(model_args.max_position_embeddings());
+
+    beam_search_sampler_graph_executor_ =
+        std::make_unique<BeamSearchSamplerGraphExecutor>(
+            worker.model_.get(),
+            static_cast<uint32_t>(max_seqs_per_batch_),
+            static_cast<uint32_t>(beam_width_),
+            static_cast<uint32_t>(FLAGS_max_decode_rounds),
+            hidden_size,
+            hidden_dtype,
+            worker.device_,
+            max_prefill_tokens,
+            max_seq_len);
+
+    LOG(INFO) << "BeamSearchSamplerGraphExecutor initialized for "
+                 "LlmRecPureDevicePipeline with max_prefill_tokens="
+              << max_prefill_tokens << ", max_seq_len=" << max_seq_len;
+  }
+#endif
+
+  return result;
 }
 
 ForwardInput RecWorkerImpl::LlmRecPureDevicePipeline::prepare_inputs(
@@ -419,6 +459,94 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecPureDevicePipeline::step(
     }
 
     if (sampling_params.selected_token_idxes.defined()) {
+#if defined(USE_CUDA)
+      // Try to use CUDA Graph for logits + sampler + beam_search fusion
+      if (beam_search_sampler_graph_executor_) {
+        std::optional<BeamSearchSamplerGraphOutput> graph_result;
+
+        if (round == 0) {
+          // Prefill phase: use forward_prefill
+          const uint32_t num_prefill_tokens =
+              static_cast<uint32_t>(hidden_states.size(0));
+          graph_result = beam_search_sampler_graph_executor_->forward_prefill(
+              hidden_states,
+              sampling_params,
+              beam_tensors.acc_logprob,
+              beam_tensors.sequence_group,
+              static_cast<uint32_t>(batch_size),
+              static_cast<uint32_t>(beam_width),
+              num_prefill_tokens);
+        } else {
+          // Decode phase: use forward with kv_max_seq_len
+          graph_result = beam_search_sampler_graph_executor_->forward(
+              hidden_states,
+              sampling_params,
+              beam_tensors.acc_logprob,
+              beam_tensors.sequence_group,
+              static_cast<uint32_t>(batch_size),
+              static_cast<uint32_t>(beam_width),
+              static_cast<uint32_t>(round),
+              static_cast<uint32_t>(mutable_input.input_params.kv_max_seq_len));
+        }
+
+        if (graph_result.has_value()) {
+          // Use Graph result
+          logits = graph_result->logits;
+          sample_output.top_tokens = graph_result->top_tokens.to(torch::kLong);
+          sample_output.top_logprobs = graph_result->top_logprobs;
+          top_tokens = graph_result->top_tokens.reshape({-1, beam_width});
+
+          // Copy beam search results
+          beam_tensors.out_log_probs.copy_(graph_result->out_acc_logprob,
+                                           /*non_blocking=*/true);
+          beam_tensors.out_token_ids.copy_(graph_result->out_token_ids,
+                                           /*non_blocking=*/true);
+          beam_tensors.out_token_index.copy_(graph_result->out_token_index,
+                                             /*non_blocking=*/true);
+          beam_tensors.out_seqgroup.copy_(graph_result->out_sequence_group,
+                                          /*non_blocking=*/true);
+
+          // Skip eager beam_search since it's already done in graph
+          beam_tensors.sequence_group.copy_(beam_tensors.out_seqgroup,
+                                            /*non_blocking=*/true);
+          beam_tensors.acc_logprob.copy_(beam_tensors.out_log_probs,
+                                         /*non_blocking=*/true);
+
+          if (round < total_rounds - 1) {
+            if (next_round_async_result.has_value()) {
+              update_input_for_next_round(mutable_input,
+                                          round,
+                                          sample_output,
+                                          top_tokens,
+                                          beam_tensors,
+                                          next_round_async_result.value());
+            } else {
+              update_input_for_next_round(mutable_input,
+                                          round,
+                                          sample_output,
+                                          top_tokens,
+                                          beam_tensors,
+                                          batch_size,
+                                          beam_width,
+                                          max_decode_step,
+                                          paged_options);
+            }
+
+            if (round > 0) {
+              execute_cache_select(
+                  beam_tensors, mutable_input, round, beam_width, layer_num);
+            }
+          }
+
+          if (round == total_rounds - 1) {
+            build_final_output(
+                logits, sample_output, sampling_params, beam_tensors, output);
+          }
+          continue;  // Skip eager path
+        }
+      }
+#endif
+      // Eager path (fallback or first round)
       logits = worker_.model_->logits(hidden_states,
                                       sampling_params.selected_token_idxes);
       sample_output = worker_.sampler_->forward(logits, sampling_params);
