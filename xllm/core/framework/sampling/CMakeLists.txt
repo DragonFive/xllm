@@ -11,8 +11,6 @@ cc_library(
     sampler.h
     beam_searcher.h
     rec_constrained_decoding.h
-    sampler_graph.h
-    beam_search_graph.h
     beam_search_sampler_graph.h
   SRCS
     sampling_params.cpp
@@ -21,8 +19,6 @@ cc_library(
     sampler.cpp
     beam_searcher.cpp
     rec_constrained_decoding.cpp
-    sampler_graph.cpp
-    beam_search_graph.cpp
     beam_search_sampler_graph.cpp
   DEPS
     :common
