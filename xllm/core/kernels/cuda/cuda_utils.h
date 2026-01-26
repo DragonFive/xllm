@@ -27,6 +27,16 @@ limitations under the License.
 
 namespace xllm::kernel::cuda {
 
+// Check if NVTX profiling is enabled via environment variable.
+// Returns true only when XLLM_ENABLE_NVTX=1
+inline bool use_nvtx_env() {
+  static bool enabled = []() {
+    const char* env = std::getenv("XLLM_ENABLE_NVTX");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  return enabled;
+}
+
 inline int getMultiProcessorCount() {
   static int nSM{0};
   static std::once_flag flag;
@@ -43,9 +53,20 @@ inline int getMultiProcessorCount() {
 
 class NvtxRange {
  public:
-  NvtxRange(const std::string& name) { nvtxRangePush(name.c_str()); }
+  NvtxRange(const std::string& name) : enabled_(use_nvtx_env()) {
+    if (enabled_) {
+      nvtxRangePush(name.c_str());
+    }
+  }
 
-  ~NvtxRange() { nvtxRangePop(); }
+  ~NvtxRange() {
+    if (enabled_) {
+      nvtxRangePop();
+    }
+  }
+
+ private:
+  bool enabled_;
 };
 
 }  // namespace xllm::kernel::cuda

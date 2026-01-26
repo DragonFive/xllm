@@ -27,6 +27,7 @@
 #include "kernels/cuda/air_topk_last_dim.h"
 #endif
 #include "kernels/cuda/cuda_ops_api.h"
+#include "kernels/cuda/cuda_utils.h"
 
 namespace xllm {
 
@@ -801,6 +802,7 @@ BeamSearchSamplerGraphExecutor::forward(const torch::Tensor& hidden_states,
                                         uint32_t beam_size,
                                         uint32_t current_step,
                                         uint32_t kv_max_seq_len) {
+  kernel::cuda::NvtxRange range("BeamSearchSamplerGraph.forward");
   const uint32_t total_rounds = in_sequence_group.size(2);
 
   if (!should_use_graph(params,
@@ -863,6 +865,7 @@ BeamSearchSamplerGraphExecutor::forward_prefill(
     uint32_t batch_size,
     uint32_t beam_size,
     uint32_t num_prefill_tokens) {
+  kernel::cuda::NvtxRange range("BeamSearchSamplerGraph.forward_prefill");
   const uint32_t total_rounds = in_sequence_group.size(2);
 
   if (!should_use_graph_prefill(params,
