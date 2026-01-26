@@ -205,7 +205,7 @@ bool RecWorkerImpl::LlmRecPureDevicePipeline::create_model(
 #if defined(USE_CUDA)
   // Initialize BeamSearchSamplerGraphExecutor if enabled
   if (result && FLAGS_enable_sampler_beamsearch_graph &&
-      worker.device_.is_cuda() && FLAGS_max_decode_rounds > 0) {
+      worker.device_.unwrap().is_cuda() && FLAGS_max_decode_rounds > 0) {
     const auto& model_args = context.get_model_args();
     uint32_t hidden_size = model_args.hidden_size();
     torch::ScalarType hidden_dtype = worker.dtype();
