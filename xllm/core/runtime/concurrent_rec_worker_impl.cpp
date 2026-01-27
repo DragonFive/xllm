@@ -115,6 +115,44 @@ bool ConcurrentRecWorkerImpl::init_model(ModelContext& context) {
 
 #if defined(USE_CUDA)
     worker_pipeline->flashinfer_workspace_.initialize(device_);
+
+    // Initialize BeamSearchSamplerGraphExecutor if enabled
+    if (FLAGS_enable_sampler_beamsearch_graph && device_.unwrap().is_cuda() &&
+        FLAGS_max_decode_rounds > 0) {
+      const auto& model_args = context.get_model_args();
+      uint32_t hidden_size = model_args.hidden_size();
+      torch::ScalarType hidden_dtype = dtype();
+
+      // Determine max_prefill_tokens for prefill graph
+      const uint32_t max_prefill_tokens =
+          FLAGS_max_tokens_for_graph_mode_prefill > 0
+              ? static_cast<uint32_t>(FLAGS_max_tokens_for_graph_mode_prefill)
+              : 0;  // 0 means prefill graph disabled
+
+      // Determine max_seq_len for decode graph
+      const uint32_t max_seq_len =
+          FLAGS_max_seq_len_for_graph_mode > 0
+              ? static_cast<uint32_t>(FLAGS_max_seq_len_for_graph_mode)
+              : static_cast<uint32_t>(model_args.max_position_embeddings());
+
+      worker_pipeline->beam_search_sampler_graph_executor_ =
+          std::make_unique<BeamSearchSamplerGraphExecutor>(
+              worker_pipeline->model_.get(),
+              static_cast<uint32_t>(options_.max_seqs_per_batch()),
+              static_cast<uint32_t>(options_.beam_width()),
+              static_cast<uint32_t>(FLAGS_max_decode_rounds),
+              hidden_size,
+              hidden_dtype,
+              device_,
+              max_prefill_tokens,
+              max_seq_len);
+
+      LOG(INFO) << "BeamSearchSamplerGraphExecutor initialized for "
+                   "ConcurrentLlmRecPureDevicePipeline["
+                << i << "] with "
+                << "max_prefill_tokens=" << max_prefill_tokens
+                << ", max_seq_len=" << max_seq_len;
+    }
 #endif
 
     multi_stream_pipelines_.emplace_back(std::move(worker_pipeline));
