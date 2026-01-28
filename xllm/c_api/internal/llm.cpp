@@ -26,6 +26,7 @@ limitations under the License.
 #include <exception>
 #include <stdexcept>
 
+#include "core/common/global_flags.h"  // Sync C API config to gflags
 #include "helper.h"
 
 XLLM_CAPI_EXPORT XLLM_LLM_Handler* xllm_llm_create(void) {
@@ -113,6 +114,21 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
         .enable_shm(xllm_init_options.enable_shm)
         .is_local(true)
         .server_idx(xllm_init_options.server_idx);
+
+    // Sync C API options to gflags to ensure core code behavior matches
+    // Options. Background: Some core modules read FLAGS_* directly instead of
+    // from options:
+    // - NPU decoder layer and Batch use FLAGS_enable_chunked_prefill
+    // - ContinuousScheduler uses FLAGS_enable_prefix_cache
+    // - Batch uses FLAGS_enable_schedule_overlap
+    // - NPU qwen3 decoder layer uses FLAGS_block_size
+    // - acl_graph_executor/profile_manager use FLAGS_max_tokens/seqs_per_batch
+    FLAGS_enable_chunked_prefill = xllm_init_options.enable_chunked_prefill;
+    FLAGS_enable_prefix_cache = xllm_init_options.enable_prefix_cache;
+    FLAGS_enable_schedule_overlap = xllm_init_options.enable_schedule_overlap;
+    FLAGS_block_size = xllm_init_options.block_size;
+    FLAGS_max_tokens_per_batch = xllm_init_options.max_tokens_per_batch;
+    FLAGS_max_seqs_per_batch = xllm_init_options.max_seqs_per_batch;
 
     handler->master = std::make_unique<xllm::LLMMaster>(options);
     handler->master->run();
