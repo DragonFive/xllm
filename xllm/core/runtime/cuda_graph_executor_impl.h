@@ -17,11 +17,15 @@ limitations under the License.
 
 #include <ATen/cuda/CUDAGraph.h>
 #include <absl/container/flat_hash_map.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "core/common/macros.h"
@@ -33,6 +37,11 @@ limitations under the License.
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
+
+namespace xllm {
+class SharedVMMAllocator;
+class VMMTorchAllocator;
+}  // namespace xllm
 
 namespace xllm::runtime::cuda {
 
@@ -163,6 +172,9 @@ class CudaGraphPersistentParam {
       int64_t n_heads,
       int64_t head_dim) const;
 
+  // Total bytes of all persistent input tensors (for logging)
+  size_t GetPersistentTensorBytes() const;
+
  private:
   const ModelArgs& args_;
   const torch::Device& device_;
@@ -218,7 +230,8 @@ class CudaGraph {
                const ModelInputParams& params,
                std::vector<KVCache>& kv_cache,
                uint32_t bucket_num_tokens,
-               const at::cuda::MempoolId_t& pool);
+               const at::cuda::MempoolId_t& pool,
+               c10::cuda::MemPool* pool_ptr = nullptr);
 
   // Replay captured graph with new input data
   torch::Tensor replay(const torch::Tensor& tokens,
@@ -261,7 +274,7 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
                         const torch::Device& device,
                         const runtime::Options& options);
 
-  ~CudaGraphExecutorImpl() override = default;
+  ~CudaGraphExecutorImpl() override;
 
   ForwardInput prepare_inputs(Batch& batch) override;
 
@@ -299,10 +312,28 @@ class CudaGraphExecutorImpl : public ExecutorImpl {
   uint32_t get_bucket_num_tokens(uint32_t num_tokens,
                                  bool is_prefill = false) const;
 
-  // Get CUDA graph memory pool for current thread
-  // Each thread automatically gets its own graph memory pool
-  // Maximum number of pools is limited by FLAGS_rec_worker_max_concurrency
-  static at::cuda::MempoolId_t get_mem_pool();
+  // Get CUDA graph memory pool id for capture. When VMM is enabled, uses
+  // per-shape MemPool under (physical_pool_id, shape_id). Same physical_pool_id
+  // => reuse across different shapes (e.g. prefill vs decode are different
+  // pools).
+  at::cuda::MempoolId_t get_mem_pool(uint32_t physical_pool_id = 0,
+                                     uint32_t shape_id = 0);
+
+  // Switch VMM allocator to a new virtual address space before capture for the
+  // given physical pool. Enables physical memory reuse within that pool across
+  // shapes (max(shape) instead of sum(shape)).
+  void reset_vmm_allocator_offset(uint32_t physical_pool_id);
+
+  struct VmmPoolState;
+
+  VmmPoolState& get_or_create_vmm_pool_state(uint32_t physical_pool_id);
+  c10::cuda::MemPool* get_or_create_vmm_mempool(uint32_t physical_pool_id,
+                                                uint32_t shape_id);
+  c10::cuda::MemPool* get_vmm_mempool(uint32_t physical_pool_id,
+                                      uint32_t shape_id);
+
+  std::mutex vmm_mutex_;
+  std::map<uint32_t, std::unique_ptr<VmmPoolState>> vmm_pools_;
 
   // Get CUDA capture stream for current thread
   // Each thread automatically gets its own high-priority capture stream

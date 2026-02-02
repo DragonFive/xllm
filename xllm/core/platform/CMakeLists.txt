@@ -1,4 +1,5 @@
 include(cc_library)
+include(cc_test)
 
 if(USE_NPU)
   add_subdirectory(npu)
@@ -11,10 +12,13 @@ cc_library(
     stream.h
     device.h
     vmm_api.h
+    shared_vmm_allocator.h
+    vmm_torch_allocator.h
   SRCS
     stream.cpp
     device.cpp
     vmm_api.cpp
+    shared_vmm_allocator.cpp
   DEPS
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
@@ -27,4 +31,18 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:platform_npu>
 )
 
+if(USE_CUDA OR USE_ILU)
+cc_test(
+  NAME
+    platform_vmm_test
+  SRCS
+    shared_vmm_allocator_test.cpp
+  DEPS
+    :platform
+    :flags
+    GTest::gtest_main
+    gflags::gflags
+    glog::glog
+)
+endif()
 
