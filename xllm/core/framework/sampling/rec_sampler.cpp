@@ -31,15 +31,15 @@ namespace xllm {
 namespace {
 
 static inline bool use_air_log_softmax_env() {
-  const char* v = std::getenv("XLLM_USE_AIR_LOG_SOFTMAX");
-  if (!v) {
-    return false;
-  }
-  if (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' ||
-      v[0] == 'N') {
-    return false;
-  }
-  return true;
+  static const bool enabled = []() {
+    const char* v = std::getenv("XLLM_USE_AIR_LOG_SOFTMAX");
+    if (!v) {
+      return false;
+    }
+    return v[0] != '0' && v[0] != 'f' && v[0] != 'F' && v[0] != 'n' &&
+           v[0] != 'N';
+  }();
+  return enabled;
 }
 
 static inline torch::Tensor log_softmax_last_dim(
@@ -91,11 +91,7 @@ SampleOutput RecSampler::forward(torch::Tensor& logits,
     return sampler_->forward(logits, params);
   }
 
-  static bool fast_path_logged = false;
-  if (!fast_path_logged) {
-    LOG(INFO) << "RecSampler fast path activated.";
-    fast_path_logged = true;
-  }
+  LOG_FIRST_N(INFO, 1) << "RecSampler fast path activated.";
 
   SampleOutput output;
 
