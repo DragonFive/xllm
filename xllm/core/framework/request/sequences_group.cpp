@@ -352,8 +352,13 @@ void SequencesGroup::generate_multi_round_output(
     float lp = (b < last_lps.size()) ? last_lps[b] : 0.0f;
     rank.emplace_back(lp, b);
   }
+  // Sort descending by logprob; tie-break by beam index for deterministic
+  // output ordering.
   std::sort(rank.begin(), rank.end(), [](const auto& l, const auto& r) {
-    return l.first < r.first;
+    if (l.first != r.first) {
+      return l.first > r.first;
+    }
+    return l.second < r.second;
   });
 
   const auto& flat2d = base.beam_seq_group_flat();
@@ -368,12 +373,30 @@ void SequencesGroup::generate_multi_round_output(
     out.index = i;
     out.text = tokenizer.decode(Slice<int32_t>{gen_ids.data(), gen_ids.size()},
                                 sequence_params_.skip_special_tokens);
-    out.token_ids = std::move(gen_ids);
+    out.token_ids = gen_ids;
 
     auto fr = base.finish_reason().to_string();
     if (fr.has_value()) {
       out.finish_reason = fr.value();
     }
+
+    // Build logprobs when requested.
+    // FIXME(beam-logprobs): The pure-device beam search pipeline only stores
+    // the accumulated logprob per beam (beam_last_logprobs), NOT per-token
+    // logprobs. Only one entry is emitted for the last token.
+    if (sequence_params_.logprobs && !gen_ids.empty()) {
+      const size_t beam_idx = rank[i].second;
+      const int32_t last_token_id = gen_ids.back();
+
+      LogProb lp;
+      lp.token_id = last_token_id;
+      lp.logprob = last_lps[beam_idx];
+
+      std::vector<LogProb> lps;
+      lps.emplace_back(std::move(lp));
+      out.logprobs = std::move(lps);
+    }
+
     outputs.push_back(std::move(out));
   }
 }
