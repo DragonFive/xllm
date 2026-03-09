@@ -20,12 +20,58 @@ limitations under the License.
 #include <mstx/ms_tools_ext.h>
 
 #include <cstring>
+#include <sstream>
 #include <map>
 #include <set>
 
 #include "common/global_flags.h"
 namespace xllm {
 namespace layer {
+namespace {
+
+const char* BoolStr(bool value) { return value ? "true" : "false"; }
+
+const char* GetLayerRole(bool is_decoder) {
+  return is_decoder ? "decoder" : "encoder";
+}
+
+const char* GetNodeRole(const atb_speed::onerec::BlockLayerParam& param) {
+  if (!param.isDecoder) {
+    return param.isPrefill ? "encoder-prefill" : "encoder-decode";
+  }
+  return param.isPrefill ? "decoder-prefill" : "decoder-decode";
+}
+
+void LogBlockLayerParam(const char* prefix,
+                        const atb_speed::onerec::BlockLayerParam& param) {
+  LOG(INFO) << prefix << ", node=" << GetNodeRole(param)
+            << ", layer_id=" << param.layerId
+            << ", is_decoder=" << BoolStr(param.isDecoder)
+            << ", use_moe=" << BoolStr(param.use_moe)
+            << ", enableOneRecPrefillOnly="
+            << BoolStr(param.enableOneRecPrefillOnly)
+            << ", worldSize=" << param.worldSize << ", rank=" << param.rank
+            << ", heads_per_rank=" << param.numAttentionHeadsPerRank
+            << ", kv_heads_per_rank=" << param.numKeyValueHeadsPerRank
+            << ", head_dim=" << param.hiddenSizePerAttentionHead;
+}
+
+std::string TensorDescToString(const atb::Tensor& t) {
+  std::ostringstream oss;
+  oss << "format=" << static_cast<int>(t.desc.format)
+      << ", dtype=" << static_cast<int>(t.desc.dtype)
+      << ", dimNum=" << t.desc.shape.dimNum << ", dims=[";
+  for (uint32_t i = 0; i < t.desc.shape.dimNum; ++i) {
+    if (i) {
+      oss << ",";
+    }
+    oss << t.desc.shape.dims[i];
+  }
+  oss << "]";
+  return oss.str();
+}
+
+}  // namespace
 
 // Decoder normal mode: self-attn(29) + cross-attn(28) + layer-norm(4) + mlp(18)
 // = 79
@@ -339,35 +385,73 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
     : BaseLayer(context), is_decoder_(is_decoder), layer_id_(layer_id) {
   const auto& args = context.get_model_args();
   const auto& parallel_args = context.get_parallel_args();
+  LOG(INFO) << "NpuOneRecBlockLayerImpl ctor begin"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_
+            << ", hidden_size=" << args.hidden_size()
+            << ", dtype=" << args.dtype()
+            << ", world_size=" << parallel_args.world_size()
+            << ", rank=" << parallel_args.rank();
 
   param_from_args(prefill_param_, args, parallel_args, /*is_prefill=*/true);
   param_from_args(decode_param_, args, parallel_args, /*is_prefill=*/false);
+  LogBlockLayerParam("NpuOneRecBlockLayerImpl ctor prefill param",
+                     prefill_param_);
+  if (is_decoder_) {
+    LogBlockLayerParam("NpuOneRecBlockLayerImpl ctor decode param",
+                       decode_param_);
+  }
 
   const int weight_count = prefill_param_.use_moe
                                ? kOneRecMoeWeightCountPerLayer
                                : kOneRecWeightCountPerLayer;
   at_weight_tensors_.resize(weight_count);
   atb_weight_tensors_.resize(weight_count);
+  LOG(INFO) << "NpuOneRecBlockLayerImpl ctor weight buffers resized"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_
+            << ", weight_count=" << weight_count;
 
   placeholder_vec_ = {1, 1};
   dtype_ = c10::typeMetaToScalarType(context.get_tensor_options().dtype());
   device_id_ = context.get_tensor_options().device().index();
 
+  LOG(INFO) << "NpuOneRecBlockLayerImpl ctor allocate placeholders begin"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_
+            << ", device_id=" << device_id_;
   auto placeholder_tensor = torch::empty({1, 1}, torch::kInt32).to(device_);
   placeholder_ = atb_speed::Utils::AtTensor2Tensor(placeholder_tensor);
   at_placeholder_ = torch::empty({1, args.hidden_size()}, dtype_).to(device_);
+  LOG(INFO) << "NpuOneRecBlockLayerImpl ctor allocate placeholders done"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_;
 
   for (int i = 0; i < weight_count; ++i) {
     at_weight_tensors_[i] =
         torch::zeros({1, args.hidden_size()}).to(context.get_tensor_options());
   }
+  LOG(INFO) << "NpuOneRecBlockLayerImpl ctor placeholder weights allocated"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_
+            << ", weight_count=" << weight_count;
 
   if (prefill_param_.use_moe) {
     auto device = context.get_tensor_options().device();
+    LOG(INFO) << "NpuOneRecBlockLayerImpl ctor allocate moe helpers begin"
+              << ", layer_id=" << layer_id_
+              << ", layer_role=" << GetLayerRole(is_decoder_);
     one_hot_ = torch::tensor({1}, torch::kInt32).to(device);
     zero_hot_ = torch::tensor({0}, torch::kInt32).to(device);
     expert_group_ = torch::tensor({1}, torch::dtype(torch::kInt32)).to(device);
+    LOG(INFO) << "NpuOneRecBlockLayerImpl ctor allocate moe helpers done"
+              << ", layer_id=" << layer_id_
+              << ", layer_role=" << GetLayerRole(is_decoder_);
   }
+
+  LOG(INFO) << "NpuOneRecBlockLayerImpl ctor done"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_;
 }
 
 void NpuOneRecBlockLayerImpl::param_from_args(
@@ -563,12 +647,27 @@ bool NpuOneRecBlockLayerImpl::validate_decoder_moe_weights(
 }
 
 void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
+  LOG(INFO) << "OneRec BlockLayer merge_loaded_weights begin"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_;
+  LogBlockLayerParam("OneRec BlockLayer merge_loaded_weights prefill context",
+                     prefill_param_);
+  if (is_decoder_) {
+    LogBlockLayerParam("OneRec BlockLayer merge_loaded_weights decode context",
+                       decode_param_);
+  }
+
   const bool q_loaded = !(at_weight_tensors_[IN_Q_WEIGHT].sizes().size() == 2 &&
                           at_weight_tensors_[IN_Q_WEIGHT].sizes()[0] == 1);
   const bool k_loaded = !(at_weight_tensors_[IN_K_WEIGHT].sizes().size() == 2 &&
                           at_weight_tensors_[IN_K_WEIGHT].sizes()[0] == 1);
   const bool v_loaded = !(at_weight_tensors_[IN_V_WEIGHT].sizes().size() == 2 &&
                           at_weight_tensors_[IN_V_WEIGHT].sizes()[0] == 1);
+  LOG(INFO) << "OneRec BlockLayer merge_loaded_weights base weight status"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_ << ", q_loaded=" << BoolStr(q_loaded)
+            << ", k_loaded=" << BoolStr(k_loaded)
+            << ", v_loaded=" << BoolStr(v_loaded);
   CHECK(q_loaded && k_loaded && v_loaded)
       << "OneRec QKV weights are not properly loaded.";
 
@@ -596,6 +695,11 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
     const bool wi1_loaded =
         !(at_weight_tensors_[IN_FFN_WI_1_WEIGHT].sizes().size() == 2 &&
           at_weight_tensors_[IN_FFN_WI_1_WEIGHT].sizes()[0] == 1);
+    LOG(INFO) << "OneRec BlockLayer merge_loaded_weights dense FFN status"
+              << ", layer_role=" << GetLayerRole(is_decoder_)
+              << ", layer_id=" << layer_id_
+              << ", wi0_loaded=" << BoolStr(wi0_loaded)
+              << ", wi1_loaded=" << BoolStr(wi1_loaded);
     CHECK(wi0_loaded && wi1_loaded)
         << "OneRec FFN gate/up weights are not properly loaded.";
 
@@ -609,6 +713,9 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
             .to(device_)
             .to(dtype_);
   } else {
+    LOG(INFO) << "OneRec BlockLayer merge_loaded_weights entering MoE merge"
+              << ", layer_id=" << layer_id_
+              << ", layer_role=" << GetLayerRole(is_decoder_);
     merge_experts_weights();
     merge_shared_experts_weights();
   }
@@ -631,7 +738,14 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors_[i]);
   }
 
-  init_layer();
+  LOG(INFO) << "OneRec BlockLayer merge_loaded_weights calling init_layer"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_
+            << ", weight_count=" << weight_count;
+  const int64_t init_status = init_layer();
+  LOG(INFO) << "OneRec BlockLayer merge_loaded_weights init_layer returned"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_ << ", status=" << init_status;
 }
 
 void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
@@ -704,7 +818,17 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
   name_ =
       is_decoder_ ? "onerec_decoder_block_layer" : "onerec_encoder_block_layer";
   model_name_ = "onerec";
-  CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
+  LOG(INFO) << "OneRec BlockLayer init_layer begin"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_ << ", name=" << name_;
+  LogBlockLayerParam("OneRec BlockLayer init_layer prefill plan",
+                     prefill_param_);
+  const int64_t prefill_status = init_node(prefill_node_, prefill_param_);
+  LOG(INFO) << "OneRec BlockLayer init_layer node returned"
+            << ", node=" << GetNodeRole(prefill_param_)
+            << ", layer_id=" << layer_id_
+            << ", status=" << prefill_status;
+  CHECK_OPERATION_STATUS_RETURN(prefill_status);
   if (is_decoder_) {
     if (FLAGS_enable_rec_prefill_only) {
       LOG(INFO) << "OneRec BlockLayer init_layer skip decode node because "
@@ -728,6 +852,9 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
               << ", layer_role=" << GetLayerRole(is_decoder_)
               << ", layer_id=" << layer_id_;
   }
+  LOG(INFO) << "OneRec BlockLayer init_layer success"
+            << ", layer_role=" << GetLayerRole(is_decoder_)
+            << ", layer_id=" << layer_id_ << ", status=" << atb::NO_ERROR;
   return atb::NO_ERROR;
 }
 
@@ -736,17 +863,25 @@ int64_t NpuOneRecBlockLayerImpl::init_attn_mask() { return atb::NO_ERROR; }
 int64_t NpuOneRecBlockLayerImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::onerec::BlockLayerParam& param) {
+  LogBlockLayerParam("OneRec BlockLayer init_node begin", param);
   atb::Operation* operation = nullptr;
   atb::Status status = atb_speed::onerec::BlockLayer(param, &operation);
   if (status != atb::NO_ERROR) {
-    LOG(ERROR) << "Failed to create ONEREC BlockLayer operation, status: "
-               << status;
+    LOG(ERROR) << "Failed to create ONEREC BlockLayer operation"
+               << ", node=" << GetNodeRole(param)
+               << ", layer_id=" << param.layerId << ", status=" << status;
     return status;
   }
 
+  LOG(INFO) << "OneRec BlockLayer operation created"
+            << ", node=" << GetNodeRole(param)
+            << ", layer_id=" << param.layerId << ", status=" << status;
+
   node.operation.reset(operation);
   if (node.operation == nullptr) {
-    LOG(ERROR) << "node.operation is null after creation";
+    LOG(ERROR) << "OneRec BlockLayer node.operation is null after creation"
+               << ", node=" << GetNodeRole(param)
+               << ", layer_id=" << param.layerId << ", status=-1";
     return -1;
   }
 
@@ -769,6 +904,12 @@ int64_t NpuOneRecBlockLayerImpl::init_node(
   node.variantPack.inTensors.resize(input_num);
   node.variantPack.outTensors.resize(output_num);
 
+  LOG(INFO) << "OneRec BlockLayer init_node success"
+            << ", node=" << GetNodeRole(param)
+            << ", layer_id=" << param.layerId << ", input_num=" << input_num
+            << ", output_num=" << output_num
+            << ", weight_count=" << weight_count
+            << ", status=" << atb::NO_ERROR;
   return atb::NO_ERROR;
 }
 
@@ -811,6 +952,72 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
                                         encoder_output,
                                         node_id);
       }
+      if (FLAGS_enable_rec_prefill_only && node_id == 0) {
+        const auto* debug_params = input_params.onerec_params();
+        LOG(INFO) << "OneRec decoder prefill debug: layer_id=" << layer_id_
+                  << ", node_id=" << node_id
+                  << ", x_sizes=" << c10::str(x.sizes())
+                  << ", x_dim=" << x.dim()
+                  << ", x_contig=" << BoolStr(x.is_contiguous())
+                  << ", attn_mask_sizes=" << c10::str(attn_mask.sizes())
+                  << ", attn_mask_dim=" << attn_mask.dim()
+                  << ", attn_mask_contig=" << BoolStr(attn_mask.is_contiguous())
+                  << ", q_max_seq_len=" << input_params.q_max_seq_len
+                  << ", kv_max_seq_len=" << input_params.kv_max_seq_len
+                  << ", encoder_max_seq_len="
+                  << (debug_params != nullptr ? debug_params->encoder_max_seq_len
+                                              : -1)
+                  << ", encoder_seq_lens_size="
+                  << (debug_params != nullptr
+                          ? static_cast<int64_t>(debug_params->encoder_seq_lens
+                                                     .size())
+                          : -1)
+                  << ", cross_attn_kv_cu_seq_lens_shape="
+                  << (debug_params != nullptr &&
+                              debug_params->cross_attn_kv_cu_seq_lens.defined()
+                          ? c10::str(
+                                debug_params->cross_attn_kv_cu_seq_lens.sizes())
+                          : "undefined")
+                  << ", cross_attn_kv_cu_seq_lens_vec_size="
+                  << (debug_params != nullptr
+                          ? static_cast<int64_t>(
+                                debug_params->cross_attn_kv_cu_seq_lens_vec
+                                    .size())
+                          : -1)
+                  << ", cross_attn_block_tables_shape="
+                  << (debug_params != nullptr &&
+                              debug_params->cross_attn_block_tables.defined()
+                          ? c10::str(
+                                debug_params->cross_attn_block_tables.sizes())
+                          : "undefined")
+                  << ", cross_attn_new_cache_slots_shape="
+                  << (debug_params != nullptr &&
+                              debug_params->cross_attn_new_cache_slots.defined()
+                          ? c10::str(
+                                debug_params->cross_attn_new_cache_slots.sizes())
+                          : "undefined");
+
+        LOG(INFO) << "OneRec decoder prefill debug: atb_x_desc="
+                  << TensorDescToString(internal_tensors_);
+        if (encoder_output != nullptr) {
+          LOG(INFO)
+              << "OneRec decoder prefill debug: encoder_output_logical_sizes="
+              << c10::str(encoder_output->sizes())
+              << ", encoder_output_logical_dim=" << encoder_output->dim()
+              << ", encoder_output_logical_contig="
+              << BoolStr(encoder_output->is_contiguous())
+              << ", encoder_output_contig_sizes="
+              << c10::str(encoder_output_contiguous_.sizes())
+              << ", encoder_output_contig_dim=" << encoder_output_contiguous_.dim()
+              << ", encoder_output_contig_contig="
+              << BoolStr(encoder_output_contiguous_.is_contiguous())
+              << ", atb_encoder_output_desc="
+              << TensorDescToString(atb_speed::Utils::AtTensor2Tensor(
+                     encoder_output_contiguous_));
+        } else {
+          LOG(INFO) << "OneRec decoder prefill debug: encoder_output=nullptr";
+        }
+      }
       st = execute_node(prefill_node_, node_id, event, event_flag);
       LOG_IF(FATAL, st != 0)
           << model_name_ << " execute prefill layer fail, error code: " << st;
@@ -823,6 +1030,12 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
           << " execute encoder prefill layer fail, error code: " << st;
     }
   } else {
+    if (FLAGS_enable_rec_prefill_only) {
+      LOG(FATAL) << model_name_
+                 << " decoder decode stage is not supported when "
+                    "enable_rec_prefill_only is enabled"
+                 << ", layer_id=" << layer_id_ << ", node_id=" << node_id;
+    }
     if (!is_decoder_) {
       LOG(FATAL) << model_name_ << " encoder decode stage is not supported.";
     }
@@ -1009,6 +1222,7 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   }
   idx++;
 
+  const auto* onerec_params = input_params.onerec_params();
   if (encoder_output != nullptr) {
     encoder_output_contiguous_ = encoder_output->is_contiguous()
                                      ? *encoder_output
@@ -1016,6 +1230,18 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     node.variantPack.inTensors.at(idx) =
         atb_speed::Utils::AtTensor2Tensor(encoder_output_contiguous_);
   } else {
+    if (onerec_params != nullptr && onerec_params->has_encoder_output) {
+      LOG(ERROR) << "OneRec decoder expected encoder_output tensor, but got "
+                    "nullptr"
+                 << ", layer_id=" << layer_id_
+                 << ", rec_stage="
+                 << (onerec_params->rec_stage ==
+                             OneRecModelInputParams::RecStage::PREFILL
+                         ? "PREFILL"
+                         : "DECODE")
+                 << ", enable_rec_prefill_only="
+                 << FLAGS_enable_rec_prefill_only;
+    }
     node.variantPack.inTensors.at(idx) = placeholder_;
   }
   idx++;
@@ -1025,7 +1251,6 @@ int NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     node.variantPack.inTensors.at(idx++).hostData = placeholder_vec_.data();
   }
 
-  const auto* onerec_params = input_params.onerec_params();
   if (onerec_params != nullptr &&
       onerec_params->encoder_seq_lens_tensor.defined()) {
     node.variantPack.inTensors.at(idx) = atb_speed::Utils::AtTensor2Tensor(

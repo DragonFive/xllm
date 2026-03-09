@@ -96,8 +96,19 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
   //     graph_captured_ = true;
   //   }
   // }
+  const bool is_onerec_debug =
+      (name_.rfind("onerec", 0) == 0) && FLAGS_enable_rec_prefill_only &&
+      (node_id == 0);
+
+  if (is_onerec_debug) {
+    LOG(INFO) << name_ << " execute_node: Setup begin";
+  }
   atb::Status st =
       node.operation->Setup(node.variantPack, node.workspaceSize, context_);
+  if (is_onerec_debug) {
+    LOG(INFO) << name_ << " execute_node: Setup done, status=" << st
+              << ", workspaceSize=" << node.workspaceSize;
+  }
   if (st != 0) {
     LOG(ERROR) << " setup layer node fail, not call execute";
     return st;
@@ -108,8 +119,15 @@ atb::Status BaseLayer::execute_node(atb_speed::Model::Node& node,
   }
 
   run_task_func_(name_ + std::to_string(node_id), [=, this]() {
-    return execute_plan(
-        node, name_ + std::to_string(node_id), event, event_flag);
+    if (is_onerec_debug) {
+      LOG(INFO) << name_ << " execute_node: Execute begin";
+    }
+    const atb::Status exec_status =
+        execute_plan(node, name_ + std::to_string(node_id), event, event_flag);
+    if (is_onerec_debug) {
+      LOG(INFO) << name_ << " execute_node: Execute done, status=" << exec_status;
+    }
+    return exec_status;
   });
 
   return st;

@@ -775,6 +775,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
                             MasterStatus master_status) {
   // set same random seed for all worker
   device_.set_seed(random_seed);
+  LOG(INFO) << "WorkerImpl::init_model begin: model_path=" << model_weights_path
+            << ", rank=" << parallel_args_.rank()
+            << ", world_size=" << parallel_args_.world_size()
+            << ", backend=" << options_.backend()
+            << ", device_index=" << device_.index()
+            << ", random_seed=" << random_seed;
 
   auto model_loader = ModelLoader::create(model_weights_path);
   model_weights_path_ = std::move(model_weights_path);
@@ -784,6 +790,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   auto args = model_loader->model_args();
   auto quant_args = model_loader->quant_args();
   torch::ScalarType dtype = util::parse_dtype(args.dtype(), device_);
+  LOG(INFO) << "WorkerImpl::init_model loader ready: model_type="
+            << args.model_type()
+            << ", dtype=" << args.dtype()
+            << ", tokenizer_vocab_size=" << tokenizer->vocab_size()
+            << ", model_vocab_size=" << args.vocab_size()
+            << ", enable_rec_prefill_only=" << FLAGS_enable_rec_prefill_only;
 
   const int64_t tokenizer_vocab_size =
       static_cast<int64_t>(tokenizer->vocab_size());
@@ -824,13 +836,18 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   auto tensor_options = torch::dtype(dtype_).device(device_);
   context_ = ModelContext(parallel_args_, args, quant_args, tensor_options);
   context_.set_model_id(options_.model_id());
+  LOG(INFO) << "WorkerImpl::init_model context ready: model_type="
+            << context_.get_model_args().model_type()
+            << ", tensor_options=" << tensor_options;
 
   // init model, create model executor
+  LOG(INFO) << "WorkerImpl::init_model entering derived init_model(context)";
   bool status = this->init_model(context_);
   if (!status) {
     LOG(ERROR) << "init_model failed";
     return false;
   }
+  LOG(INFO) << "WorkerImpl::init_model derived init_model(context) done";
 
   int32_t tp_world_size = parallel_args_.world_size();
   if (parallel_args_.tp_group_) {
@@ -847,11 +864,16 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
         std::make_unique<ScopedAtenLoadThreads>(/*target_threads=*/1);
   }
 
+  LOG(INFO) << "WorkerImpl::init_model start weight loading: model_type="
+            << args.model_type() << ", tp_world_size=" << tp_world_size
+            << ", master_status=" << static_cast<int>(master_status);
   if (master_status == MasterStatus::WAKEUP) {
     this->load_model(std::move(model_loader));
   } else if (master_status == MasterStatus::LIGHT_SLEEP) {
     this->lazy_load_model(std::move(model_loader));
   }
+  LOG(INFO) << "WorkerImpl::init_model weight loading finished: model_type="
+            << args.model_type();
 
   if (scoped_load_threads) {
     LOG(INFO) << "Weight loading completed, restored ATen threads="

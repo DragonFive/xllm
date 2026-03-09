@@ -307,6 +307,20 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
       rec_params.decoder_context_embedding.defined();
   const bool has_encoder_context =
       rec_params.has_encoder_output || has_decoder_context;
+  LOG(INFO) << "OneRecWorkPipeline::step begin: rec_stage="
+            << (rec_params.rec_stage == OneRecModelInputParams::RecStage::PREFILL
+                    ? "PREFILL"
+                    : "DECODE")
+            << ", is_first_prefill=" << rec_params.is_first_prefill
+            << ", has_encoder_output=" << rec_params.has_encoder_output
+            << ", has_decoder_context=" << has_decoder_context
+            << ", token_ids_defined=" << input.token_ids.defined()
+            << ", token_ids_shape="
+            << (input.token_ids.defined() ? c10::str(input.token_ids.sizes())
+                                          : "undefined")
+            << ", positions_shape="
+            << (input.positions.defined() ? c10::str(input.positions.sizes())
+                                          : "undefined");
 
   torch::Tensor hidden_states;
   if (rec_params.rec_stage == OneRecModelInputParams::RecStage::PREFILL) {
@@ -319,6 +333,14 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
       decoder_params.mutable_onerec_params().is_encoder_forward = false;
       decoder_params.mutable_onerec_params().has_encoder_output =
           rec_params.has_encoder_output;
+      LOG(INFO) << "OneRecWorkPipeline::step prefill(reuse encoder context): "
+                << "decoder_context_shape="
+                << (decoder_params.onerec_params() != nullptr &&
+                            decoder_params.onerec_params()
+                                ->decoder_context_embedding.defined()
+                        ? c10::str(decoder_params.onerec_params()
+                                       ->decoder_context_embedding.sizes())
+                        : "undefined");
       auto model_output = runtime_.executor->forward(input.token_ids,
                                                      input.positions,
                                                      runtime_.worker.kv_caches_,
@@ -329,6 +351,25 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
           rec_params.encoder_sparse_embedding.defined();
       const bool has_encoder_tokens = rec_params.encoder_token_ids.defined() &&
                                       rec_params.encoder_positions.defined();
+      LOG(INFO) << "OneRecWorkPipeline::step first prefill inputs: "
+                << "has_sparse_embedding=" << has_sparse_embedding
+                << ", sparse_embedding_shape="
+                << (has_sparse_embedding
+                        ? c10::str(rec_params.encoder_sparse_embedding.sizes())
+                        : "undefined")
+                << ", has_encoder_tokens=" << has_encoder_tokens
+                << ", encoder_token_ids_shape="
+                << (rec_params.encoder_token_ids.defined()
+                        ? c10::str(rec_params.encoder_token_ids.sizes())
+                        : "undefined")
+                << ", encoder_positions_shape="
+                << (rec_params.encoder_positions.defined()
+                        ? c10::str(rec_params.encoder_positions.sizes())
+                        : "undefined")
+                << ", decoder_context_shape="
+                << (has_decoder_context
+                        ? c10::str(rec_params.decoder_context_embedding.sizes())
+                        : "undefined");
 
       if (!has_sparse_embedding && !has_encoder_tokens) {
         LOG(ERROR) << "OneRec first prefill requires encoder inputs.";
@@ -353,6 +394,13 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
                                      rec_params.encoder_positions,
                                      runtime_.worker.kv_caches_,
                                      encoder_params);
+      LOG(INFO) << "OneRecWorkPipeline::step encoder forward done: "
+                << "encoder_tokens_shape="
+                << c10::str(encoder_tokens.sizes())
+                << ", encoder_hidden_shape="
+                << (encoder_output.hidden_states.defined()
+                        ? c10::str(encoder_output.hidden_states.sizes())
+                        : "undefined");
 
       ModelInputParams decoder_params = input_params;
       auto& decoder_onerec_params = decoder_params.mutable_onerec_params();
@@ -383,6 +431,13 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
     decoder_params.mutable_onerec_params().is_encoder_forward = false;
     decoder_params.mutable_onerec_params().has_encoder_output =
         rec_params.has_encoder_output;
+    LOG(INFO) << "OneRecWorkPipeline::step decode begin: decoder_context_shape="
+              << (decoder_params.onerec_params() != nullptr &&
+                          decoder_params.onerec_params()
+                              ->decoder_context_embedding.defined()
+                      ? c10::str(decoder_params.onerec_params()
+                                     ->decoder_context_embedding.sizes())
+                      : "undefined");
     auto model_output = runtime_.executor->forward(input.token_ids,
                                                    input.positions,
                                                    runtime_.worker.kv_caches_,
@@ -391,12 +446,22 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   }
 
   if (!hidden_states.defined()) {
+    LOG(ERROR) << "OneRecWorkPipeline::step hidden_states is undefined";
     return std::nullopt;
   }
 
+  LOG(INFO) << "OneRecWorkPipeline::step hidden_states ready: shape="
+            << c10::str(hidden_states.sizes())
+            << ", dim=" << hidden_states.dim()
+            << ", contiguous=" << hidden_states.is_contiguous();
+
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
       !runtime_.worker.options_.enable_speculative_decode()) {
-    runtime_.stream->synchronize();
+    LOG(INFO) << "OneRecWorkPipeline::step no-driver path: before synchronize";
+    const auto ret = runtime_.stream->synchronize();
+    LOG(INFO) << "OneRecWorkPipeline::step no-driver path: after synchronize, "
+                 "ret="
+              << ret;
     COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
     DeviceMonitor::get_instance().update_active_activation_memory(
         runtime_.worker.device_.index());
@@ -405,15 +470,35 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
 
   torch::Tensor logits;
   if (sampling_params.selected_token_idxes.defined()) {
+    LOG(INFO) << "OneRecWorkPipeline::step before logits: "
+              << "selected_token_idxes_shape="
+              << c10::str(sampling_params.selected_token_idxes.sizes());
     logits = runtime_.model->logits(hidden_states,
                                     sampling_params.selected_token_idxes);
+    LOG(INFO) << "OneRecWorkPipeline::step after logits: "
+              << "logits_shape=" << c10::str(logits.sizes())
+              << ", logits_dim=" << logits.dim()
+              << ", logits_contiguous=" << logits.is_contiguous();
   }
 
   ForwardOutput output;
 
   if (sampling_params.selected_token_idxes.defined()) {
+    LOG(INFO) << "OneRecWorkPipeline::step before sampler";
     auto sample_output =
         runtime_.worker.sampler_->forward(logits, sampling_params);
+    LOG(INFO) << "OneRecWorkPipeline::step after sampler: "
+              << "top_tokens_defined=" << sample_output.top_tokens.defined()
+              << ", top_tokens_shape="
+              << (sample_output.top_tokens.defined()
+                      ? c10::str(sample_output.top_tokens.sizes())
+                      : "undefined")
+              << ", top_logprobs_defined="
+              << sample_output.top_logprobs.defined()
+              << ", top_logprobs_shape="
+              << (sample_output.top_logprobs.defined()
+                      ? c10::str(sample_output.top_logprobs.sizes())
+                      : "undefined");
     output.logits = logits;
     output.sample_output = sample_output;
     output.do_sample = sampling_params.do_sample;
@@ -421,7 +506,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
     output.max_top_logprobs = sampling_params.max_top_logprobs;
   }
 
-  runtime_.stream->synchronize();
+  LOG(INFO) << "OneRecWorkPipeline::step before synchronize";
+  const auto ret = runtime_.stream->synchronize();
+  LOG(INFO) << "OneRecWorkPipeline::step after synchronize, ret=" << ret;
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
       runtime_.worker.device_.index());
@@ -1308,13 +1395,24 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
   rec_model_kind_ = get_rec_model_kind(model_type);
   CHECK(rec_model_kind_ != RecModelKind::kNone)
       << "Unsupported rec model_type: " << model_type;
+  LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) begin: model_type="
+            << model_type
+            << ", rec_worker_max_concurrency="
+            << options_.rec_worker_max_concurrency()
+            << ", rec_model_kind=" << static_cast<int>(rec_model_kind_)
+            << ", enable_rec_prefill_only=" << FLAGS_enable_rec_prefill_only
+            << ", device_index=" << device_.index();
 
   // Create concurrent pipeline (not base class pipeline)
   auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
+  LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline_type="
+            << static_cast<int>(pipeline_type);
 
   // Reserve space for model instances
   work_pipelines_.reserve(options_.rec_worker_max_concurrency());
   for (size_t i = 0; i < options_.rec_worker_max_concurrency(); ++i) {
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] setup begin";
     RecPipelineRuntime runtime(*this);
     auto stream = device_.get_stream_from_pool();
     runtime.stream = std::move(stream);
@@ -1325,26 +1423,42 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                        context.get_model_args(),
                                        context.get_quant_args(),
                                        context.get_tensor_options());
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] context ready";
 
     if (rec_model_kind_ == RecModelKind::kOneRec) {
+      LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+                << "] create_rec_model begin";
       runtime.model = create_rec_model(*runtime.context.get());
     } else {
+      LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+                << "] create_llm_model begin";
       runtime.model = create_llm_model(*runtime.context.get());
     }
     CHECK(runtime.model != nullptr) << "Failed to create model instance " << i;
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] model ready";
 
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] executor create begin";
     runtime.executor =
         std::make_unique<Executor>(runtime.model.get(),
                                    runtime.context->get_model_args(),
                                    runtime.worker.device(),
                                    runtime.worker.options_);
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] executor ready";
 
     if (FLAGS_enable_eplb) {
       runtime.eplb_executor = std::make_unique<EplbExecutor>(
           runtime.model.get(), runtime.worker.device());
     }
 
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] create_pipeline begin";
     work_pipelines_.emplace_back(create_pipeline(pipeline_type, runtime));
+    LOG(INFO) << "RecWorkerImpl::init_model(ModelContext) pipeline[" << i
+              << "] create_pipeline done";
     index_queue_.enqueue(i);
   }
 
@@ -1371,16 +1485,24 @@ void RecWorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
 
   // Save model weights path to create new loaders for other instances
   std::string model_weights_path = loader->model_weights_path();
+  LOG(INFO) << "RecWorkerImpl::load_model begin: model_path="
+            << model_weights_path
+            << ", pipeline_count=" << work_pipelines_.size()
+            << ", enable_rec_prefill_only=" << FLAGS_enable_rec_prefill_only;
 
   // Load weights for the first model instance (using the original loader)
+  LOG(INFO) << "RecWorkerImpl::load_model loading pipeline[0]";
   work_pipelines_[0]->runtime().model->load_model(std::move(loader));
   LOG(INFO) << "Loaded weights for model instance 0";
 
   // Create new loaders and load weights for other model instances
   for (size_t i = 1; i < work_pipelines_.size(); ++i) {
+    LOG(INFO) << "RecWorkerImpl::load_model create loader for pipeline[" << i
+              << "]";
     auto model_loader = ModelLoader::create(model_weights_path);
     CHECK(model_loader != nullptr)
         << "Failed to create ModelLoader for model instance " << i;
+    LOG(INFO) << "RecWorkerImpl::load_model loading pipeline[" << i << "]";
     work_pipelines_[i]->runtime().model->load_model(std::move(model_loader));
     LOG(INFO) << "Loaded weights for model instance " << i;
   }

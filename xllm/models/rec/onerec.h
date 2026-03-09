@@ -186,24 +186,50 @@ class OneRecStackImpl : public torch::nn::Module {
     relative_attention_num_buckets_ = args.relative_attention_num_buckets();
     relative_attention_max_distance_ = args.relative_attention_max_distance();
     num_heads_ = is_decode ? args.decoder_n_heads() : args.n_heads();
+    const uint32_t num_layers =
+        is_decode ? args.n_layers() : args.n_encoder_layers();
+    LOG(INFO) << "OneRecStackImpl ctor begin: role="
+              << (is_decoder_ ? "decoder" : "encoder")
+              << ", num_layers=" << num_layers
+              << ", hidden_size=" << hidden_size_
+              << ", use_absolute_position_embedding="
+              << use_absolute_position_embedding_
+              << ", use_moe=" << use_moe_
+              << ", num_heads=" << num_heads_;
 
     embed_tokens_ = embed_tokens;
     if (!use_absolute_position_embedding_) {
+      LOG(INFO) << "OneRecStackImpl ctor create position_bias_embedding: role="
+                << (is_decoder_ ? "decoder" : "encoder");
       position_bias_embedding_ = register_module("position_bias_embedding",
                                                  layer::WordEmbedding(context));
+      LOG(INFO) << "OneRecStackImpl ctor position_bias_embedding ready: role="
+                << (is_decoder_ ? "decoder" : "encoder");
     }
 
+    LOG(INFO) << "OneRecStackImpl ctor create final_layer_norm: role="
+              << (is_decoder_ ? "decoder" : "encoder");
     norm_ = register_module("final_layer_norm", layer::RMSNorm(context));
+    LOG(INFO) << "OneRecStackImpl ctor final_layer_norm ready: role="
+              << (is_decoder_ ? "decoder" : "encoder");
 
     blocks_ = register_module("block", torch::nn::ModuleList());
-    const uint32_t num_layers =
-        is_decode ? args.n_layers() : args.n_encoder_layers();
     layers_.reserve(num_layers);
     for (uint32_t i = 0; i < num_layers; ++i) {
+      LOG(INFO) << "OneRecStackImpl ctor create block begin: role="
+                << (is_decoder_ ? "decoder" : "encoder")
+                << ", layer_id=" << i;
       auto block = layer::NpuOneRecBlockLayer(context, is_decode, i);
+      LOG(INFO) << "OneRecStackImpl ctor create block ready: role="
+                << (is_decoder_ ? "decoder" : "encoder")
+                << ", layer_id=" << i;
       layers_.push_back(block);
       blocks_->push_back(block);
     }
+
+    LOG(INFO) << "OneRecStackImpl ctor done: role="
+              << (is_decoder_ ? "decoder" : "encoder")
+              << ", num_layers=" << num_layers;
 
     (void)options;
   }
@@ -217,6 +243,19 @@ class OneRecStackImpl : public torch::nn::Module {
 
     const auto* onerec_params = input_params.onerec_params();
     CHECK(onerec_params != nullptr) << "OneRec requires onerec_params().";
+    LOG(INFO) << "OneRecStackImpl::forward begin: role="
+              << (is_decoder_ ? "decoder" : "encoder")
+              << ", tokens_shape=" << c10::str(tokens.sizes())
+              << ", encoder_output_shape="
+              << (encoder_output.defined() ? c10::str(encoder_output.sizes())
+                                           : "undefined")
+              << ", is_hybrid_mode=" << onerec_params->is_hybrid_mode
+              << ", has_decoder_context="
+              << onerec_params->decoder_context_embedding.defined()
+              << ", decoder_context_shape="
+              << (onerec_params->decoder_context_embedding.defined()
+                      ? c10::str(onerec_params->decoder_context_embedding.sizes())
+                      : "undefined");
 
     torch::Tensor h;
     if (onerec_params->is_hybrid_mode && !is_decoder_) {
@@ -228,6 +267,15 @@ class OneRecStackImpl : public torch::nn::Module {
         h = embed_tokens_(tokens);
 
         auto& context_emb = onerec_params->decoder_context_embedding;
+        if (context_emb.dim() != 4) {
+          LOG(ERROR) << "OneRec decoder_context_embedding expects 4-D "
+                        "[bs, group_width, seq, hidden], got "
+                     << context_emb.dim() << "-D shape="
+                     << c10::str(context_emb.sizes())
+                     << ", role=" << (is_decoder_ ? "decoder" : "encoder")
+                     << ", tokens_shape=" << c10::str(tokens.sizes());
+          return torch::Tensor();
+        }
         const int64_t hidden_size = context_emb.size(3);
         const int64_t bs = onerec_params->bs;
         const int64_t group_width = onerec_params->group_width;
@@ -499,14 +547,23 @@ class OneRecModelImpl : public torch::nn::Module {
   explicit OneRecModelImpl(const ModelContext& context) {
     hidden_size_ = context.get_model_args().hidden_size();
     options_ = context.get_tensor_options();
+    LOG(INFO) << "OneRecModelImpl ctor begin: hidden_size=" << hidden_size_
+              << ", options=" << options_;
+    LOG(INFO) << "OneRecModelImpl ctor create shared embedding";
     shared_ = register_module("shared", layer::WordEmbedding(context));
+    LOG(INFO) << "OneRecModelImpl ctor shared embedding ready";
 
 #if defined(USE_NPU)
+    LOG(INFO) << "OneRecModelImpl ctor create encoder stack";
     encoder_ = register_module(
         "encoder", OneRecStack(context, /*is_decode=*/false, shared_));
+    LOG(INFO) << "OneRecModelImpl ctor encoder stack ready";
+    LOG(INFO) << "OneRecModelImpl ctor create decoder stack";
     decoder_ = register_module(
         "decoder", OneRecStack(context, /*is_decode=*/true, shared_));
+    LOG(INFO) << "OneRecModelImpl ctor decoder stack ready";
 #endif
+    LOG(INFO) << "OneRecModelImpl ctor done";
   }
 
   ModelOutput forward(const torch::Tensor& tokens,
@@ -552,6 +609,21 @@ class OneRecModelImpl : public torch::nn::Module {
 
       const torch::Tensor& decoder_context =
           onerec_params->decoder_context_embedding;
+      if (onerec_params->has_encoder_output) {
+        const bool cache_hit = cached_encoder_output.defined();
+        LOG(INFO) << "OneRec decoder encoder output reuse: cache_hit="
+                  << cache_hit
+                  << ", decoder_context_defined="
+                  << decoder_context.defined()
+                  << ", model_instance=" << static_cast<const void*>(this);
+        if (!cache_hit) {
+          LOG(WARNING)
+              << "OneRec decoder expected cached encoder output, but reuse "
+                 "missed"
+              << ", decoder_context_defined=" << decoder_context.defined()
+              << ", model_instance=" << static_cast<const void*>(this);
+        }
+      }
 
       if (!decoder_context.defined() && !cached_encoder_output.defined()) {
         LOG(ERROR)
@@ -762,8 +834,11 @@ class OneRecForConditionalGenerationImpl
     }
 
 #if defined(USE_NPU)
+    LOG(INFO) << "OneRec load_model: start verify_loaded_weights.";
     model_->verify_loaded_weights();
+    LOG(INFO) << "OneRec load_model: verify_loaded_weights done, start merge_loaded_weights.";
     model_->merge_loaded_weights();
+    LOG(INFO) << "OneRec load_model: merge_loaded_weights done.";
 #endif
   }
 };

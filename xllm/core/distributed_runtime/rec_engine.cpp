@@ -648,6 +648,7 @@ ForwardOutput RecEngine::OneRecEnginePipeline::step(
               timer.elapsed_microseconds());
 
   timer.reset();
+  LOG(INFO) << "OneRecEnginePipeline::step prefill output ready for CPU access";
   batches[0].process_sample_output(prefill_output.sample_output, false);
   COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
 
@@ -670,6 +671,8 @@ ForwardOutput RecEngine::OneRecEnginePipeline::step(
     }
 
     timer.reset();
+    LOG(INFO) << "OneRecEnginePipeline::step decode output ready for CPU access: "
+              << "decode_step=" << i;
     batches[0].process_sample_output(decode_output.sample_output, false);
     COUNTER_ADD(rec_sampling_latency_microseconds,
                 timer.elapsed_microseconds());
@@ -735,6 +738,23 @@ ForwardOutput RecEngine::OneRecEnginePipeline::get_model_output(
   }
   Device(engine_.workers_[0]->device()).synchronize_default_stream();
 
+  LOG(INFO) << "OneRecEnginePipeline::get_model_output D2H done: "
+            << "next_tokens_device="
+            << (sample_output.next_tokens.defined()
+                    ? c10::str(sample_output.next_tokens.device())
+                    : "undefined")
+            << ", logprobs_device="
+            << (sample_output.logprobs.defined()
+                    ? c10::str(sample_output.logprobs.device())
+                    : "undefined")
+            << ", top_tokens_device="
+            << (sample_output.top_tokens.defined()
+                    ? c10::str(sample_output.top_tokens.device())
+                    : "undefined")
+            << ", top_logprobs_device="
+            << (sample_output.top_logprobs.defined()
+                    ? c10::str(sample_output.top_logprobs.device())
+                    : "undefined");
 
   return output;
 }
