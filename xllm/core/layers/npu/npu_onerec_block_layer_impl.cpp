@@ -746,6 +746,9 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
   LOG(INFO) << "OneRec BlockLayer merge_loaded_weights init_layer returned"
             << ", layer_role=" << GetLayerRole(is_decoder_)
             << ", layer_id=" << layer_id_ << ", status=" << init_status;
+  CHECK_EQ(init_status, atb::NO_ERROR)
+      << "OneRec BlockLayer init_layer failed, layer_role="
+      << GetLayerRole(is_decoder_) << ", layer_id=" << layer_id_;
 }
 
 void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
