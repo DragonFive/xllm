@@ -28,12 +28,12 @@ limitations under the License.
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "npu_base_layer.h"
-#include "xllm_kernels/core/include/atb_speed/base/hosttensor_binder.h"
-#include "xllm_kernels/core/include/atb_speed/base/model.h"
-#include "xllm_kernels/core/include/atb_speed/log.h"
-#include "xllm_kernels/core/include/atb_speed/utils/model_factory.h"
-#include "xllm_kernels/models/onerec/layer/block_layer.h"
-#include "xllm_kernels/operations/fusion/utils.h"
+#include "xllm_atb_layers/core/include/atb_speed/base/hosttensor_binder.h"
+#include "xllm_atb_layers/core/include/atb_speed/base/model.h"
+#include "xllm_atb_layers/core/include/atb_speed/log.h"
+#include "xllm_atb_layers/core/include/atb_speed/utils/model_factory.h"
+#include "xllm_atb_layers/models/onerec/layer/block_layer.h"
+#include "xllm_atb_layers/operations/fusion/utils.h"
 
 namespace xllm {
 namespace layer {
