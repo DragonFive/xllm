@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#if defined(USE_NPU)
 #include "core/common/global_flags.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/npu/npu_onerec_block_layer_impl.h"
@@ -469,3 +470,4 @@ class OneRecStackImpl : public torch::nn::Module {
 TORCH_MODULE(OneRecStack);
 
 }  // namespace xllm
+#endif
