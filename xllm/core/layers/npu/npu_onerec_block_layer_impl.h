@@ -83,6 +83,20 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   void verify_loaded_weights(const std::string& prefix) const;
   void merge_loaded_weights();
 
+  torch::Tensor forward(torch::Tensor& hidden_states,
+                        torch::Tensor& attn_mask,
+                        KVCache& kv_cache,
+                        ModelInputParams& input_params,
+                        torch::Tensor* encoder_output,
+                        int32_t node_id,
+                        aclrtEvent* event,
+                        std::atomic<bool>* event_flag,
+                        const torch::Tensor& expert_array);
+
+  void load_state_dict(const StateDict& state_dict);
+  void verify_loaded_weights(const std::string& prefix) const;
+  void merge_loaded_weights();
+
  private:
   void param_from_args(atb_speed::onerec::BlockLayerParam& param,
                        const ModelArgs& args,
