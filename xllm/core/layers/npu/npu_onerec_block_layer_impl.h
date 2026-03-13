@@ -19,21 +19,12 @@ limitations under the License.
 
 #include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "framework/model/model_input_params.h"
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
-#include "npu_base_layer.h"
-#include "xllm_atb_layers/core/include/atb_speed/base/hosttensor_binder.h"
-#include "xllm_atb_layers/core/include/atb_speed/base/model.h"
-#include "xllm_atb_layers/core/include/atb_speed/log.h"
-#include "xllm_atb_layers/core/include/atb_speed/utils/model_factory.h"
-#include "xllm_atb_layers/models/onerec/layer/block_layer.h"
-#include "xllm_atb_layers/operations/fusion/utils.h"
+#include "layers/onerec_block_layer.h"
 
 namespace xllm {
 namespace layer {
@@ -63,6 +54,20 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr,
                         const torch::Tensor& expert_array = torch::Tensor());
+
+  torch::Tensor forward(torch::Tensor& hidden_states,
+                        torch::Tensor& attn_mask,
+                        KVCache& kv_cache,
+                        ModelInputParams& input_params,
+                        torch::Tensor* encoder_output,
+                        int32_t node_id,
+                        aclrtEvent* event,
+                        std::atomic<bool>* event_flag,
+                        const torch::Tensor& expert_array);
+
+  void load_state_dict(const StateDict& state_dict);
+  void verify_loaded_weights(const std::string& prefix) const;
+  void merge_loaded_weights();
 
  private:
   void param_from_args(atb_speed::onerec::BlockLayerParam& param,
