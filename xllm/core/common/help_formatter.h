@@ -94,9 +94,9 @@ const OptionCategory kXllmServiceOptions = {
     "XLLM-SERVICE OPTIONS",
     {"etcd_addr", "rank_tablefile", "etcd_namespace"}};
 
-const OptionCategory kBeamSearchOptions = {
-    "BEAM SEARCH OPTIONS",
-    {"enable_beam_search_kernel", "enable_topk_sorted"}};
+const OptionCategory kBeamSearchOptions = {"BEAM SEARCH OPTIONS",
+                                           {"enable_beam_search_kernel",
+                                            "enable_topk_sorted"}};
 
 const OptionCategory kRecOptions = {"REC OPTIONS",
                                     {"enable_rec_fast_sampler",
