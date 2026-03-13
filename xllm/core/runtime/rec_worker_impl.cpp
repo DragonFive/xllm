@@ -411,12 +411,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
       rec_params.decoder_context_embedding.defined();
   const bool has_encoder_context =
       rec_params.has_encoder_output || has_decoder_context;
-  std::optional<folly::SemiFuture<torch::Tensor>> filter_mask_future;
-  if ((runtime_.worker.driver_ || runtime_.worker.dp_driver_) &&
-      FLAGS_enable_constrained_decoding && constrained_decoding_ != nullptr &&
-      sampling_params.selected_token_idxes.defined()) {
-    filter_mask_future = prepare_filter_mask_async(rec_params.generated_tokens);
-  }
 
   torch::Tensor hidden_states;
   if (rec_params.rec_stage == OneRecModelInputParams::RecStage::PREFILL) {
