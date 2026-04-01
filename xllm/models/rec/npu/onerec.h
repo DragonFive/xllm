@@ -41,7 +41,7 @@ limitations under the License.
 
 namespace xllm {
 
-class OneRecModelImpl final : public torch::nn::Module {
+class OneRecModelImpl : public torch::nn::Module {
  public:
   explicit OneRecModelImpl(const ModelContext& context) {
     hidden_size_ = context.get_model_args().hidden_size();
@@ -262,7 +262,7 @@ class OneRecModelImpl final : public torch::nn::Module {
 };
 TORCH_MODULE(OneRecModel);
 
-class OneRecForConditionalGenerationImpl final
+class OneRecForConditionalGenerationImpl
     : public RecForCausalLMImplBase<OneRecModel> {
  public:
   explicit OneRecForConditionalGenerationImpl(const ModelContext& context)
