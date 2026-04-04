@@ -212,7 +212,233 @@ kernel / 算子热路径：
 - `xllm/core/kernels/cuda/xattention/beam_search.cpp`
 - `xllm/core/kernels/cuda/xattention/cache_select.cu`
 
-## 6. 验证
+## 6. 当前分支的执行主链
+
+为了把设计和实现真正对起来，可以把当前分支的主执行链拆成下面几步来理解：
+
+1. **外部接入**
+   - 如果走动态库方式，请求会从 `xllm/c_api/internal/rec.cpp` 中的 `xllm_rec_text_completions`、`xllm_rec_token_completions` 或 `xllm_rec_chat_completions` 进入。
+   - 如果走服务方式，请求会从 `xllm/api_service/rec_completion_service_impl.cpp` 或 `chat_service_impl.cpp` 进入，再转到 `RecMaster`。
+
+2. **请求进入 `RecMaster`**
+   - `RecMaster` 负责把 prompt、token ids、raw embedding 等不同入口统一收敛到 request 构造逻辑。
+   - 在这里会根据模型类型区分 `kOneRec` 和 `kLlmRec`，并选择不同的 request pipeline。
+
+3. **进入固定调度**
+   - `RecMaster` 在初始化时直接创建 `FixedStepsScheduler`。
+   - 调度器不再按“每一步都动态重排 batch”的思路工作，而是优先围绕固定轮数和固定候选组去构造 batch。
+
+4. **引擎执行**
+   - `RecEngine` 再根据 `RecPipelineType` 选择执行路径。
+   - 对 `LlmRec` multi-round 场景，会下沉到 `RecMultiRoundEnginePipeline`，把多轮 decode 的主要控制逻辑继续往 worker 侧下压。
+
+5. **batch 与输入拼装**
+   - `RecBatchInputBuilder` 和 `RecMultiRoundBatchInputBuilder` 负责把 sequence、step 信息、decode positions、sampling params 等整理成 `ForwardInput`。
+   - 这里的 `step_meta` 是 multi-step 执行的关键数据来源，它决定后续每一轮 decode 该如何构造位置、cache 和 beam 相关输入。
+
+6. **worker 侧多轮执行**
+   - `RecWorkerImpl::LlmRecMultiRoundPipeline::step()` 会在设备侧循环多轮。
+   - 它会先准备 beam search tensor、full/unshared KV 相关结构，再在每一轮中执行：
+     - 当前轮输入准备
+     - 模型 forward
+     - sample 输出处理
+     - beam search
+     - cache select
+     - 下一轮输入预计算
+
+7. **算子热路径**
+   - Attention 相关路径落在 `xattention.cpp` 与 `flashinfer_attention.cpp`
+   - beam 相关路径落在 `beam_search.cpp`
+   - beam 重排后的 cache 选择路径落在 `cache_select.cu`
+
+如果从技术分享视角来讲，这条主链非常适合作为“架构总图”之后的第一条展开线，因为它把“固定调度、整图执行、定制算子”三件事串成了一个具体执行过程，而不是三个割裂的优化点。
+
+## 7. 设计取舍与适用边界
+
+这套设计并不意味着固定调度一定优于连续调度，也不意味着 multi-step pipeline 适合所有生成任务。它成立的前提，是当前生成式推荐场景具有下面几个特征：
+
+- decode 轮数较固定，通常不会像开放式文本生成那样提前结束；
+- 同一请求下存在较大的 `beam_width`，而且多个 beam 需要同步比较；
+- 整次请求的总时延，比逐 token 的交互体验更重要；
+- 设备侧状态（KV Cache、positions、beam tensors）可以提前组织并稳定复用。
+
+在这些前提成立时，固定调度和整图执行的收益会比较明显。但它也有明确边界：
+
+### 7.1 固定调度的边界
+
+- 如果请求长度差异极大，而且大量请求会提前结束，那么连续调度的灵活性会更有价值；
+- 如果业务更关心“新请求能不能立刻插入”，而不是“当前窗口吞吐是否最优”，固定调度会天然吃亏；
+- 如果候选扩展不依赖大规模 beam 同步推进，那么固定窗口的收益会下降。
+
+### 7.2 multi-step pipeline 的边界
+
+- 如果每一步都必须回到 host 做强控制决策，那么 multi-step pipeline 的优势会被削弱；
+- 如果 shape、batch 或关键输入在每一轮都大幅波动，那么想要把多轮执行稳定下来会更难；
+- 如果后端算子本身还不支持稳定的多轮设备侧推进，那么整图执行只会停留在概念层。
+
+### 7.3 定制算子的边界
+
+`xAttention` 和 `beam search` 定制算子之所以值得做，是因为当前执行形态已经足够稳定。如果没有 fixed-step 带来的稳定 batch 形态，也没有 multi-step pipeline 带来的稳定多轮推进，那么很多定制优化都会被反复的数据搬运、batch 重组和 host 参与开销抵消掉。
+
+因此，更合理的理解顺序不是“先有定制算子，再决定调度”，而是：
+
+1. 先确认 workload 适合固定调度；
+2. 再确认多轮执行可以尽可能下沉到设备侧；
+3. 最后再围绕真正稳定下来的热路径做算子定制。
+
+这样才能让 `fixed_steps_scheduler`、`multi_step_pipeline`、`xAttention` 和 `beam search` 四者形成一套前后自洽的设计，而不是彼此孤立的优化点。
+
+## 8. 代码路径附录
+
+这一节的目的，不是重复“代码结构”里的文件清单，而是给读者一个更可执行的阅读顺序：如果后续要继续做技术分享、走读代码，或者排查 `backend=rec` 路径上的行为差异，可以直接按下面的顺序进入。
+
+### 8.1 从外部入口开始看
+
+如果要理解 `predictor` 或动态库接入是怎样进入 xLLM 的，建议先看下面几处：
+
+- `xllm/c_api/rec.h`
+  - 对外暴露 `xllm_rec_create`、`xllm_rec_initialize`、`xllm_rec_text_completions`、`xllm_rec_token_completions`、`xllm_rec_chat_completions`
+  - 适合先理解“外部系统到底能怎么调用 REC 能力”
+- `xllm/c_api/internal/rec.cpp`
+  - 这是真正的 CAPI 实现
+  - 适合看 `.so` 模式下，request 参数是怎样被封装和转发的
+- `xllm/c_api/examples/simple_rec_completions.cpp`
+  - 是最短的调用示例
+  - 如果要给新人解释“动态库接入长什么样”，这里最直观
+
+如果技术分享里想给一段“最小调用样例”，这一层最适合出现在开头。
+
+### 8.2 从服务入口看统一分发
+
+如果你更关心 RPC 或统一服务链路，可以继续看：
+
+- `xllm/api_service/api_service.cpp`
+  - 这里会根据 `FLAGS_backend` 决定挂哪类 service impl
+  - `backend == "rec"` 时，`rec_completion_service_impl_` 和 `chat_service_impl_` 都会被接上
+- `xllm/api_service/rec_completion_service_impl.cpp`
+  - 负责把 rec completion 请求转给 `RecMaster`
+  - `routing`、`input_tensors`、`RequestParams` 都是在这里被整理进来
+- `xllm/api_service/chat_service_impl.cpp`
+  - 对 `RecMaster` 也有 chat 入口
+  - 适合说明“REC 不是只有 token completion，一样可以走 chat 形态”
+
+这一层适合在技术分享中回答一个问题：为什么说 `backend=rec` 不是另起炉灶，而是接进了现有服务框架。
+
+### 8.3 从调度和引擎看主链
+
+如果分享的重点是“为什么 fixed step 更适合 rec”，阅读顺序建议是：
+
+1. `xllm/core/distributed_runtime/rec_master.h`
+2. `xllm/core/distributed_runtime/rec_master.cpp`
+3. `xllm/core/scheduler/fixed_steps_scheduler.h`
+4. `xllm/core/scheduler/fixed_steps_scheduler.cpp`
+5. `xllm/core/distributed_runtime/rec_engine.h`
+6. `xllm/core/distributed_runtime/rec_engine.cpp`
+
+可以按下面这条链理解：
+
+```text
+Rec request
+  -> RecMaster
+  -> FixedStepsScheduler
+  -> RecEngine
+  -> RecEnginePipeline
+  -> Worker / worker_clients
+```
+
+这里最值得讲的几个点是：
+
+- `RecMaster` 负责入口收敛和 pipeline 选择
+- `FixedStepsScheduler` 负责把 request 组织成适合固定轮数推进的 batch
+- `RecEngine` 负责把调度结果交给实际执行路径
+- `RecMultiRoundEnginePipeline` 代表“多轮 decode 控制进一步下沉”的实现方式
+
+如果分享时要强调“fixed step 不是口头概念，而是代码主链的真实选择”，这一层就是核心证据。
+
+### 8.4 从 batch builder 看 multi-step 的输入组织
+
+如果要解释 `multi_step_pipeline` 为什么能成立，单看 scheduler 还不够，必须继续看 batch builder：
+
+- `xllm/core/framework/batch/rec_batch_input_builder.h`
+- `xllm/core/framework/batch/rec_batch_input_builder.cpp`
+- `xllm/core/framework/batch/rec_multi_round_batch_input_builder.h`
+- `xllm/core/framework/batch/rec_multi_round_batch_input_builder.cpp`
+- `xllm/core/framework/batch/batch.cpp`
+
+这里最重要的不是“类名”，而是几个关键事实：
+
+- `RecBatchInputBuilder::create(...)` 会按 `RecType` 和 multi-round 模式选择 builder
+- `RecMultiRoundBatchInputBuilder` 不是普通 builder 的轻微变种，而是专门为多轮 decode 组织输入的实现
+- `step_meta`、`decode_positions`、`sampling params`、`batch forward type` 等信息是在这一层被拼好并送往后续 runtime 的
+
+所以，如果要说明“为什么第一步就能把后面几步的输入准备好”，这一层比只讲 engine 更关键。
+
+### 8.5 从 worker 看 device 侧多轮执行
+
+`multi_step_pipeline` 真正最值得展开的代码在：
+
+- `xllm/core/runtime/rec_worker_impl.h`
+- `xllm/core/runtime/rec_worker_impl.cpp`
+
+尤其是下面这些点：
+
+- `RecWorkerImpl::step_async(...)`
+  - 说明请求是如何进到 worker 内部并在特定 stream 上执行的
+- `RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_inputs(...)`
+  - 说明 multi-round 输入如何进入 runtime
+- `RecWorkerImpl::LlmRecMultiRoundPipeline::allocate_kv_caches_related()`
+  - 说明为什么 fixed-step 场景更适合提前分配 KV 相关结构
+- `RecWorkerImpl::LlmRecMultiRoundPipeline::step(...)`
+  - 这是最核心的一段
+  - 明确展示了多轮循环、beam search、cache select、下一轮输入预计算之间的关系
+- `compute_next_round_input_async(...)`
+  - 这是解释“为什么可以减少 host 往返”的关键点
+
+如果技术分享想从“执行效率”而不是“调度策略”切入，这一层是最值得重点展开的。
+
+### 8.6 从 kernel 热路径看为什么定制算子值得做
+
+如果要讲 `xAttention` 和 `beam search` 定制算子，推荐按下面的顺序进：
+
+- `xllm/core/layers/cuda/xattention.cpp`
+- `xllm/core/layers/cuda/flashinfer_attention.cpp`
+- `xllm/core/kernels/cuda/xattention/xattention_ops_api.h`
+- `xllm/core/kernels/cuda/xattention/beam_search.cpp`
+- `xllm/core/kernels/cuda/xattention/cache_select.cu`
+
+这一层适合回答 3 个问题：
+
+1. Attention 的稳定执行路径到底落在哪
+2. Beam Search 为什么不只是调度问题，而是 kernel 热路径问题
+3. beam 重排之后的 cache select 为什么必须和前面的执行形态一起考虑
+
+也就是说，技术分享如果要把 `fixed_steps_scheduler`、`multi_step_pipeline`、`xAttention` 和 `beam search` 串成一条线，最终一定会落到这里。
+
+### 8.7 推荐的代码阅读顺序
+
+如果后续你或者其他同学还要继续扩写这篇文档，我建议代码阅读顺序固定成下面这样：
+
+```text
+入口
+  -> api_service
+  -> RecMaster
+  -> FixedStepsScheduler
+  -> RecEngine
+  -> RecBatchInputBuilder / RecMultiRoundBatchInputBuilder
+  -> RecWorkerImpl::LlmRecMultiRoundPipeline
+  -> xAttention / beam_search / cache_select
+```
+
+这个顺序的好处是：
+
+- 先看“请求怎么进来”
+- 再看“为什么 fixed step”
+- 再看“multi-step 是怎么在设备侧成立的”
+- 最后看“定制算子为什么在这里有价值”
+
+这样逻辑最顺，也最适合技术分享展开。
+
+## 9. 验证
 
 建议在合入前至少完成以下检查：
 

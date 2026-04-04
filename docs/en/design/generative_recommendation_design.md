@@ -212,7 +212,233 @@ Kernel hot path:
 - `xllm/core/kernels/cuda/xattention/beam_search.cpp`
 - `xllm/core/kernels/cuda/xattention/cache_select.cu`
 
-## 6. Verification
+## 6. Current-branch Execution Flow
+
+To align the design with the actual implementation, the current branch can be understood as the following execution chain:
+
+1. **External entry**
+   - In shared-library mode, requests enter from `xllm/c_api/internal/rec.cpp` through `xllm_rec_text_completions`, `xllm_rec_token_completions`, or `xllm_rec_chat_completions`.
+   - In service mode, requests enter from `xllm/api_service/rec_completion_service_impl.cpp` or `chat_service_impl.cpp`, and are then forwarded to `RecMaster`.
+
+2. **Request convergence in `RecMaster`**
+   - `RecMaster` unifies different request forms such as prompt input, token input, and raw embedding input.
+   - It also distinguishes `kOneRec` and `kLlmRec`, then selects the corresponding request pipeline.
+
+3. **Entering fixed scheduling**
+   - `RecMaster` creates `FixedStepsScheduler` directly during initialization.
+   - Instead of rebuilding decode batches dynamically at every step, the scheduler is centered on a fixed number of rounds and a stable candidate group.
+
+4. **Engine execution**
+   - `RecEngine` then selects an execution path according to `RecPipelineType`.
+   - For the `LlmRec` multi-round scenario, execution is routed into `RecMultiRoundEnginePipeline`, which pushes more decode control logic down toward the worker side.
+
+5. **Batch building and input construction**
+   - `RecBatchInputBuilder` and `RecMultiRoundBatchInputBuilder` organize sequences, step information, decode positions, sampling parameters, and other metadata into `ForwardInput`.
+   - `step_meta` is especially important here because it provides the per-round information needed for multi-step execution.
+
+6. **Multi-round execution inside the worker**
+   - `RecWorkerImpl::LlmRecMultiRoundPipeline::step()` performs a device-side round loop.
+   - For each round, it coordinates:
+     - current-round input preparation
+     - model forward
+     - sample processing
+     - beam search
+     - cache selection
+     - preparation for the next round
+
+7. **Hot operator path**
+   - Attention-related execution goes through `xattention.cpp` and `flashinfer_attention.cpp`
+   - Beam-related selection goes through `beam_search.cpp`
+   - Cache selection after beam reordering goes through `cache_select.cu`
+
+From a technical-sharing perspective, this chain is a useful narrative backbone because it connects fixed scheduling, whole-graph multi-step execution, and custom kernels into one coherent execution story instead of presenting them as isolated optimizations.
+
+## 7. Trade-offs and Applicability Boundaries
+
+This design does not mean that fixed scheduling is always better than continuous scheduling, nor does it mean that multi-step pipeline execution fits every generation task. It works well because the current generative recommendation workload has a few specific characteristics:
+
+- the number of decode rounds is relatively fixed and requests usually do not terminate early like open-ended text generation;
+- one request often carries a large `beam_width`, and multiple beams must be compared synchronously;
+- total request latency matters more than token-by-token interactivity;
+- device-side state such as KV cache, positions, and beam tensors can be prepared and reused in a relatively stable way.
+
+When those conditions hold, fixed scheduling and multi-step execution provide clear benefits. At the same time, they also have clear boundaries:
+
+### 7.1 Boundary of fixed scheduling
+
+- If request lengths vary dramatically and a large number of requests end early, continuous scheduling regains its advantage.
+- If the business priority is to insert new requests as soon as possible, fixed scheduling naturally becomes less attractive.
+- If candidate expansion no longer depends on synchronized beam progression, the benefit of a fixed execution window decreases.
+
+### 7.2 Boundary of `multi_step_pipeline`
+
+- If each step still requires strong host-side decisions, the value of device-side multi-step execution becomes smaller.
+- If shape, batch layout, or key inputs change significantly at every round, it becomes much harder to keep a stable whole-graph execution path.
+- If backend operators themselves are not ready for stable multi-round device-side execution, whole-graph execution will remain only a conceptual idea.
+
+### 7.3 Boundary of custom operators
+
+`xAttention` and custom `beam search` kernels are valuable because the execution shape is already stable enough. Without fixed-step scheduling and multi-step device-side progression, many operator-level optimizations would be diluted by repeated data movement, batch rebuilding, and extra host participation.
+
+So the more accurate order of reasoning is:
+
+1. first confirm that the workload truly fits fixed scheduling;
+2. then confirm that multi-round execution can be pushed down to the device side;
+3. only then optimize the stable hot path with custom operators.
+
+This is what makes `fixed_steps_scheduler`, `multi_step_pipeline`, `xAttention`, and `beam search` a coherent design stack rather than four unrelated optimization tricks.
+
+## 8. Code Path Appendix
+
+The purpose of this appendix is not to repeat the file list in the previous section, but to provide a practical reading order. If someone later wants to expand this document, prepare a technical talk, or walk through the implementation, the following path is a more useful starting point.
+
+### 8.1 Start from the external entry
+
+If the goal is to understand how `predictor` or the shared-library integration enters xLLM, start with:
+
+- `xllm/c_api/rec.h`
+  - exposes `xllm_rec_create`, `xllm_rec_initialize`, `xllm_rec_text_completions`, `xllm_rec_token_completions`, and `xllm_rec_chat_completions`
+  - useful for understanding what the REC-facing external contract looks like
+- `xllm/c_api/internal/rec.cpp`
+  - the actual CAPI implementation
+  - useful for seeing how request parameters are wrapped and forwarded in `.so` mode
+- `xllm/c_api/examples/simple_rec_completions.cpp`
+  - the smallest runnable example
+  - useful when explaining what a dynamic-library integration looks like in practice
+
+If the technical-sharing version needs one “minimal usage example”, this is the best layer to cite first.
+
+### 8.2 Then read the service entry layer
+
+If the focus is on RPC mode or the unified service path, continue with:
+
+- `xllm/api_service/api_service.cpp`
+  - dispatches service implementations according to `FLAGS_backend`
+  - under `backend == "rec"`, both `rec_completion_service_impl_` and `chat_service_impl_` are attached
+- `xllm/api_service/rec_completion_service_impl.cpp`
+  - forwards REC completion requests into `RecMaster`
+  - this is where `routing`, `input_tensors`, and `RequestParams` are assembled together
+- `xllm/api_service/chat_service_impl.cpp`
+  - also provides a chat entry for `RecMaster`
+  - useful to show that REC is not limited to token completion only
+
+This layer is useful in a technical talk when explaining that `backend=rec` is not a side path outside the service framework, but a first-class backend integrated into the existing service entry.
+
+### 8.3 Then read scheduling and engine as one chain
+
+If the main story is “why fixed step is a better fit for REC”, a practical reading order is:
+
+1. `xllm/core/distributed_runtime/rec_master.h`
+2. `xllm/core/distributed_runtime/rec_master.cpp`
+3. `xllm/core/scheduler/fixed_steps_scheduler.h`
+4. `xllm/core/scheduler/fixed_steps_scheduler.cpp`
+5. `xllm/core/distributed_runtime/rec_engine.h`
+6. `xllm/core/distributed_runtime/rec_engine.cpp`
+
+The chain can be understood as:
+
+```text
+Rec request
+  -> RecMaster
+  -> FixedStepsScheduler
+  -> RecEngine
+  -> RecEnginePipeline
+  -> Worker / worker_clients
+```
+
+The most important takeaways in this layer are:
+
+- `RecMaster` converges multiple request forms and chooses the request pipeline
+- `FixedStepsScheduler` organizes requests into a batch shape that matches fixed-round progression
+- `RecEngine` bridges the scheduler output to the actual execution path
+- `RecMultiRoundEnginePipeline` is the concrete code path that represents “push multi-round decode control further down”
+
+If the talk needs to prove that “fixed step is not just an idea but the actual code path”, this is the core evidence layer.
+
+### 8.4 Read batch builders to understand why multi-step execution is possible
+
+To explain why `multi_step_pipeline` is possible, it is not enough to stop at the scheduler. The batch builder layer is equally important:
+
+- `xllm/core/framework/batch/rec_batch_input_builder.h`
+- `xllm/core/framework/batch/rec_batch_input_builder.cpp`
+- `xllm/core/framework/batch/rec_multi_round_batch_input_builder.h`
+- `xllm/core/framework/batch/rec_multi_round_batch_input_builder.cpp`
+- `xllm/core/framework/batch/batch.cpp`
+
+The key points here are:
+
+- `RecBatchInputBuilder::create(...)` chooses different builders according to `RecType` and multi-round mode
+- `RecMultiRoundBatchInputBuilder` is not just a small variation of the default builder, but a dedicated implementation for multi-round decode input construction
+- `step_meta`, `decode_positions`, `sampling params`, and `batch forward type` are assembled here before being sent further into runtime
+
+So if the document or talk wants to explain “why later rounds can already be prepared at the first step”, this layer is more important than only talking about the engine loop.
+
+### 8.5 Read worker-side multi-round execution next
+
+The most valuable implementation details of `multi_step_pipeline` are inside:
+
+- `xllm/core/runtime/rec_worker_impl.h`
+- `xllm/core/runtime/rec_worker_impl.cpp`
+
+Especially these parts:
+
+- `RecWorkerImpl::step_async(...)`
+  - shows how work is dispatched into the worker and onto the target stream
+- `RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_inputs(...)`
+  - shows how multi-round inputs enter runtime
+- `RecWorkerImpl::LlmRecMultiRoundPipeline::allocate_kv_caches_related()`
+  - shows why fixed-step execution is friendly to early KV-related allocation
+- `RecWorkerImpl::LlmRecMultiRoundPipeline::step(...)`
+  - this is the single most important function for multi-round execution
+  - it makes the relationship among round loop, beam search, cache select, and next-round preparation explicit
+- `compute_next_round_input_async(...)`
+  - this is the key function when explaining why host round-trips can be reduced
+
+If a technical talk wants to emphasize execution efficiency rather than scheduling policy, this is the best layer to expand.
+
+### 8.6 Finally read the hot operator path
+
+If the goal is to explain why `xAttention` and custom `beam search` kernels matter, the recommended reading order is:
+
+- `xllm/core/layers/cuda/xattention.cpp`
+- `xllm/core/layers/cuda/flashinfer_attention.cpp`
+- `xllm/core/kernels/cuda/xattention/xattention_ops_api.h`
+- `xllm/core/kernels/cuda/xattention/beam_search.cpp`
+- `xllm/core/kernels/cuda/xattention/cache_select.cu`
+
+This layer helps answer three questions:
+
+1. where the stable attention execution path actually lives
+2. why beam search is not only a scheduling topic but also a hot kernel path
+3. why cache selection after beam reordering must be discussed together with execution shape
+
+In other words, if the technical-sharing narrative wants to connect `fixed_steps_scheduler`, `multi_step_pipeline`, `xAttention`, and `beam search` into one coherent story, it eventually has to land here.
+
+### 8.7 Recommended reading order
+
+If this document is expanded further later, the recommended code-reading order is:
+
+```text
+entry
+  -> api_service
+  -> RecMaster
+  -> FixedStepsScheduler
+  -> RecEngine
+  -> RecBatchInputBuilder / RecMultiRoundBatchInputBuilder
+  -> RecWorkerImpl::LlmRecMultiRoundPipeline
+  -> xAttention / beam_search / cache_select
+```
+
+The advantage of this order is that it matches how people usually understand the system:
+
+- first, how the request enters the system
+- then, why REC prefers fixed-step scheduling
+- then, how multi-step execution is actually pushed down to the device side
+- finally, why custom operators become valuable only after the execution shape becomes stable
+
+This makes the logic easier to present in a technical talk and easier to reuse in future documentation work.
+
+## 9. Verification
 
 Before merging, at least the following checks are recommended:
 
