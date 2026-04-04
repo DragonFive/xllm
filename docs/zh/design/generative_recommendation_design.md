@@ -438,7 +438,64 @@ Rec request
 
 这样逻辑最顺，也最适合技术分享展开。
 
-## 9. 验证
+## 9. 关键代码锚点索引
+
+如果后续需要继续写技术分享、补代码注释，或者在评审时快速证明文档里的说法来自当前分支实现，可以直接从下面这组锚点入手。
+
+### 9.1 入口与服务层锚点
+
+- `xllm/core/distributed_runtime/rec_master.cpp:575`
+  - `RecMaster::handle_request(...)`
+  - 对应 prompt / prompt_tokens / input_tensors 入口
+- `xllm/core/distributed_runtime/rec_master.cpp:603`
+  - `RecMaster::handle_request(...)`
+  - 对应 chat messages 入口
+- `xllm/core/distributed_runtime/rec_master.cpp:651`
+  - `RecMaster::handle_request(const std::vector<int>& prompt_tokens, ...)`
+  - 对应 token / raw input 类入口
+
+这些锚点适合回答一个问题：REC 请求到底是怎么被收敛到 `RecMaster` 里的。
+
+### 9.2 调度层锚点
+
+- `xllm/core/scheduler/fixed_steps_scheduler.cpp:337`
+  - `FixedStepsScheduler::step(const absl::Duration& timeout)`
+  - 这是 fixed-step 调度真正往前推进的一步
+- `xllm/core/scheduler/fixed_steps_scheduler.cpp:186`
+  - `FixedStepsScheduler::prepare_batch()`
+  - 适合解释当前 batch 是怎么在固定步场景下被组织的
+- `xllm/core/framework/batch/rec_batch_input_builder.cpp:29`
+  - `RecBatchInputBuilder::create(...)`
+  - 适合解释 builder 是如何按 `RecType` 和 multi-round 模式切换的
+
+这几处放在一起，可以直接支持“fixed_steps_scheduler 不是概念，而是代码主链里的真实选择”这一点。
+
+### 9.3 引擎与多轮执行锚点
+
+- `xllm/core/distributed_runtime/rec_engine.cpp:901`
+  - `RecEngine::RecMultiRoundEnginePipeline::step(...)`
+  - 说明 engine 层如何把执行进一步下沉到 multi-round pipeline
+- `xllm/core/runtime/rec_worker_impl.cpp:849`
+  - `RecWorkerImpl::LlmRecMultiRoundPipeline::step(...)`
+  - 这是最关键的一段，真正体现多轮 decode 循环在设备侧发生
+- `xllm/core/runtime/rec_worker_impl.cpp:1011`
+  - `xllm::kernel::cuda::beam_search(...)` 调用点
+- `xllm/core/runtime/rec_worker_impl.cpp:1066`
+  - `xllm::kernel::cuda::cache_select(...)` 调用点
+
+如果你需要在分享中明确“beam search 和 cache select 不是调度层概念，而是直接落到 device 热路径上的实现”，这一组锚点最适合引用。
+
+### 9.4 这组锚点怎么用
+
+这组锚点不需要在正文中全部展开，但非常适合作为：
+
+- 技术分享讲稿里的“代码证据页”
+- PR 说明里的“关键实现位置”
+- 后续 reviewer 问“这句话代码在哪”的快速答复
+
+如果后续还要继续扩写文档，建议优先围绕这几处函数补更细的输入输出说明，而不是再扩展泛化描述。
+
+## 10. 验证
 
 建议在合入前至少完成以下检查：
 

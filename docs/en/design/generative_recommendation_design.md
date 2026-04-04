@@ -438,7 +438,64 @@ The advantage of this order is that it matches how people usually understand the
 
 This makes the logic easier to present in a technical talk and easier to reuse in future documentation work.
 
-## 9. Verification
+## 9. Key Code Anchor Index
+
+If this design document is later extended into a technical talk, a PR explanation, or a deeper code walkthrough, the following anchors are the fastest way to connect the document back to the current branch implementation.
+
+### 9.1 Entry and service-layer anchors
+
+- `xllm/core/distributed_runtime/rec_master.cpp:575`
+  - `RecMaster::handle_request(...)`
+  - prompt / prompt_tokens / input_tensors entry
+- `xllm/core/distributed_runtime/rec_master.cpp:603`
+  - `RecMaster::handle_request(...)`
+  - chat-message entry
+- `xllm/core/distributed_runtime/rec_master.cpp:651`
+  - `RecMaster::handle_request(const std::vector<int>& prompt_tokens, ...)`
+  - token / raw-input style entry
+
+This group is useful when the talk needs to answer a simple question first: how exactly does a REC request get converged into `RecMaster`.
+
+### 9.2 Scheduling anchors
+
+- `xllm/core/scheduler/fixed_steps_scheduler.cpp:337`
+  - `FixedStepsScheduler::step(const absl::Duration& timeout)`
+  - the actual scheduling step that advances the fixed-step path
+- `xllm/core/scheduler/fixed_steps_scheduler.cpp:186`
+  - `FixedStepsScheduler::prepare_batch()`
+  - useful for explaining how requests are grouped under fixed scheduling
+- `xllm/core/framework/batch/rec_batch_input_builder.cpp:29`
+  - `RecBatchInputBuilder::create(...)`
+  - useful for explaining how builders are selected according to `RecType` and multi-round mode
+
+Taken together, these anchors are strong evidence that fixed-step scheduling is not just a conceptual preference but the actual scheduling choice in the code path.
+
+### 9.3 Engine and multi-round execution anchors
+
+- `xllm/core/distributed_runtime/rec_engine.cpp:901`
+  - `RecEngine::RecMultiRoundEnginePipeline::step(...)`
+  - shows how engine-side execution is pushed into the multi-round pipeline
+- `xllm/core/runtime/rec_worker_impl.cpp:849`
+  - `RecWorkerImpl::LlmRecMultiRoundPipeline::step(...)`
+  - the single most important multi-round execution function on the worker side
+- `xllm/core/runtime/rec_worker_impl.cpp:1011`
+  - call site of `xllm::kernel::cuda::beam_search(...)`
+- `xllm/core/runtime/rec_worker_impl.cpp:1066`
+  - call site of `xllm::kernel::cuda::cache_select(...)`
+
+If the talk needs to make it explicit that beam search and cache select are not only “scheduling concepts” but hot device-side execution paths, this is the right group of anchors to cite.
+
+### 9.4 How to use this anchor list
+
+This list does not need to be repeated in the main narrative, but it is especially useful as:
+
+- a “code evidence” slide in a technical talk
+- a “key implementation locations” section in a PR description
+- a quick response set when a reviewer asks where a specific statement comes from
+
+If the document is extended further later, these anchors are also the most practical starting points for adding deeper function-level explanations.
+
+## 10. Verification
 
 Before merging, at least the following checks are recommended:
 
