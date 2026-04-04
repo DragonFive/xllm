@@ -684,21 +684,129 @@ That is why the more accurate order in recommendation is:
 2. push multi-round execution to the device side
 3. optimize the stable hot path with `xAttention`, `beam search`, and `cache_select`
 
-### 11.5 Why this comparison deserves its own section
+### 11.5 Design boundaries and applicability conditions
 
-The value of this comparison is not to prove that recommendation is “different” in an abstract sense. Its real value is to help later reviewers, readers, and speakers quickly answer:
+The purpose of this comparison is not to claim that generative recommendation and general LLM inference are completely unrelated. The real purpose is to make it explicit which parts can be reused from the general path and which parts must be redesigned around the `backend=rec` workload.
 
-- which parts are shared with the general LLM path
-- which parts are REC-specific design choices
-- which optimizations only make sense because recommendation decode is fixed-round and candidate-synchronous
+From the analysis above, `fixed_steps_scheduler`, `multi_step_pipeline`, `xAttention`, and `beam search` need to be discussed together because they depend on the same preconditions:
 
-Without this section, `fixed_steps_scheduler`, `multi_step_pipeline`, `xAttention`, and `beam search` are easy to misread as four unrelated optimizations. In reality, they are a layered design stack shaped by the workload itself.
+- output length is fixed or approximately fixed;
+- the number of decode rounds is small, but the cost of one round is still high;
+- one request maintains a relatively large `beam_width`;
+- candidate expansion and candidate comparison are part of the main serving path rather than optional post-processing;
+- device-side state can be prepared early and reused across later rounds.
 
-## 12. Verification
+Only when these conditions hold at the same time do fixed scheduling and whole-graph multi-step execution deliver stable gains. Once these conditions disappear, for example because requests vary dramatically in length, many sequences terminate early, or new-request latency matters more than throughput, the current `backend=rec` design may no longer be the best choice.
 
-Before merging, at least the following checks are recommended:
+It is also important to note that these four parts are not parallel ideas. They form a layered dependency:
 
-- confirm that both the Chinese and English design documents render correctly;
-- confirm that every image reference resolves to an actual file under `docs/assets/`;
-- confirm that the English document points to English diagrams instead of Chinese-labeled figures;
-- confirm that the documentation entry pages can navigate to this design document.
+The first layer is `fixed_steps_scheduler`. It stabilizes the scheduling entrance. If the scheduler still rebuilds batches and prunes sequences at every step, the later execution path cannot become stable.
+
+The second layer is `multi_step_pipeline`. It stabilizes the progression of multi-round execution. Only after the scheduling window is stable does it become meaningful to push input preparation, KV organization, and round progression further down to the device side.
+
+The third layer is `xAttention`. It addresses the memory and bandwidth behavior of attention in the recommendation workload. It only pays off consistently when execution itself has already become stable enough.
+
+The fourth layer is `beam search` optimization. It reduces search and filtering cost under a large candidate space, but because beam logic directly participates in the main decode path, it cannot be treated as an isolated post-processing step.
+
+In short, the current branch should be understood not as four independent optimizations, but as one layered design shaped by the recommendation workload itself.
+
+### 11.6 Scenarios where the benefit is limited
+
+To avoid treating the current design as a universal answer, its boundaries should also be stated explicitly.
+
+The first category is where fixed scheduling is not ideal. If request lengths vary dramatically, many sequences terminate early, or the system cares more about the earliest insertion of a new request than about total batch throughput, continuous scheduling may become more attractive again.
+
+The second category is where whole-graph multi-step execution is hard to sustain. If each round still requires strong host-side decisions, or if shape, batch layout, or key inputs change significantly from round to round, then the benefits of `multi_step_pipeline` become weaker.
+
+The third category is where operator-level gains are limited. If beam size is small, candidate expansion is cheap, or the shared prefix is short, the engineering payoff of `xAttention` and beam-related optimization may still exist, but it will be much smaller than in a typical recommendation-serving workload.
+
+Writing down these boundaries is useful for two reasons: it prevents readers from assuming unconditional applicability, and it gives reviewers a clearer way to distinguish between design assumptions and implementation defects.
+
+## 12. Verification and Acceptance Guidance
+
+Verification should not stop at “the document renders correctly”. It should also answer whether the implementation in the current branch actually supports the design described in this document.
+
+### 12.1 Document-level verification
+
+The most basic verification still matters:
+
+- both the Chinese and English design documents render correctly;
+- all image references resolve to actual files under `docs/assets/`;
+- the English document points to English diagrams instead of Chinese-labeled figures;
+- the entry pages and related feature pages can navigate to this design document.
+
+This level of verification ensures that the document itself is consumable.
+
+### 12.2 Code-path consistency verification
+
+The second level is to verify that the key paths described in the document really exist in the current branch and that their roles match the implementation:
+
+- whether `RecMaster` truly converges requests and selects the proper pipeline;
+- whether `FixedStepsScheduler` is actually the fixed scheduling entry for `backend=rec`;
+- whether `RecEngine` is really the engine-side execution organizer;
+- whether `RecWorkerImpl::LlmRecMultiRoundPipeline` is really the device-side multi-round execution path;
+- whether the paths of `xAttention`, `beam_search`, and `cache_select` match the design description.
+
+This level prevents the document from becoming a “target architecture note” that no longer matches the branch.
+
+### 12.3 Verification items tied to design goals
+
+If this document is used as a stable base for implementation discussion or technical sharing, the verification items should also map directly back to the design goals.
+
+For fixed scheduling, useful checks include:
+
+- whether decode still rebuilds batches frequently;
+- whether beam-related sequences still trigger heavy pruning and movement every round;
+- whether scheduler overhead is actually reduced in profiling.
+
+For `multi_step_pipeline`, useful checks include:
+
+- whether the host still decides termination at every round;
+- whether next-round inputs can already be prepared while the current round is executing;
+- whether `D2H/H2D` round trips are reduced relative to a host-driven round-by-round path.
+
+For `xAttention`, useful checks include:
+
+- whether shared KV is really stored once at the physical-storage level;
+- whether unshared KV really carries only decode-generated tokens;
+- whether repeated loading of the shared prefix is reduced.
+
+For `beam search`, useful checks include:
+
+- whether sorting and filtering still dominate the cost under large `beam_width`;
+- whether beam-related data structures are reused across rounds;
+- whether item filtering and candidate screening are already integrated with the main decode path.
+
+### 12.4 Final acceptance criteria
+
+If this document is treated as the design baseline of the current branch, then at minimum it should satisfy the following:
+
+- document level: bilingual readability, complete references, and reachable navigation;
+- structure level: the relationship among scheduling, execution, and custom operators is clearly described;
+- code level: key paths, key functions, and key files can be matched to the branch;
+- design level: assumptions, boundaries, and trade-offs are stated clearly;
+- sharing level: a reader can extract a talk outline directly from the document without rebuilding the logic from scratch.
+
+Only when those conditions are met does the document become a stable base shared by design discussion, technical sharing, and code review.
+
+## 13. FAQ / Common Misconceptions
+
+### Q1: Does fixed-step scheduling always outperform continuous scheduling?
+
+No. Fixed-step scheduling is a strong fit for the current `backend=rec` workload because the decode rounds are more fixed, `beam_width` is larger, and candidate comparison is more synchronized. If these assumptions disappear, continuous scheduling may become more attractive again.
+
+### Q2: Is `multi_step_pipeline` only about reducing memcpy calls?
+
+No. Fewer `D2H/H2D` round trips are only the most visible benefit. The more important change is the control model itself: instead of letting the host drive every round, the system pushes as much multi-round progression as possible down to the device side.
+
+### Q3: Why are `xAttention` and `beam search` discussed in the same section?
+
+Because they depend on the same condition: execution shape must already be stable. If the scheduler still rebuilds batches frequently, or the host still intervenes heavily at each round, then a large part of the operator-level gain will be diluted by system overhead.
+
+### Q4: Is this design only about OneRec?
+
+No. The document uses recommendation serving as the main narrative and often uses OneRec as an example, but the more important point is the workload shape behind `backend=rec`, not a single model name.
+
+### Q5: Why does the document repeatedly emphasize “stabilize scheduling first, optimize operators later”?
+
+Because order matters in system design. If the scheduling entrance is still unstable, and the execution path still depends heavily on host-side intervention, then operator-level optimization will struggle to produce stable end-to-end gains.
