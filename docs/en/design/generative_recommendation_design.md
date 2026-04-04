@@ -55,6 +55,48 @@ Therefore, generative recommendation naturally has two characteristics:
 
 In other words, the real optimization target is not “make one sequence finish earlier”, but “push multiple candidates forward stably in a small number of rounds and compare them efficiently at each round”. This leads directly to the later design choice: fixed scheduling at the control layer and whole-graph multi-step execution at the execution layer, followed by custom operator optimization on top of that stable execution shape.
 
+### 1.1 Workload characteristics: why GR is not just “another attention model”
+
+At a high level, generative recommendation still uses attention-based architectures, so it is easy to assume that its serving path can simply reuse the general LLM serving mindset. But the workload profile is very different.
+
+Generative recommendation typically has the following characteristics:
+
+- the prompt is long because it carries user history, context, and recommendation-side signals;
+- the output is short because the system only needs a fixed-length item token sequence;
+- the number of decode rounds is fixed and usually small;
+- each decode round is still expensive because candidate expansion is often combined with a large `beam_width` and `top_k`.
+
+This forms a sharp contrast with general LLM inference:
+
+- general LLM inference is usually “short prompt + long output”;
+- generative recommendation is much closer to “long prompt + short output”.
+
+So recommendation does not become cheap simply because the output is short. The decode phase is still expensive, and in many cases the expensive part is no longer only attention itself, but the system cost around candidate expansion and beam comparison.
+
+### 1.2 Three core challenges highlighted by the `xGR` paper
+
+The `xGR` paper is useful because it frames the serving problem of generative recommendation as a system problem rather than only a model problem. In particular, it highlights three challenge categories that map very well to the design choices in the current branch.
+
+#### Challenge 1: long-prompt / short-output does not mean decode is cheap
+
+Even though the decode length is fixed and small, each decode round may still be expensive. Shared-prefix reuse, repeated KV access across beams, and beam-related block movement all become more visible because the system is not amortizing them over a long free-form generation.
+
+#### Challenge 2: beam search is not only an algorithmic issue
+
+In generative recommendation, beam search is not just a decoding technique for “better text quality”. It is part of the recommendation search process itself. Once `beam_width` and `top_k` increase, sorting, filtering, valid-item checking, candidate retention, and data-structure reuse all become system-level concerns.
+
+#### Challenge 3: the bottleneck is also in host-device cooperation
+
+The system usually runs under strict online latency constraints and high concurrency. If the host still comes back at every step to decide whether to continue, prepare the next input, and resend control to the device, the host-side control path itself becomes a major part of the latency budget.
+
+### 1.3 What this document takes from `xGR`
+
+This document does not try to reproduce the full paper, nor does it replace the experimental section of `xGR`. Its role is narrower and more practical:
+
+- the paper provides the workload framing and the system-level motivation;
+- the current branch provides concrete implementation paths inside xLLM;
+- this document connects the two, so that later talks, reviews, and code walkthroughs have both design context and code anchors.
+
 ## 2. Inference Architecture
 
 ### 2.1 Model Structure
@@ -168,6 +210,53 @@ To avoid concatenating Shared KV and Unshared KV into one long logical sequence,
 3. **merge stage**: use OnlineSoftmax to merge the two parts stably.
 
 At the parallelization level, shared, unshared, and merge are assigned to different execution units or queues to form a pipeline. The goal is to overlap Shared and Unshared computation as much as possible while minimizing synchronization points.
+
+### 4.3 `xBeam`: treating beam search as a system problem
+
+If `xAttention` addresses the question “how can attention reuse shared context and avoid wasteful KV movement”, then `xBeam` addresses a different but equally important question: “how can beam search avoid turning recommendation decode into a sorting-heavy control bottleneck”.
+
+From a systems perspective, beam search in recommendation carries several cost layers at once:
+
+- each round must select a new beam set from a large candidate pool;
+- not every token combination corresponds to a valid item;
+- old candidates are discarded while new candidates are constantly introduced;
+- if the implementation rebuilds data structures and performs full sorting every round, the overhead grows quickly.
+
+So `xBeam` should be understood less as “one sorting kernel” and more as a system-level optimization strategy around beam search. Its goals include:
+
+- terminate unnecessary sorting work as early as possible;
+- filter invalid item paths as early as possible;
+- reuse data structures across rounds instead of reconstructing them repeatedly.
+
+For a technical talk, the key message here is that beam search is not an accessory cost in recommendation serving. It is part of the main decode cost, and therefore has to be designed together with scheduling, memory layout, and hot operator paths.
+
+### 4.4 `xSchedule`: a system-level view of overlap and parallelism
+
+The third challenge in `xGR` is not that one operator is slow, but that the whole serving pipeline is not naturally shaped for the recommendation workload. In this document, that idea can be summarized as `xSchedule`. It is not the name of one single class in the current branch. Instead, it is a useful way to describe the system-level effort to maximize overlap across host-side scheduling, engine-side execution, worker-side multi-round progression, and stream-level parallelism.
+
+At least three ideas belong to this layer:
+
+1. **clearer host-device role split**
+   - the host should participate less in every round;
+   - the device should carry more of the fixed-round progression directly.
+
+2. **more pipeline-friendly execution**
+   - while the current round is being executed, next-round inputs should already be under preparation;
+   - scheduler, batch builder, and worker should avoid introducing unnecessary idle boundaries.
+
+3. **multi-stream and multi-pipeline concurrency**
+   - a fixed execution window naturally increases waiting cost for new requests;
+   - but that cost can be partially offset through multiple streams or multiple execution pipelines.
+
+So, in the context of this document, `xSchedule` is best understood as the system layer that combines fixed-step stability, device-side multi-step progression, and multi-stream overlap into one serving strategy.
+
+### 4.5 Why this design direction is worth the effort
+
+The `xGR` paper provides a very useful result: under strict latency constraints and high concurrency, redesigning the serving path around `xAttention`, `xBeam`, and `xSchedule` can produce a substantial throughput gain. The headline number in the paper is at least `3.49×` throughput over the baseline under strict latency constraints.
+
+That does not mean the current xLLM branch already reproduces every experiment from the paper. But it does support one strong conclusion: treating generative recommendation as a special workload is not over-engineering. There is clear system-level value in doing so.
+
+This also gives the technical talk a strong closing point for this section: the reason to separate recommendation from the general LLM path is not just conceptual neatness, but the fact that recommendation decode really creates a different serving problem, and the payoff of handling it explicitly can be significant.
 
 ## 5. Code Layout
 
