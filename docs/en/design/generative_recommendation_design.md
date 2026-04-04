@@ -495,7 +495,117 @@ This list does not need to be repeated in the main narrative, but it is especial
 
 If the document is extended further later, these anchors are also the most practical starting points for adding deeper function-level explanations.
 
-## 10. Verification
+## 10. Suggested Talk Order and Reading Strategy
+
+The previous sections, especially the code-path appendix and the key-code anchor list, are useful as a reference base. But if this document is later turned into a real technical talk, it also needs a more presentation-friendly reading order.
+
+### 10.1 Recommended talk order
+
+If the audience is not directly involved in implementing `backend=rec`, the talk should not start from `RecWorkerImpl` or `beam_search.cpp`. A more effective order is:
+
+1. **Start from the business goal**
+   - explain why generative recommendation and general LLM inference optimize for different targets
+   - explain why recommendation cares more about end-to-end request latency and fixed-round candidate comparison
+
+2. **Then explain the scheduling choice**
+   - why `fixed_steps_scheduler` is a better fit for this workload
+   - why a large `beam_width` makes fixed scheduling more valuable than continuous scheduling
+
+3. **Then explain the execution model**
+   - why `multi_step_pipeline` can push multi-round decode control further down to the device side
+   - why this reduces host round-trips and control overhead
+
+4. **Then explain custom operators**
+   - why `xAttention` and `beam search` optimizations become meaningful only after the execution shape becomes stable
+   - why those two topics should be presented together rather than as isolated tricks
+
+5. **Finally return to the code**
+   - use the code path and key anchors to prove the previous conclusions
+
+This order works well because the audience first understands the design motivation, then the execution strategy, and only after that the implementation evidence.
+
+### 10.2 For internal code walkthroughs, the order can be reversed
+
+If the audience already works on xLLM or recommendation infrastructure, the order can be more implementation-driven:
+
+1. start from `RecMaster -> FixedStepsScheduler -> RecEngine`
+2. then `RecBatchInputBuilder`
+3. then `RecWorkerImpl::LlmRecMultiRoundPipeline`
+4. finally `xAttention / beam_search / cache_select`
+
+This path is more efficient for an internal walkthrough because it follows the actual call stack. The downside is that it pushes new readers into implementation detail before they have the design context.
+
+### 10.3 The three takeaways worth remembering
+
+If the document is later compressed into a short technical presentation, the whole design can be summarized into three lines:
+
+- `fixed_steps_scheduler` solves scheduling stability;
+- `multi_step_pipeline` solves multi-round execution efficiency;
+- `xAttention` and `beam search` custom kernels turn that stable execution shape into real performance gains.
+
+Those three lines are the most important part to remember. The rest of the document can be seen as evidence supporting them.
+
+## 11. Comparison with the General LLM Inference Path
+
+To avoid treating `backend=rec` as “just another small variation of LLM inference”, it is useful to compare it explicitly with the general LLM inference path.
+
+### 11.1 Different optimization targets
+
+General LLM inference is usually optimized for token-by-token generation experience: return the first result quickly, keep the token interval small, and allow new requests to enter as early as possible.  
+`backend=rec`, in contrast, is optimized for candidate expansion and comparison within a fixed number of rounds, so the primary concern becomes end-to-end request latency rather than the earliest completion of one sequence.
+
+That means both paths perform decode, but the target is already different:
+
+- general LLM inference is more about dynamic request management
+- generative recommendation is more about synchronized progression inside a fixed execution window
+
+### 11.2 Different scheduling focus
+
+In general LLM inference, continuous scheduling is valuable because:
+
+- some sequences can end early and free space immediately
+- batches can be rebuilt continuously
+- dynamic insertion and dynamic exit are frequent and meaningful
+
+In `backend=rec`, the picture is different:
+
+- the number of decode rounds is more fixed
+- `beam_width` is larger
+- multiple candidates under the same request must be compared in the same round
+- frequent batch rebuilding tends to amplify scheduling cost rather than reduce it
+
+So the key difference is not simply “fixed-step vs continuous”, but “stability-first scheduling” versus “flexibility-first scheduling”.
+
+### 11.3 Different execution model
+
+General LLM inference often allows the host to continue participating at each decode step, including step completion checks and next-step preparation.  
+Generative recommendation, because of its fixed-round and synchronized-candidate nature, benefits more from preparing multi-round structures early and letting the device continue forward.
+
+That is why `multi_step_pipeline` is especially valuable here: it is not only about removing a few memcpy calls, but about replacing a host-driven step-by-step control model with a device-side multi-round progression model.
+
+### 11.4 Different way to realize operator-level gains
+
+In general LLM inference, operator optimization often directly improves one decode step or the generic attention path.  
+In `backend=rec`, the gain of operator optimization depends much more on whether the execution shape has already been stabilized.
+
+If fixed scheduling is not established and batches are still rebuilt frequently, or if multi-step execution is not established and the host still repeatedly intervenes, a large part of the operator-level gain will be diluted by extra data movement and control overhead.  
+That is why the more accurate order in recommendation is:
+
+1. stabilize scheduling first
+2. push multi-round execution to the device side
+3. optimize the stable hot path with `xAttention`, `beam search`, and `cache_select`
+
+### 11.5 Why this comparison deserves its own section
+
+The value of this comparison is not to prove that recommendation is “different” in an abstract sense. Its real value is to help later reviewers, readers, and speakers quickly answer:
+
+- which parts are shared with the general LLM path
+- which parts are REC-specific design choices
+- which optimizations only make sense because recommendation decode is fixed-round and candidate-synchronous
+
+Without this section, `fixed_steps_scheduler`, `multi_step_pipeline`, `xAttention`, and `beam search` are easy to misread as four unrelated optimizations. In reality, they are a layered design stack shaped by the workload itself.
+
+## 12. Verification
 
 Before merging, at least the following checks are recommended:
 
