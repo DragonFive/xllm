@@ -20,7 +20,7 @@ hide:
 
 #### Background
 
-LLM with parameter scales ranging from tens of billions to trillions are being rapidly deployed in core business scenarios such as intelligent customer service, real-time recommendation, and content generation. Efficient support for domestic computing hardware has become a core requirement for low-cost inference deployment. Existing inference engines struggle to effectively adapt to the architectural characteristics of dedicated accelerators like domestic chips. Performance issues such as low utilization of computing units, load imbalance and communication overhead bottlenecks under the MoE architecture, and difficulties in kv cache management have restricted the efficient inference of requests and the scalability of the system. The xLLM inference engine improves the resource efficiency of the entire  "communication-computation-storage" performance link and it provides crucial technical support for the large-scale implementation of LLM in real-world business scenarios.
+LLMs with parameter counts ranging from tens of billions to trillions are being rapidly deployed in core business scenarios such as intelligent customer service, real-time recommendation, and content generation. Efficient support for domestic computing hardware has become a core requirement for low-cost inference deployment. Existing inference engines still struggle to adapt to the architectural characteristics of dedicated accelerators such as domestic chips. Problems such as low utilization of compute units, load imbalance and communication bottlenecks under the MoE architecture, and difficulties in KV cache management restrict both inference efficiency and system scalability. The xLLM inference engine improves resource efficiency across the entire communication-computation-storage path and provides critical technical support for large-scale LLM deployment in real-world business scenarios.
 
 
 ## Core Features
@@ -55,3 +55,8 @@ LLM with parameter scales ranging from tens of billions to trillions are being r
 **Algorithm-driven Acceleration**
 - Speculative decoding optimization to improve efficiency through multi-core parallelism.
 - Dynamic load balancing of MoE experts to achieve efficient adjustment of expert distribution.
+
+## Design Documents
+
+- [Graph Mode Design Document](design/graph_mode_design.md)
+- [Generative Recommendation Design Document](design/generative_recommendation_design.md)

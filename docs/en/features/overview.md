@@ -1,6 +1,6 @@
 # Overall Architecture
 
-## Backgroud
+## Background
 
 In recent years, with the groundbreaking progress of large language models (LLMs) ranging from tens of billions to trillions of parameters (such as GPT, Claude, DeepSeek, LLaMA, etc.) in the fields of natural language processing and multimodal interaction, the industry has an urgent need for efficient inference engines and service systems. How to reduce cluster inference costs and improve inference efficiency has become a key challenge for achieving large-scale commercial deployment.
 
@@ -42,10 +42,15 @@ We have implemented various request scheduling strategies supporting continuous 
 #### Global KV Cache Management
 Utilizes ETCD as a metadata service middleware at the global level for cluster service registration, load information synchronization, and global cache state management. Each compute instance maintains a local multi-level cache pool. Regarding scheduling strategy, the system adopts a dynamic decision-making mechanism based on KV cache: it first performs prefix matching detection, calculates the KV cache reuse rate of candidate nodes, and finally selects the node with the optimal comprehensive performance for processing, achieving dynamic offloading and migration of KV cache.
 #### Speculative Inference
-xLLM incorporates an optimized speculative inference algorithm that generates multiple tokens at once to boost throughput. xLLM reduces communication costs by下沉 (sinking) the speculative module and optimizes speculative inference computation through methods like overlapping scheduling and computation timelines and reducing operator data movement in speculative scenarios.
+xLLM incorporates an optimized speculative inference algorithm that generates multiple tokens at once to boost throughput. It reduces communication costs by pushing the speculative module further down the execution stack, and further optimizes speculative inference through overlap between scheduling and computation as well as reduced operator-side data movement.
 #### MoE Load Balancing
 xLLM implements expert weight updates based on historical expert load statistics for MoE models. During inference, it achieves effective dynamic load balancing through efficient expert load statistics and double-buffered, seamless expert weight updates.
 
 ### Multimodal Support
 
 xLLM provides comprehensive support for various multimodal models, including Qwen2-VL and MiniCPMV.
+
+### Related Design Documents
+
+- [Graph Mode Design Document](../design/graph_mode_design.md)
+- [Generative Recommendation Design Document](../design/generative_recommendation_design.md)

@@ -8,7 +8,7 @@ This document focuses on the following topics:
 
 - the goal and constraints of generative recommendation inference
 - model structure and integration architecture
-- why the REC path prefers fixed scheduling and graph-style execution
+- why the REC path prefers fixed scheduling and whole-graph multi-step execution
 - how `xAttention` and `beam search` cooperate around memory efficiency and execution efficiency
 - where the core REC-related code is located in the current branch
 
@@ -28,7 +28,7 @@ The non-goals of this document are:
 
 In recent years, LLM-based generative recommendation has made substantial progress. xLLM has also introduced support for recommendation inference. The goal of generative recommendation is not simply to attach an LLM to a recommendation system, but to use generative modeling to improve candidate expansion and ranking quality, especially metrics such as `CTR`.
 
-In the current solution, xLLM serves as the unified inference engine and is integrated into the existing prediction pipeline through a shared library (`so`) interface:
+In the current solution, xLLM serves as the unified inference engine and is integrated into the existing prediction pipeline through a shared library (`.so`) interface:
 
 - the `predictor` side continues to handle sparse feature processing, sample construction, and online service integration;
 - the `xLLM` side is responsible for the LLM-related inference computation.
@@ -53,7 +53,7 @@ Therefore, generative recommendation naturally has two characteristics:
 - fixed-step decoding;
 - synchronized comparison of multiple candidates.
 
-In other words, the real optimization target is not “make one sequence finish earlier”, but “push multiple candidates forward stably in a small number of rounds and compare them efficiently at each round”. This leads directly to the later design choice: fixed scheduling at the control layer and graph-style execution at the execution layer, followed by custom operator optimization on top of that stable execution shape.
+In other words, the real optimization target is not “make one sequence finish earlier”, but “push multiple candidates forward stably in a small number of rounds and compare them efficiently at each round”. This leads directly to the later design choice: fixed scheduling at the control layer and whole-graph multi-step execution at the execution layer, followed by custom operator optimization on top of that stable execution shape.
 
 ## 2. Inference Architecture
 
@@ -63,7 +63,7 @@ Generative recommendation has become one of the most important paradigm shifts i
 
 ![OneRec model structure](../../assets/generative_recommendation_model_onerec.png)
 
-![OneTrans model structure](../../assets/generative_recommendation_model_onetrs.png)
+![OneTrans model structure](../../assets/generative_recommendation_model_onetrans.png)
 
 A shared pattern across these models is that they keep the traditional recommendation signals such as user sequence features, user static features, and context features, then use an input adaptation layer to map heterogeneous recommendation inputs (discrete IDs, continuous values, sequences, and multimodal content) into embeddings that can be consumed by the LLM decoder. The model body itself is still an Encoder+Decoder or Decoder-only LLM structure, which means different parts of the model should be handled by different inference engines.
 
@@ -74,17 +74,17 @@ Based on the model structure, the current solution splits the model into two gro
 - the input adaptation layer still belongs to the traditional CTR-style inference domain and is handled by the `predictor` side;
 - the LLM body is handled by xLLM.
 
-As the core LLM inference engine, xLLM provides two integration modes for generative recommendation: RPC integration and dynamic library integration.
+As the core LLM inference engine, xLLM provides two integration modes for generative recommendation: RPC integration and shared library (`.so`) integration.
 
 #### 2.2.1 RPC Integration
 
-The current marketing and recommendation-recall scenarios mainly use the RPC-based integration mode. Its advantage is a clean service boundary, while the downside is the extra RPC overhead.
+The current marketing and online recall scenarios mainly use the RPC-based integration mode. Its advantage is a clean service boundary, while the downside is the extra RPC overhead.
 
 #### 2.2.2 Shared Library Integration
 
 Another mode is to embed xLLM into the predictor side as an internal inference engine for the LLM subgraph. This avoids RPC round trips and is more suitable for future low-latency scenarios.
 
-![Generative recommendation integration architecture](../../assets/generative_recommendation_integration_architecture.jpg)
+![Generative recommendation integration architecture](../../assets/generative_recommendation_integration_architecture_en.svg)
 
 ## 3. Fixed Scheduling and Graph-style Execution
 
@@ -96,7 +96,7 @@ The figure above comes from the paper *Orca: A Distributed Serving System for Tr
 
 Generative recommendation changes that assumption because the decoding length is fixed and the candidate set needs to move forward synchronously. As a result, the REC path is more suitable for `fixed_steps_scheduler` than for continuous batching. The reason is not simply “fixed rounds imply fixed scheduling”. The deeper reason is that the workload itself is organized as a fixed number of rounds. When requests usually finish in a predefined number of rounds and multiple candidate branches must move forward together, the scheduler should focus on sending one stable candidate group efficiently instead of inserting and removing requests at every step.
 
-The first benefit of `fixed_steps_scheduler` is that it matches `beam search` better. In the decode stage, `beam size` is often large and multiple beams need to move and be compared in the same round. If continuous scheduling is used, every step may trigger batch rebuilding, sequence compaction, index remapping, and state pruning. Those operations make sense for general LLM inference because requests really do end dynamically. In generative recommendation, however, they are often additional cost instead of real value. Under fixed scheduling, the beam group of one request can move forward together inside one fixed window, without repeated batch rebuilding and repeated pruning decisions.
+The first benefit of `fixed_steps_scheduler` is that it matches `beam search` better. In the decode stage, `beam width` is often large and multiple beams need to move and be compared in the same round. If continuous scheduling is used, every step may trigger batch rebuilding, sequence compaction, index remapping, and state pruning. Those operations make sense for general LLM inference because requests really do end dynamically. In generative recommendation, however, they are often additional cost instead of real value. Under fixed scheduling, the beam group of one request can move forward together inside one fixed window, without repeated batch rebuilding and repeated pruning decisions.
 
 The second benefit is execution stability. Once the number of rounds, the beam-group size, and the advancing rhythm all become stable, many later optimizations become possible. Buffers can be allocated early, workspace can be reused more easily, and cache access patterns become more regular. This stability makes profiling and capacity planning easier and allows the execution path to be made much more stable.
 
@@ -119,7 +119,7 @@ This brings several direct benefits:
 
 For a fixed-round recommendation workload, this is clearly more efficient than returning to the host after every step.
 
-Another important but often underestimated benefit of `multi_step_pipeline` is that it creates a better execution environment for custom operators. This is the point where `xAttention` and `beam search` custom kernels can be discussed together. `fixed step` solves scheduling stability, while graph-style multi-step execution plus custom kernels solves execution efficiency.
+Another important but often underestimated benefit of `multi_step_pipeline` is that it creates a better execution environment for custom operators. This is the point where `xAttention` and `beam search` custom kernels can be discussed together. `fixed step` solves scheduling stability, while whole-graph multi-step execution plus custom kernels solves execution efficiency.
 
 ## 4. Memory Management and Operator Co-optimization
 
@@ -138,7 +138,7 @@ Even if the number of decode rounds is small, the per-step cost is not small. To
 
 The main bottlenecks of this inference service can be summarized into two groups, and `xAttention` is designed around both of them.
 
-The first is redundant bandwidth consumption in attention. Shared prefixes are not explicitly represented as reusable structures. When beam size is large, all beams share the same long prompt, but a generic implementation often organizes KV as if every beam were a full independent sequence. This causes shared KV to be loaded repeatedly along the beam dimension and reduces the effective arithmetic intensity of the attention kernel, eventually making the path bandwidth-bound.
+The first is redundant bandwidth consumption in attention. Shared prefixes are not explicitly represented as reusable structures. When beam width is large, all beams share the same long prompt, but a generic implementation often organizes KV as if every beam were a full independent sequence. This causes shared KV to be loaded repeatedly along the beam dimension and reduces the effective arithmetic intensity of the attention kernel, eventually making the path bandwidth-bound.
 
 The second is KV cache copying and fragmentation. Beam search frequently forks and retires branches, which leads to beam reordering. For a block-based KV management scheme such as PagedAttention, “reordering + block alignment” often implies block copying, fragmentation, and extra memory waste. Both memory capacity and memory bandwidth get amplified in the wrong direction.
 
@@ -146,7 +146,7 @@ The second is KV cache copying and fragmentation. Beam search frequently forks a
 
 #### 4.2.1 KV Cache Layout Optimization
 
-![xAttention KV cache layout](../../assets/xattention_kv_layout.png)
+![xAttention KV cache layout](../../assets/xattention_kv_layout_en.svg)
 
 Given the fixed structure of generative recommendation inference, xAttention redesigns both KV cache organization and the attention execution strategy. The shared prefix is stored only once at the physical-memory level, while beam branching and reordering no longer cause high-cost copying.
 
@@ -159,7 +159,7 @@ Once the cache is split this way, Unshared KV only stores the decode-generated t
 
 #### 4.2.2 Attention Compute Optimization
 
-![xAttention three-stage execution](../../assets/xattention_three_stage_pipeline.png)
+![xAttention three-stage execution](../../assets/xattention_three_stage_pipeline_en.svg)
 
 To avoid concatenating Shared KV and Unshared KV into one long logical sequence, xAttention splits one attention computation into three stages:
 
@@ -211,3 +211,12 @@ Kernel hot path:
 - `xllm/core/layers/cuda/flashinfer_attention.cpp`
 - `xllm/core/kernels/cuda/xattention/beam_search.cpp`
 - `xllm/core/kernels/cuda/xattention/cache_select.cu`
+
+## 6. Verification
+
+Before merging, at least the following checks are recommended:
+
+- confirm that both the Chinese and English design documents render correctly;
+- confirm that every image reference resolves to an actual file under `docs/assets/`;
+- confirm that the English document points to English diagrams instead of Chinese-labeled figures;
+- confirm that the documentation entry pages can navigate to this design document.
