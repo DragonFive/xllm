@@ -33,7 +33,7 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-class CharTokenizer final : public Tokenizer {
+class CharTokenizer : public Tokenizer {
  public:
   bool encode(const std::string_view& text,
               std::vector<int32_t>* ids,
@@ -373,8 +373,8 @@ TEST(SampleSlotTest, RequestOutputStableSortsOutOfOrderSampleIds) {
 }
 
 TEST(SampleSlotTest, OneRecOutputCarriesTokenLogprobsWhenEnabled) {
-  ScopedBoolFlag enable_rec_logprobs_output(
-      &FLAGS_enable_rec_logprobs_output, true);
+  ScopedBoolFlag enable_rec_logprobs_output(&FLAGS_enable_rec_logprobs_output,
+                                            true);
   ScopedBoolFlag enable_convert_tokens_to_item(
       &FLAGS_enable_convert_tokens_to_item, false);
 

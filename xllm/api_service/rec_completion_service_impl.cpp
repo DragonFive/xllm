@@ -54,8 +54,7 @@ void append_rec_logprobs(proto::InferTensorContents* logprobs_context,
 
   for (int32_t i = 0; i < expected_count; ++i) {
     if (i < actual_count && token_logprobs[i].has_value()) {
-      logprobs_context->mutable_fp32_contents()->Add(
-          token_logprobs[i].value());
+      logprobs_context->mutable_fp32_contents()->Add(token_logprobs[i].value());
     } else {
       logprobs_context->mutable_fp32_contents()->Add(0.0f);
     }
@@ -87,8 +86,7 @@ std::vector<int64_t> select_rec_item_ids(const SequenceOutput& output) {
                               static_cast<uint32_t>(output.index)
                         : std::random_device{}();
     std::mt19937 generator(seed);
-    std::shuffle(
-        selected_item_ids.begin(), selected_item_ids.end(), generator);
+    std::shuffle(selected_item_ids.begin(), selected_item_ids.end(), generator);
     selected_item_ids.resize(each_threshold);
   }
 
@@ -151,9 +149,9 @@ bool send_result_to_client_brpc_rec(std::shared_ptr<CompletionCall> call,
     logprobs_tensor->set_name("sku_logprobs");
     logprobs_tensor->set_datatype(proto::DataType::FLOAT);
     for (const auto& output : req_output.outputs) {
-      logprob_width = std::max(
-          logprob_width,
-          static_cast<int32_t>(output.token_ids_logprobs.size()));
+      logprob_width =
+          std::max(logprob_width,
+                   static_cast<int32_t>(output.token_ids_logprobs.size()));
     }
   }
 
@@ -180,12 +178,12 @@ bool send_result_to_client_brpc_rec(std::shared_ptr<CompletionCall> call,
       }
       total_item_count += static_cast<int32_t>(selected_item_ids.size());
       max_items_per_output = std::max(
-          max_items_per_output,
-          static_cast<int32_t>(selected_item_ids.size()));
+          max_items_per_output, static_cast<int32_t>(selected_item_ids.size()));
       selected_item_groups.emplace_back(std::move(selected_item_ids));
     }
 
-    const int32_t output_count = static_cast<int32_t>(req_output.outputs.size());
+    const int32_t output_count =
+        static_cast<int32_t>(req_output.outputs.size());
     if (FLAGS_enable_rec_multi_item_output) {
       auto lengths_tensor = response.mutable_output_tensors()->Add();
       lengths_tensor->set_name("rec_result_lengths");
@@ -236,7 +234,8 @@ bool send_result_to_client_brpc_rec(std::shared_ptr<CompletionCall> call,
     for (int32_t i = 0; i < output_count; ++i) {
       const auto& selected_item_ids = selected_item_groups[i];
       if (!selected_item_ids.empty()) {
-        output_context->mutable_int64_contents()->Add(selected_item_ids.front());
+        output_context->mutable_int64_contents()->Add(
+            selected_item_ids.front());
       } else {
         output_context->mutable_int64_contents()->Add(0);
       }
@@ -258,7 +257,8 @@ bool send_result_to_client_brpc_rec(std::shared_ptr<CompletionCall> call,
       return call->write_and_finish(response);
     }
 
-    const int32_t output_count = static_cast<int32_t>(req_output.outputs.size());
+    const int32_t output_count =
+        static_cast<int32_t>(req_output.outputs.size());
     output_tensor->mutable_shape()->Add(output_count);
     output_tensor->mutable_shape()->Add(req_output.outputs[0].token_ids.size());
     if (logprobs_tensor != nullptr) {
