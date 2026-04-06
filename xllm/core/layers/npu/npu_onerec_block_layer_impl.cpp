@@ -450,8 +450,8 @@ constexpr int32_t IN_MOE_SHARED_W1_WEIGHT =
 constexpr int32_t IN_MOE_SHARED_W2_WEIGHT =
     static_cast<int32_t>(OneRecMoeBlockLayerTensorId::IN_MOE_SHARED_W2_WEIGHT);
 
-static const std::unordered_map<std::string, int> kOneRecEncoderWeightMapping =
-    {
+static const std::unordered_map<std::string, int32_t>
+    kOneRecEncoderWeightMapping = {
         {"layer.0.layer_norm.weight", IN_LAYER_NORM_WEIGHT},
         {"layer.0.SelfAttention.q.weight", IN_Q_WEIGHT},
         {"layer.0.SelfAttention.k.weight", IN_K_WEIGHT},
@@ -483,8 +483,8 @@ static const std::unordered_map<std::string, int> kOneRecEncoderWeightMapping =
         {"1.ffn.gate_proj.weight", IN_FFN_WI_0_WEIGHT},
 };
 
-static const std::unordered_map<std::string, int> kOneRecDecoderWeightMapping =
-    {
+static const std::unordered_map<std::string, int32_t>
+    kOneRecDecoderWeightMapping = {
         {"layer.0.layer_norm.weight", IN_LAYER_NORM_WEIGHT},
         {"layer.0.SelfAttention.q.weight", IN_Q_WEIGHT},
         {"layer.0.SelfAttention.k.weight", IN_K_WEIGHT},
