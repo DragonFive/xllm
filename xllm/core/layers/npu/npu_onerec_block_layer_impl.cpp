@@ -1206,11 +1206,12 @@ void NpuOneRecBlockLayerImpl::build_encoder_node_variant_pack(
     node.variantPack.inTensors.at(i) = *node.inTensors.at(i);
   }
 
-  const int input_tensor_idx = static_cast<int>(kOneRecWeightCountPerLayer);
-  const int attention_mask_idx = input_tensor_idx + 1;
-  const int token_offset_idx = attention_mask_idx + 1;
-  const int layer_id_idx = token_offset_idx + 1;
-  const int seq_len_idx = layer_id_idx + 1;
+  const int32_t input_tensor_idx =
+      static_cast<int32_t>(kOneRecWeightCountPerLayer);
+  const int32_t attention_mask_idx = input_tensor_idx + 1;
+  const int32_t token_offset_idx = attention_mask_idx + 1;
+  const int32_t layer_id_idx = token_offset_idx + 1;
+  const int32_t seq_len_idx = layer_id_idx + 1;
 
   node.variantPack.inTensors.at(input_tensor_idx) = internal_tensors_;
   node.variantPack.inTensors.at(attention_mask_idx) =
