@@ -22,13 +22,12 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
-#include <random>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "common/global_flags.h"
 #include "common/instance_name.h"
+#include "common/rec_output_utils.h"
 #include "completion.pb.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
@@ -59,38 +58,6 @@ void append_rec_logprobs(proto::InferTensorContents* logprobs_context,
       logprobs_context->mutable_fp32_contents()->Add(0.0f);
     }
   }
-}
-
-std::vector<int64_t> select_rec_item_ids(const SequenceOutput& output) {
-  if (!FLAGS_enable_rec_multi_item_output || output.item_ids_list.empty()) {
-    if (output.item_ids.has_value()) {
-      return {output.item_ids.value()};
-    }
-    return {};
-  }
-
-  std::vector<int64_t> selected_item_ids;
-  selected_item_ids.reserve(output.item_ids_list.size());
-  std::unordered_set<int64_t> seen_item_ids;
-  for (const int64_t item_id : output.item_ids_list) {
-    if (seen_item_ids.insert(item_id).second) {
-      selected_item_ids.emplace_back(item_id);
-    }
-  }
-
-  const int32_t each_threshold = FLAGS_each_conversion_threshold;
-  if (each_threshold > 0 &&
-      static_cast<int32_t>(selected_item_ids.size()) > each_threshold) {
-    uint32_t seed = FLAGS_random_seed >= 0
-                        ? static_cast<uint32_t>(FLAGS_random_seed) +
-                              static_cast<uint32_t>(output.index)
-                        : std::random_device{}();
-    std::mt19937 generator(seed);
-    std::shuffle(selected_item_ids.begin(), selected_item_ids.end(), generator);
-    selected_item_ids.resize(each_threshold);
-  }
-
-  return selected_item_ids;
 }
 
 void set_logprobs(proto::Choice* choice,
