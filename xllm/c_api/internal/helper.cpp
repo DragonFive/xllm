@@ -193,6 +193,7 @@ XLLM_Response* build_error_response(const std::string& request_id,
 
 XLLM_Response* build_success_response(const InferenceType& inference_type,
                                       const RequestOutput& output,
+                                      RecPipelineType rec_pipeline_type,
                                       const std::string& request_id,
                                       int64_t created_time,
                                       const std::string& model) {
@@ -215,8 +216,12 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
   response->choices.entries_size = output.outputs.size();
   response->choices.entries = new XLLM_Choice[response->choices.entries_size]();
   CHECK(nullptr != response->choices.entries);
-  if (inference_type == InferenceType::REC_COMPLETIONS ||
-      inference_type == InferenceType::REC_CHAT_COMPLETIONS) {
+  const bool is_rec_inference =
+      inference_type == InferenceType::REC_COMPLETIONS ||
+      inference_type == InferenceType::REC_CHAT_COMPLETIONS;
+  const bool is_onerec_pipeline =
+      is_rec_inference && rec_pipeline_type == RecPipelineType::kOneRecDefault;
+  if (is_onerec_pipeline) {
     response->rec_outputs.entries_size = output.outputs.size();
     response->rec_outputs.entries =
         new XLLM_RecOutput[response->rec_outputs.entries_size]();
@@ -226,9 +231,7 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
   std::vector<std::vector<int64_t>> selected_item_groups;
   int32_t total_item_count = 0;
   const int32_t total_threshold = FLAGS_total_conversion_threshold;
-  if ((inference_type == InferenceType::REC_COMPLETIONS ||
-       inference_type == InferenceType::REC_CHAT_COMPLETIONS) &&
-      FLAGS_enable_convert_tokens_to_item) {
+  if (is_onerec_pipeline && FLAGS_enable_convert_tokens_to_item) {
     selected_item_groups.reserve(output.outputs.size());
     for (const auto& seq_output : output.outputs) {
       std::vector<int64_t> selected_item_ids = select_rec_item_ids(seq_output);
@@ -292,9 +295,8 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
       }
     }
 
-    if ((inference_type == InferenceType::REC_COMPLETIONS ||
-         inference_type == InferenceType::REC_CHAT_COMPLETIONS) &&
-        FLAGS_enable_convert_tokens_to_item && rec_output != nullptr) {
+    if (is_onerec_pipeline && FLAGS_enable_convert_tokens_to_item &&
+        rec_output != nullptr) {
       const std::vector<int64_t>& selected_item_ids = selected_item_groups[i];
       if (!selected_item_ids.empty()) {
         rec_output->item_ids_size = selected_item_ids.size();
@@ -306,9 +308,7 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
       }
     }
 
-    if ((inference_type == InferenceType::REC_COMPLETIONS ||
-         inference_type == InferenceType::REC_CHAT_COMPLETIONS) &&
-        FLAGS_enable_rec_logprobs_output &&
+    if (is_onerec_pipeline && FLAGS_enable_rec_logprobs_output &&
         !seq_output.token_ids_logprobs.empty() && rec_output != nullptr) {
       rec_output->rec_token_logprobs_size =
           seq_output.token_ids_logprobs.size();
@@ -384,8 +384,11 @@ XLLM_Response* handle_inference_request(
   xllm::RequestParams xllm_request_params;
   transfer_request_params(inference_type, request_params, &xllm_request_params);
   xllm_request_params.request_id = request_id;
+  RecPipelineType rec_pipeline_type = RecPipelineType::kLlmRecDefault;
   if constexpr (std::is_same_v<HandlerType, XLLM_REC_Handler>) {
-    if (FLAGS_enable_rec_logprobs_output) {
+    rec_pipeline_type = handler->pipeline_type;
+    if (FLAGS_enable_rec_logprobs_output &&
+        rec_pipeline_type == RecPipelineType::kOneRecDefault) {
       xllm_request_params.logprobs = true;
     }
   }
@@ -400,6 +403,7 @@ XLLM_Response* handle_inference_request(
                                 request_id,
                                 created_time,
                                 inference_type,
+                                rec_pipeline_type,
                                 weak_promise = std::weak_ptr(promise_ptr)](
                                    const RequestOutput& req_output) -> bool {
       if (auto locked_promise = weak_promise.lock()) {
@@ -408,6 +412,7 @@ XLLM_Response* handle_inference_request(
             if (req_output.status.value().ok()) {
               locked_promise->setValue(build_success_response(inference_type,
                                                               req_output,
+                                                              rec_pipeline_type,
                                                               request_id,
                                                               created_time,
                                                               model_id));

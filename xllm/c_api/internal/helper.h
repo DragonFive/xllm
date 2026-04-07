@@ -27,6 +27,7 @@ limitations under the License.
 #include "c_api/default.h"
 #include "c_api/types.h"
 #include "core/common/instance_name.h"
+#include "core/common/rec_model_utils.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/framework/request/request_output.h"
@@ -55,6 +56,9 @@ struct XLLM_LLM_Handler {
 struct XLLM_REC_Handler {
   /** Flag indicating if REC instance is initialized and ready for inference */
   bool initialized{false};
+
+  /** Selected REC pipeline type for the loaded model */
+  xllm::RecPipelineType pipeline_type{xllm::RecPipelineType::kLlmRecDefault};
 
   /** List of loaded recommendation model IDs */
   std::vector<std::string> model_ids;
@@ -127,6 +131,7 @@ XLLM_Response* build_error_response(const std::string& request_id,
  */
 XLLM_Response* build_success_response(const InferenceType& inference_type,
                                       const xllm::RequestOutput& output,
+                                      xllm::RecPipelineType rec_pipeline_type,
                                       const std::string& request_id,
                                       int64_t created_time,
                                       const std::string& model);
