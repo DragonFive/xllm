@@ -20,8 +20,8 @@ limitations under the License.
 #include <string>
 
 #include "core/common/global_flags.h"
-#include "core/common/rec_output_utils.h"
 #include "core/util/env_var.h"
+#include "core/util/rec_output_utils.h"
 #include "core/util/uuid.h"
 
 namespace xllm {
