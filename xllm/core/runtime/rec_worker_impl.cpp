@@ -338,6 +338,25 @@ ForwardInput RecWorkerImpl::OneRecWorkPipeline::prepare_inputs(Batch& batch) {
       thread_pool);
 }
 
+void RecWorkerImpl::OneRecWorkPipeline::prepare_work_before_execute(
+    const ForwardInput& inputs,
+    ForwardInput& processed_inputs) {
+  RecWorkPipeline::prepare_work_before_execute(inputs, processed_inputs);
+
+  auto& onerec_params = processed_inputs.input_params.mutable_onerec_params();
+  if (!onerec_params.decoder_context_embedding.defined()) {
+    return;
+  }
+
+  if (onerec_params.decoder_context_embedding.scalar_type() ==
+      runtime_.worker.dtype()) {
+    return;
+  }
+
+  onerec_params.decoder_context_embedding =
+      onerec_params.decoder_context_embedding.to(runtime_.worker.dtype());
+}
+
 folly::SemiFuture<torch::Tensor>
 RecWorkerImpl::OneRecWorkPipeline::prepare_filter_mask_async(
     const std::vector<std::vector<int32_t>>& generated_tokens) {
