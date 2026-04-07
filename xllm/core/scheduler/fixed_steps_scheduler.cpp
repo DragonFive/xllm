@@ -28,7 +28,7 @@ limitations under the License.
 #include <memory>
 
 #include "common/metrics.h"
-#include "common/rec_model_utils.h"
+#include "util/rec_model_utils.h"
 #include "common/types.h"
 #include "core/common/global_flags.h"
 #include "distributed_runtime/engine.h"

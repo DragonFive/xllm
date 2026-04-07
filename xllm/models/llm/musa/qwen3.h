@@ -15,7 +15,7 @@ limitations under the License.
 
 #pragma once
 
-#include "core/common/rec_model_utils.h"
+#include "core/util/rec_model_utils.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/common/rotary_embedding.h"
 #include "core/layers/musa/musa_qwen3_decoder_layer_impl.h"

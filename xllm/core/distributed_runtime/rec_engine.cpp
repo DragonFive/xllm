@@ -25,7 +25,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
-#include "common/rec_model_utils.h"
+#include "util/rec_model_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/parallel_state.h"

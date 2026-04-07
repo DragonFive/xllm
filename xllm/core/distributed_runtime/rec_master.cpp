@@ -29,7 +29,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "common/metrics.h"
-#include "common/rec_model_utils.h"
+#include "util/rec_model_utils.h"
 #include "common/types.h"
 #include "framework/request/mm_data.h"
 #include "models/model_registry.h"

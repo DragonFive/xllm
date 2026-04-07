@@ -27,11 +27,11 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/instance_name.h"
-#include "common/rec_output_utils.h"
 #include "completion.pb.h"
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/framework/request/request_output.h"
+#include "util/rec_output_utils.h"
 
 #ifdef likely
 #undef likely

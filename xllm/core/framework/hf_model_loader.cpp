@@ -35,7 +35,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/global_flags.h"
-#include "core/common/rec_model_utils.h"
+#include "core/util/rec_model_utils.h"
 #include "core/common/version_singleton.h"
 #include "core/framework/state_dict/rec_vocab_dict.h"
 #include "core/framework/state_dict/safetensors/safetensors.h"
