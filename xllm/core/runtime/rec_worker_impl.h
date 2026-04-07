@@ -120,6 +120,9 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
     ForwardInput prepare_inputs(Batch& batch) override;
 
+    void prepare_work_before_execute(const ForwardInput& inputs,
+                                     ForwardInput& processed_inputs) override;
+
     std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
    private:
