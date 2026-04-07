@@ -197,6 +197,17 @@ class OneRecStackImpl : public torch::nn::Module {
     if (onerec_params->is_hybrid_mode && !is_decoder_) {
       h = tokens;
     } else if (onerec_params->decoder_context_embedding.defined()) {
+      LOG(INFO) << "OneRec dual-embedding model debug: is_decoder="
+                << is_decoder_
+                << ", token_numel=" << tokens.numel()
+                << ", decoder_context_shape="
+                << onerec_params->decoder_context_embedding.sizes()
+                << ", decoder_context_dtype="
+                << static_cast<int32_t>(
+                       onerec_params->decoder_context_embedding.scalar_type())
+                << ", bs=" << onerec_params->bs
+                << ", group_width=" << onerec_params->group_width
+                << ", seq_len=" << onerec_params->seq_len;
       if (tokens.numel() == 0) {
         h = onerec_params->decoder_context_embedding.reshape(
             {-1, onerec_params->decoder_context_embedding.size(-1)});
@@ -224,6 +235,9 @@ class OneRecStackImpl : public torch::nn::Module {
       if (!h.is_contiguous()) {
         h = h.contiguous();
       }
+      LOG(INFO) << "OneRec dual-embedding hidden-state debug: is_decoder="
+                << is_decoder_ << ", h_shape=" << h.sizes()
+                << ", h_dtype=" << static_cast<int32_t>(h.scalar_type());
     } else {
       h = embed_tokens_(tokens);
     }
@@ -282,6 +296,15 @@ class OneRecStackImpl : public torch::nn::Module {
             << "OneRec decoder layer kv_cache is missing at layer " << i;
       }
       KVCache& kv_cache_ref = is_decoder_ ? kv_caches[i] : dummy_kv_cache;
+      if (i == 0 && is_decoder_) {
+        LOG(INFO) << "OneRec dual-embedding layer0 debug: h_shape=" << h.sizes()
+                  << ", h_dtype=" << static_cast<int32_t>(h.scalar_type())
+                  << ", attn_mask_shape=" << preprocessed_attn_mask.sizes()
+                  << ", attn_mask_dtype="
+                  << static_cast<int32_t>(preprocessed_attn_mask.scalar_type())
+                  << ", encoder_output_defined="
+                  << npu_encoder_output.defined();
+      }
 
       layers_[i]->forward(
           h,

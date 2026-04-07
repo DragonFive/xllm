@@ -388,6 +388,21 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
       rec_params.decoder_context_embedding.defined();
   const bool has_encoder_context =
       rec_params.has_encoder_output || has_decoder_context;
+  if (has_decoder_context) {
+    LOG(INFO) << "OneRec dual-embedding worker debug: rec_stage="
+              << static_cast<int32_t>(rec_params.rec_stage)
+              << ", is_first_prefill=" << rec_params.is_first_prefill
+              << ", token_numel=" << input.token_ids.numel()
+              << ", decoder_context_shape="
+              << rec_params.decoder_context_embedding.sizes()
+              << ", decoder_context_dtype="
+              << static_cast<int32_t>(
+                     rec_params.decoder_context_embedding.scalar_type())
+              << ", has_encoder_output=" << rec_params.has_encoder_output
+              << ", bs=" << rec_params.bs
+              << ", group_width=" << rec_params.group_width
+              << ", seq_len=" << rec_params.seq_len;
+  }
   std::optional<folly::SemiFuture<torch::Tensor>> filter_mask_future;
   if ((runtime_.worker.driver_ || runtime_.worker.dp_driver_) &&
       FLAGS_enable_constrained_decoding && constrained_decoding_ != nullptr &&
