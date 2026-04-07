@@ -172,7 +172,11 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
     refresh_sequences_from_groups();
   }
   if (rec_type == RecType::kOneRec) {
-    refresh_output_targets();
+    if (FLAGS_enable_rec_prefill_only) {
+      refresh_onerec_prefill_output_targets();
+    } else {
+      refresh_output_targets();
+    }
   }
 
   auto builder = RecBatchInputBuilder::create(rec_type,
@@ -384,6 +388,59 @@ void Batch::refresh_output_targets() {
     const uint32_t n_tokens = token_ids.size();
     const uint32_t n_kv_cache_tokens =
         sequence->kv_state().kv_cache_tokens_num();
+    if (n_tokens <= n_kv_cache_tokens) {
+      continue;
+    }
+
+    CHECK(allowed_max_tokens_[seq_index] > 0);
+    const uint32_t q_seq_len =
+        std::min(n_tokens - n_kv_cache_tokens, allowed_max_tokens_[seq_index]);
+    const uint32_t seq_len = q_seq_len + n_kv_cache_tokens;
+    const auto& sample_slots = sequence->sample_slots();
+
+    if (sample_slots.empty()) {
+      if (seq_len == n_tokens) {
+        output_targets_.push_back({sequence, /*sample_id=*/0, false});
+      }
+      continue;
+    }
+
+    for (const auto& sample_slot : sample_slots) {
+      const uint32_t sample_source_position =
+          get_sample_source_position(sample_slot);
+      if (sample_source_position < n_kv_cache_tokens ||
+          sample_source_position >= seq_len) {
+        continue;
+      }
+      output_targets_.push_back(
+          {sequence, sample_slot.sample_id, /*from_sample_slot=*/true});
+    }
+  }
+}
+
+void Batch::refresh_onerec_prefill_output_targets() {
+  output_targets_.clear();
+  if (sequences_.empty()) {
+    return;
+  }
+
+  for (size_t seq_index = 0; seq_index < sequences_.size(); ++seq_index) {
+    auto* sequence = sequences_[seq_index];
+    if (sequence == nullptr) {
+      continue;
+    }
+
+    const auto token_ids = sequence->tokens();
+    const uint32_t n_tokens = token_ids.size();
+    const uint32_t n_kv_cache_tokens =
+        sequence->kv_state().kv_cache_tokens_num();
+    const bool needs_context_target = sequence->is_onerec_model() &&
+                                      n_tokens == 0 && n_kv_cache_tokens == 0 &&
+                                      sequence->num_decoder_embeddings() > 0;
+    if (needs_context_target) {
+      output_targets_.push_back({sequence, /*sample_id=*/0, false});
+      continue;
+    }
     if (n_tokens <= n_kv_cache_tokens) {
       continue;
     }
