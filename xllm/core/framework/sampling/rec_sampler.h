@@ -18,7 +18,7 @@ limitations under the License.
 
 #include <memory>
 
-#include "common/rec_model_utils.h"
+#include "util/rec_model_utils.h"
 #include "sampling_params.h"
 
 namespace xllm {

@@ -20,7 +20,7 @@ limitations under the License.
 #include <memory>
 
 #include "common/macros.h"
-#include "common/rec_model_utils.h"
+#include "util/rec_model_utils.h"
 #include "distributed_runtime/dist_manager.h"
 #include "engine.h"
 #include "framework/batch/batch.h"

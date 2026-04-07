@@ -22,7 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/interruption_bus.h"
-#include "core/common/rec_model_utils.h"
+#include "core/util/rec_model_utils.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"

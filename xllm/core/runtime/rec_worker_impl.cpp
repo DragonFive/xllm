@@ -28,7 +28,7 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
-#include "common/rec_model_utils.h"
+#include "util/rec_model_utils.h"
 #include "common/types.h"
 #include "core/common/global_flags.h"
 #include "framework/model/model_input_params.h"
