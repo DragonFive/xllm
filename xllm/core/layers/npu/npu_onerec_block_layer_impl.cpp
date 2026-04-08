@@ -1223,7 +1223,6 @@ void NpuOneRecBlockLayerImpl::build_encoder_node_variant_pack(
   node.variantPack.inTensors.at(layer_id_idx).hostData =
       placeholder_vec_.data();
 
-  const auto* onerec_params = input_params.onerec_params();
   if (onerec_params != nullptr &&
       onerec_params->encoder_seq_lens_tensor.defined()) {
     node.variantPack.inTensors.at(seq_len_idx) =
@@ -1389,7 +1388,6 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     node.variantPack.inTensors.at(idx++).hostData = placeholder_vec_.data();
   }
 
-  const auto* onerec_params = input_params.onerec_params();
   if (onerec_params != nullptr &&
       onerec_params->encoder_seq_lens_tensor.defined()) {
     node.variantPack.inTensors.at(idx) = atb_speed::Utils::AtTensor2Tensor(
