@@ -75,7 +75,8 @@ void validate_flags(const std::string& model_type) {
     FLAGS_enable_schedule_overlap = false;
   }
   // TODO: support other block sizes in the future
-  if (FLAGS_block_size != 16 && FLAGS_block_size != 1) {
+  if (FLAGS_block_size != 16 && FLAGS_block_size != 1 &&
+      FLAGS_backend != "dit") {
     LOG(FATAL) << "Currently, block_size must be 16 for MLU backend, we will "
                   "support other block sizes in the future.";
   }
@@ -160,8 +161,8 @@ int run() {
     FLAGS_max_tokens_per_chunk_for_prefill = FLAGS_max_tokens_per_batch;
   }
 
-// disable block copy kernel on non-NPU backend
-#if !defined(USE_NPU)
+// disable block copy kernel on unsupported backends
+#if !defined(USE_NPU) && !defined(USE_CUDA)
   FLAGS_enable_block_copy_kernel = false;
 #endif
   std::string model_type = "";

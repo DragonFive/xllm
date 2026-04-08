@@ -28,10 +28,10 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
-#include "util/rec_model_utils.h"
 #include "common/types.h"
 #include "core/common/global_flags.h"
 #include "framework/model/model_input_params.h"
+#include "util/rec_model_utils.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/cuda_ops_api.h"
 #include "kernels/cuda/xattention/xattention_ops_api.h"
@@ -95,32 +95,9 @@ void RecWorkerImpl::RecWorkPipeline::prepare_work_before_execute(
   processed_inputs =
       inputs.to(runtime_.worker.device(), runtime_.worker.dtype());
   auto& input_params = processed_inputs.input_params;
+  runtime_.worker.apply_kv_block_swaps(input_params);
+
 #if defined(USE_NPU)
-  if (input_params.swap_blocks.size() > 0 && !FLAGS_enable_block_copy_kernel) {
-    auto& swap_blocks = input_params.swap_blocks;
-
-    // collect src and dst indices
-    std::vector<int64_t> src_indices, dst_indices;
-    src_indices.reserve(swap_blocks.size());
-    dst_indices.reserve(swap_blocks.size());
-
-    for (const auto& block : swap_blocks) {
-      src_indices.push_back(block.src_block_id);
-      dst_indices.push_back(block.dst_block_id);
-    }
-
-    // batch select keys and values
-    auto src_tensor = torch::tensor(
-        src_indices,
-        torch::dtype(torch::kLong).device(runtime_.worker.device_));
-    auto dst_tensor = torch::tensor(
-        dst_indices,
-        torch::dtype(torch::kLong).device(runtime_.worker.device_));
-    const int64_t num_layers = runtime_.context->get_model_args().n_layers();
-    for (int layer_id = 0; layer_id < num_layers; layer_id++) {
-      runtime_.worker.kv_caches_[layer_id].swap_blocks(src_tensor, dst_tensor);
-    }
-  }
   if (runtime_.context->get_model_args().enable_mla() &&
       input_params.batch_forward_type.is_chunked_prefill()) {
     runtime_.worker.prepare_mla_prefixcache_inputs(input_params);
@@ -411,6 +388,12 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
       rec_params.decoder_context_embedding.defined();
   const bool has_encoder_context =
       rec_params.has_encoder_output || has_decoder_context;
+  std::optional<folly::SemiFuture<torch::Tensor>> filter_mask_future;
+  if ((runtime_.worker.driver_ || runtime_.worker.dp_driver_) &&
+      FLAGS_enable_constrained_decoding && constrained_decoding_ != nullptr &&
+      sampling_params.selected_token_idxes.defined()) {
+    filter_mask_future = prepare_filter_mask_async(rec_params.generated_tokens);
+  }
 
   torch::Tensor hidden_states;
   if (rec_params.rec_stage == OneRecModelInputParams::RecStage::PREFILL) {

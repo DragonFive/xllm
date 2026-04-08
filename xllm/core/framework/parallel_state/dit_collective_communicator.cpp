@@ -42,22 +42,20 @@ DiTCollectiveCommunicator::DiTCollectiveCommunicator(int32_t global_rank,
                                                      int32_t dit_sp_size,
                                                      int32_t dit_cfg_size)
     : CollectiveCommunicatorBase(global_rank, world_size) {
-#if defined(USE_NPU)
-  DiTMappingNPU::Options dit_mapping_options;
-  dit_mapping_options.dit_tp_size(dit_tp_size)
-      .dit_sp_size(dit_sp_size)
-      .dit_cfg_size(dit_cfg_size)
-      .dit_dp_size(dit_dp_size);
-  dit_mapping_npu_ = std::make_unique<DiTMappingNPU>(
-      world_size, global_rank, dit_mapping_options);
   parallel_args_ = std::make_unique<ParallelArgs>(global_rank,
                                                   world_size,
                                                   dit_dp_size,
                                                   dit_tp_size,
                                                   dit_sp_size,
                                                   dit_cfg_size,
-                                                  nullptr);
-#endif
+                                                  /*process_group=*/nullptr);
+  DiTMapping::Options dit_mapping_options;
+  dit_mapping_options.dit_tp_size(dit_tp_size)
+      .dit_sp_size(dit_sp_size)
+      .dit_cfg_size(dit_cfg_size)
+      .dit_dp_size(dit_dp_size);
+  dit_mapping_ = std::make_unique<DiTMapping>(
+      world_size, global_rank, dit_mapping_options);
 }
 
 void DiTCollectiveCommunicator::create_process_groups(
@@ -87,14 +85,13 @@ void DiTCollectiveCommunicator::create_process_groups(
 
   parallel_args_->process_group_ = process_group_.get();
 
-  if (tp_size > 1) {
-    auto tp_parallel_info = dit_mapping_npu_->get_parallel_info("tp");
+  if (tp_size > 1 && dit_mapping_) {
+    auto tp_parallel_info = dit_mapping_->get_parallel_info("tp");
     auto group_id = tp_parallel_info.current_group_id();
     auto num_group = tp_parallel_info.num_group();
     auto local_rank = tp_parallel_info.rank();
     auto& rank_per_group = tp_parallel_info.rank_per_group()[group_id];
     int port_offset = group_id + 1;
-#if defined(USE_NPU)
     dit_tp_group_ = create_process_group(global_rank,
                                          local_rank,
                                          rank_per_group,
@@ -105,18 +102,16 @@ void DiTCollectiveCommunicator::create_process_groups(
                                          "tp_group",
                                          device);
     parallel_args_->dit_tp_group_ = dit_tp_group_.get();
-#endif
     port += num_group;
   }
 
-  if (sp_size > 1) {
-    auto sp_parallel_info = dit_mapping_npu_->get_parallel_info("sp");
+  if (sp_size > 1 && dit_mapping_) {
+    auto sp_parallel_info = dit_mapping_->get_parallel_info("sp");
     auto group_id = sp_parallel_info.current_group_id();
     auto num_group = sp_parallel_info.num_group();
     auto local_rank = sp_parallel_info.rank();
     auto& rank_per_group = sp_parallel_info.rank_per_group()[group_id];
     int port_offset = group_id + 1;
-#if defined(USE_NPU)
     dit_sp_group_ = create_process_group(global_rank,
                                          local_rank,
                                          rank_per_group,
@@ -127,18 +122,16 @@ void DiTCollectiveCommunicator::create_process_groups(
                                          "sp_group",
                                          device);
     parallel_args_->dit_sp_group_ = dit_sp_group_.get();
-#endif
     port += num_group;
   }
 
-  if (cfg_size > 1) {
-    auto cfg_parallel_info = dit_mapping_npu_->get_parallel_info("cfg");
+  if (cfg_size > 1 && dit_mapping_) {
+    auto cfg_parallel_info = dit_mapping_->get_parallel_info("cfg");
     auto group_id = cfg_parallel_info.current_group_id();
     auto num_group = cfg_parallel_info.num_group();
     auto local_rank = cfg_parallel_info.rank();
     auto& rank_per_group = cfg_parallel_info.rank_per_group()[group_id];
     int port_offset = group_id + 1;
-#if defined(USE_NPU)
     dit_cfg_group_ = create_process_group(global_rank,
                                           local_rank,
                                           rank_per_group,
@@ -149,18 +142,16 @@ void DiTCollectiveCommunicator::create_process_groups(
                                           "cfg_group",
                                           device);
     parallel_args_->dit_cfg_group_ = dit_cfg_group_.get();
-#endif
     port += num_group;
   }
 
-  if (dp_size > 1) {
-    auto dp_parallel_info = dit_mapping_npu_->get_parallel_info("dp");
+  if (dp_size > 1 && dit_mapping_) {
+    auto dp_parallel_info = dit_mapping_->get_parallel_info("dp");
     auto group_id = dp_parallel_info.current_group_id();
     auto num_group = dp_parallel_info.num_group();
     auto local_rank = dp_parallel_info.rank();
     auto& rank_per_group = dp_parallel_info.rank_per_group()[group_id];
     int port_offset = group_id + 1;
-#if defined(USE_NPU)
     dit_dp_group_ = create_process_group(global_rank,
                                          local_rank,
                                          rank_per_group,
@@ -171,7 +162,6 @@ void DiTCollectiveCommunicator::create_process_groups(
                                          "dp_group",
                                          device);
     parallel_args_->dit_dp_group_ = dit_dp_group_.get();
-#endif
     port += num_group;
   }
 }

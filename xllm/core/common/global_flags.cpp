@@ -343,8 +343,6 @@ DEFINE_string(kv_cache_transfer_mode,
               "PUSH",
               "The mode of kv cache transfer(e.g. PUSH, PULL).");
 
-DEFINE_int32(npu_phy_id, -1, "npu phy id");
-
 DEFINE_int32(transfer_listen_port, 26000, "The KVCacheTranfer listen port.");
 
 DEFINE_uint64(input_shm_size,
@@ -408,14 +406,14 @@ DEFINE_bool(enable_atb_spec_kernel,
 
 // --- block copy config ---
 
-#if defined(USE_NPU)
+#if defined(USE_NPU) || defined(USE_CUDA)
 DEFINE_bool(enable_block_copy_kernel,
             true,
-            "Whether to use ATB block copy kernel. NPU-only.");
+            "Whether to use block copy kernel on supported backends.");
 #else
 DEFINE_bool(enable_block_copy_kernel,
             false,
-            "Whether to use ATB block copy kernel. NPU-only.");
+            "Whether to use block copy kernel on supported backends.");
 #endif
 
 // --- service routing config ---
