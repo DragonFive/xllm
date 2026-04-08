@@ -1119,22 +1119,6 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
 
   const bool is_prefill =
       onerec_params->rec_stage == OneRecModelInputParams::RecStage::PREFILL;
-  if (is_decoder_ && is_prefill) {
-    LOG(INFO) << "OneRec dual-embedding NPU block debug: layer_id=" << layer_id_
-              << ", x_shape=" << x.sizes()
-              << ", x_dtype=" << static_cast<int32_t>(x.scalar_type())
-              << ", attn_mask_shape=" << attn_mask.sizes()
-              << ", attn_mask_dtype="
-              << static_cast<int32_t>(attn_mask.scalar_type())
-              << ", encoder_output_defined=" << (encoder_output != nullptr);
-    if (encoder_output != nullptr) {
-      LOG(INFO) << "OneRec dual-embedding encoder-output debug: layer_id="
-                << layer_id_
-                << ", encoder_output_shape=" << encoder_output->sizes()
-                << ", encoder_output_dtype="
-                << static_cast<int32_t>(encoder_output->scalar_type());
-    }
-  }
 
   atb::Status st;
   if (is_prefill) {
