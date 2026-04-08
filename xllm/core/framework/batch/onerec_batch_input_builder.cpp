@@ -947,6 +947,34 @@ ForwardInput OneRecBatchInputBuilder::build_rec_forward_input(
     }
   }
 
+  if (!perf_cache.cache_data.decoder_context_embeddings.empty()) {
+    const int32_t q_seq_first = input_params.q_seq_lens_vec.empty()
+                                    ? -1
+                                    : input_params.q_seq_lens_vec[0];
+    const int32_t q_seq_last = input_params.q_seq_lens_vec.empty()
+                                   ? -1
+                                   : input_params.q_seq_lens_vec.back();
+    const int32_t kv_seq_first = input_params.kv_seq_lens_vec.empty()
+                                     ? -1
+                                     : input_params.kv_seq_lens_vec[0];
+    const int32_t kv_seq_last = input_params.kv_seq_lens_vec.empty()
+                                    ? -1
+                                    : input_params.kv_seq_lens_vec.back();
+    LOG(INFO) << "OneRec dual-embedding builder meta: num_sequences="
+              << input_params.num_sequences << ", seq_len=" << seq_len
+              << ", num_decoder_embeddings=" << num_decoder_embeddings
+              << ", q_max_seq_len=" << input_params.q_max_seq_len
+              << ", kv_max_seq_len=" << input_params.kv_max_seq_len
+              << ", q_seq_lens_size=" << input_params.q_seq_lens_vec.size()
+              << ", q_seq_len_first=" << q_seq_first
+              << ", q_seq_len_last=" << q_seq_last
+              << ", kv_seq_lens_size=" << input_params.kv_seq_lens_vec.size()
+              << ", kv_seq_len_first=" << kv_seq_first
+              << ", kv_seq_len_last=" << kv_seq_last
+              << ", bs=" << onerec_params.bs
+              << ", group_width=" << onerec_params.group_width;
+  }
+
   return forward_input;
 }
 

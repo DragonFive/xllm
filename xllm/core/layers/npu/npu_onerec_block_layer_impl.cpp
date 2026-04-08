@@ -1315,6 +1315,36 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     int32_t start_tensor_idx) {
   internal_tensors_ = atb_speed::Utils::AtTensor2Tensor(x);
 
+  const auto* onerec_params = input_params.onerec_params();
+  if (onerec_params != nullptr) {
+    const int32_t q_seq_first = input_params.q_seq_lens_vec.empty()
+                                    ? -1
+                                    : input_params.q_seq_lens_vec[0];
+    const int32_t q_seq_last = input_params.q_seq_lens_vec.empty()
+                                   ? -1
+                                   : input_params.q_seq_lens_vec.back();
+    const int32_t kv_seq_first = input_params.kv_seq_lens_vec.empty()
+                                     ? -1
+                                     : input_params.kv_seq_lens_vec[0];
+    const int32_t kv_seq_last = input_params.kv_seq_lens_vec.empty()
+                                    ? -1
+                                    : input_params.kv_seq_lens_vec.back();
+    LOG(INFO) << "OneRec dual-embedding NPU meta: layer_id=" << layer_id_
+              << ", x_rows=" << x.size(0)
+              << ", num_sequences=" << input_params.num_sequences
+              << ", q_max_seq_len=" << input_params.q_max_seq_len
+              << ", kv_max_seq_len=" << input_params.kv_max_seq_len
+              << ", q_seq_lens_size=" << input_params.q_seq_lens_vec.size()
+              << ", q_seq_len_first=" << q_seq_first
+              << ", q_seq_len_last=" << q_seq_last
+              << ", kv_seq_lens_size=" << input_params.kv_seq_lens_vec.size()
+              << ", kv_seq_len_first=" << kv_seq_first
+              << ", kv_seq_len_last=" << kv_seq_last
+              << ", bs=" << onerec_params->bs
+              << ", group_width=" << onerec_params->group_width
+              << ", seq_len=" << onerec_params->seq_len;
+  }
+
   int32_t idx = start_tensor_idx;
   node.variantPack.inTensors.at(idx++) = internal_tensors_;
   node.variantPack.inTensors.at(idx++) =

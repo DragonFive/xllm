@@ -389,6 +389,18 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   const bool has_encoder_context =
       rec_params.has_encoder_output || has_decoder_context;
   if (has_decoder_context) {
+    const int32_t q_seq_first = input_params.q_seq_lens_vec.empty()
+                                    ? -1
+                                    : input_params.q_seq_lens_vec[0];
+    const int32_t q_seq_last = input_params.q_seq_lens_vec.empty()
+                                   ? -1
+                                   : input_params.q_seq_lens_vec.back();
+    const int32_t kv_seq_first = input_params.kv_seq_lens_vec.empty()
+                                     ? -1
+                                     : input_params.kv_seq_lens_vec[0];
+    const int32_t kv_seq_last = input_params.kv_seq_lens_vec.empty()
+                                    ? -1
+                                    : input_params.kv_seq_lens_vec.back();
     LOG(INFO) << "OneRec dual-embedding worker debug: rec_stage="
               << static_cast<int32_t>(rec_params.rec_stage)
               << ", is_first_prefill=" << rec_params.is_first_prefill
@@ -401,7 +413,16 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
               << ", has_encoder_output=" << rec_params.has_encoder_output
               << ", bs=" << rec_params.bs
               << ", group_width=" << rec_params.group_width
-              << ", seq_len=" << rec_params.seq_len;
+              << ", seq_len=" << rec_params.seq_len
+              << ", num_sequences=" << input_params.num_sequences
+              << ", q_max_seq_len=" << input_params.q_max_seq_len
+              << ", kv_max_seq_len=" << input_params.kv_max_seq_len
+              << ", q_seq_lens_size=" << input_params.q_seq_lens_vec.size()
+              << ", q_seq_len_first=" << q_seq_first
+              << ", q_seq_len_last=" << q_seq_last
+              << ", kv_seq_lens_size=" << input_params.kv_seq_lens_vec.size()
+              << ", kv_seq_len_first=" << kv_seq_first
+              << ", kv_seq_len_last=" << kv_seq_last;
   }
   std::optional<folly::SemiFuture<torch::Tensor>> filter_mask_future;
   if ((runtime_.worker.driver_ || runtime_.worker.dp_driver_) &&
