@@ -227,6 +227,17 @@ class OneRecStackImpl : public torch::nn::Module {
       if (!h.is_contiguous()) {
         h = h.contiguous();
       }
+#if defined(USE_NPU)
+      if (h.device().type() == c10::DeviceType::PrivateUse1 &&
+          at_npu::native::get_npu_format(h) != ACL_FORMAT_ND) {
+        LOG(INFO) << "OneRec dual-embedding normalize hidden-state to ND: "
+                  << "is_decoder=" << is_decoder_
+                  << ", h_shape=" << h.sizes()
+                  << ", h_dtype=" << static_cast<int32_t>(h.scalar_type())
+                  << ", old_h_format=" << at_npu::native::get_npu_format(h);
+        h = at_npu::native::npu_format_cast(h, ACL_FORMAT_ND).contiguous();
+      }
+#endif
     } else {
       h = embed_tokens_(tokens);
     }
