@@ -1316,6 +1316,8 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     LOG(INFO) << "OneRec dual-embedding NPU meta: layer_id=" << layer_id_
               << ", x_rows=" << x.size(0)
               << ", num_sequences=" << input_params.num_sequences
+              << ", prefill_param_bs=" << prefill_param_.bs
+              << ", decode_param_bs=" << decode_param_.bs
               << ", q_max_seq_len=" << input_params.q_max_seq_len
               << ", kv_max_seq_len=" << input_params.kv_max_seq_len
               << ", q_seq_lens_size=" << input_params.q_seq_lens_vec.size()
