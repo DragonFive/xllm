@@ -18,6 +18,9 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/npu/npu_onerec_block_layer_impl.h"
+#if defined(USE_NPU)
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
+#endif
 
 namespace xllm {
 
@@ -226,6 +229,21 @@ class OneRecStackImpl : public torch::nn::Module {
       }
     } else {
       h = embed_tokens_(tokens);
+    }
+
+    if (onerec_params->decoder_context_embedding.defined()) {
+#if defined(USE_NPU)
+      LOG(INFO) << "OneRec dual-embedding hidden-state format: is_decoder="
+                << is_decoder_ << ", h_shape=" << h.sizes()
+                << ", h_dtype=" << static_cast<int32_t>(h.scalar_type())
+                << ", h_format=" << at_npu::native::get_npu_format(h)
+                << ", h_contiguous=" << h.is_contiguous();
+#else
+      LOG(INFO) << "OneRec dual-embedding hidden-state format: is_decoder="
+                << is_decoder_ << ", h_shape=" << h.sizes()
+                << ", h_dtype=" << static_cast<int32_t>(h.scalar_type())
+                << ", h_contiguous=" << h.is_contiguous();
+#endif
     }
 
     torch::Tensor npu_encoder_output = encoder_output;

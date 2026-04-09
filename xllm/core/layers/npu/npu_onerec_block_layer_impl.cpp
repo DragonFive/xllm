@@ -23,6 +23,9 @@ limitations under the License.
 #include <set>
 
 #include "common/global_flags.h"
+#if defined(USE_NPU)
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
+#endif
 namespace xllm {
 namespace layer {
 namespace {
@@ -1119,6 +1122,16 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
 
   const bool is_prefill =
       onerec_params->rec_stage == OneRecModelInputParams::RecStage::PREFILL;
+
+#if defined(USE_NPU)
+  if (onerec_params->decoder_context_embedding.defined()) {
+    LOG(INFO) << "OneRec dual-embedding NPU input format: layer_id=" << layer_id_
+              << ", x_shape=" << x.sizes()
+              << ", x_dtype=" << static_cast<int32_t>(x.scalar_type())
+              << ", x_format=" << at_npu::native::get_npu_format(x)
+              << ", x_contiguous=" << x.is_contiguous();
+  }
+#endif
 
   atb::Status st;
   if (is_prefill) {
