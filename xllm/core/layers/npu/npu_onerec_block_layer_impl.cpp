@@ -690,6 +690,7 @@ void NpuOneRecBlockLayerImpl::param_from_args(
       is_decoder_ ? args.decoder_head_dim() : args.head_dim();
   param.numAttentionHeadsPerRank = args_n_heads / param.worldSize;
   param.hiddenSizePerAttentionHead = args_head_dim;
+  param.useAttentionScaling = args.use_attention_scaling();
 
   const auto general_kv_heads = args.n_kv_heads();
   const auto decoder_kv_heads = args.decoder_n_kv_heads().has_value()

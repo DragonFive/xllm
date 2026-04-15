@@ -87,6 +87,7 @@ struct ModelArgs {
   // the maximum sequence length to use for rotary position embeddings.
   PROPERTY(int64_t, max_position_embeddings) = 0;
   PROPERTY(bool, use_absolute_position_embedding) = false;
+  PROPERTY(bool, use_attention_scaling) = false;
 
   // token id for beginning of sentence.
   PROPERTY(int32_t, bos_token_id) = 0;
@@ -510,6 +511,7 @@ inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << ", max_position_embeddings: " << args.max_position_embeddings();
   os << ", use_absolute_position_embedding: "
      << args.use_absolute_position_embedding();
+  os << ", use_attention_scaling: " << args.use_attention_scaling();
   os << ", bos_token_id: " << args.bos_token_id();
   os << ", eos_token_id: " << args.eos_token_id();
   os << ", pad_token_id: " << args.pad_token_id();
