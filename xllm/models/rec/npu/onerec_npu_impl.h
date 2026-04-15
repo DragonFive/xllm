@@ -20,6 +20,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/npu/npu_onerec_block_layer_impl.h"
+#include "core/util/rec_model_utils.h"
 
 namespace xllm {
 
@@ -391,14 +392,13 @@ class OneRecStackImpl : public torch::nn::Module {
     }
 
     batch_size = std::max<int64_t>(1, batch_size);
-    torch::Tensor mask =
-        torch::triu(torch::ones({seq_length, seq_length},
-                                h.options().dtype(torch::kUInt8)),
-                    1)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand({batch_size, 1, seq_length, seq_length})
-            .contiguous();
+    auto mask = torch::triu(torch::ones({seq_length, seq_length},
+                                        h.options().dtype(torch::kUInt8)),
+                            1)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand({batch_size, 1, seq_length, seq_length})
+                    .contiguous();
     return mask;
   }
 
@@ -427,7 +427,7 @@ class OneRecStackImpl : public torch::nn::Module {
                                    ? layer_position_bias
                                    : layer_position_bias.contiguous();
 
-    if (is_decoder_ && FLAGS_enable_rec_prefill_only) {
+    if (is_decoder_ && use_legacy_onerec_prefill_only_mode()) {
       const float mask_value = -9984.0f;
       auto upper_tri_mask =
           torch::triu(torch::ones({query_length, query_length},

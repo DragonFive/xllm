@@ -262,7 +262,7 @@ class OneRecForConditionalGenerationImpl final
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
     for (const auto& state_dict : loader->get_state_dicts()) {
-      StateDict prefixed_state_dict =
+      auto prefixed_state_dict =
           state_dict->get_dict_with_prefix("module.module3.t5_model.");
       StateDict model_state_dict =
           prefixed_state_dict.size() > 0
@@ -334,6 +334,7 @@ REGISTER_MODEL_ARGS(onerec, [&] {
   LOAD_ARG_OR(use_absolute_position_embedding,
               "use_absolute_position_embedding",
               false);
+  LOAD_ARG_OR(use_attention_scaling, "use_attention_scaling", false);
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", true);
 
   LOAD_ARG_OR(use_moe, "use_moe", false);
