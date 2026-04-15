@@ -23,6 +23,7 @@ limitations under the License.
 #include <set>
 
 #include "common/global_flags.h"
+#include "core/util/rec_model_utils.h"
 namespace xllm {
 namespace layer {
 namespace {
@@ -604,7 +605,7 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
   param_from_args(prefill_param_atb_, args, parallel_args, /*is_prefill=*/true);
   prefill_param_atb_.matmulBackend = atb_speed::common::OpBackend::ATB;
   param_from_args(decode_param_, args, parallel_args, /*is_prefill=*/false);
-  if (FLAGS_enable_rec_prefill_only && is_decoder_) {
+  if (use_legacy_onerec_prefill_only_mode() && is_decoder_) {
     param_from_args(decoder_prefill_only_decode_param_,
                     args,
                     parallel_args,
@@ -674,7 +675,8 @@ void NpuOneRecBlockLayerImpl::param_from_args(
   param.enableInterLayerAddNorm = false;
   param.isDecoder = is_decoder_;
   param.isOneRecEncoder = !is_decoder_;
-  param.enableOneRecPrefillOnly = FLAGS_enable_rec_prefill_only;
+  param.use_xattn = is_decoder_ && is_onerec_xattention_mode();
+  param.enableOneRecPrefillOnly = use_legacy_onerec_prefill_only_mode();
   param.backend = FLAGS_communication_backend;
   param.matmulBackend = kEnableOneRecAclnnAttentionLinear
                             ? atb_speed::common::OpBackend::ACLNN
@@ -690,11 +692,7 @@ void NpuOneRecBlockLayerImpl::param_from_args(
       is_decoder_ ? args.decoder_head_dim() : args.head_dim();
   param.numAttentionHeadsPerRank = args_n_heads / param.worldSize;
   param.hiddenSizePerAttentionHead = args_head_dim;
-  // Reuse an existing model capability bit to split the legacy and 3B paths.
-  // Current validated models follow:
-  // - legacy model: moe_use_shared_experts = false
-  // - 3B model:     moe_use_shared_experts = true
-  param.useAttentionScaling = args.moe_use_shared_experts();
+  param.useAttentionScaling = args.use_attention_scaling();
 
   const auto general_kv_heads = args.n_kv_heads();
   const auto decoder_kv_heads = args.decoder_n_kv_heads().has_value()
@@ -1087,8 +1085,7 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
               << "OneRec fused FFN weight1 dim0 must be even, got "
               << fused_gate_up.sizes() << " from " << state_key;
           correct_tensor_dtype(fused_gate_up, state_key);
-          std::vector<torch::Tensor> chunks =
-              fused_gate_up.chunk(/*chunks=*/2, /*dim=*/0);
+          auto chunks = fused_gate_up.chunk(2, 0);
           at_weight_tensors_[kInFfnWi0Weight] =
               chunks[0].contiguous().to(device_);
           at_weight_tensors_[kInFfnWi1Weight] =
@@ -1157,7 +1154,7 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
         init_node(prefill_node_atb_, prefill_param_atb_));
   }
   if (is_decoder_) {
-    if (FLAGS_enable_rec_prefill_only) {
+    if (use_legacy_onerec_prefill_only_mode()) {
       CHECK_OPERATION_STATUS_RETURN(
           init_node(decoder_prefill_only_decode_node_,
                     decoder_prefill_only_decode_param_));
@@ -1251,7 +1248,7 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   atb::Status st;
   if (is_prefill) {
     if (is_decoder_) {
-      if (FLAGS_enable_rec_prefill_only) {
+      if (use_legacy_onerec_prefill_only_mode()) {
         if (is_first_prefill && encoder_output != nullptr) {
           const int64_t bs = encoder_output->size(0);
           const int64_t seq_len = encoder_output->size(1);
@@ -1467,7 +1464,7 @@ void NpuOneRecBlockLayerImpl::build_decoder_moe_node_variant_pack(
       attn_mask,
       kv_cache,
       input_params,
-      (FLAGS_enable_rec_prefill_only && is_prefill && !is_first_prefill)
+      (use_legacy_onerec_prefill_only_mode() && is_prefill && !is_first_prefill)
           ? decoder_prefill_only_decode_param_
           : (is_prefill ? prefill_param_ : decode_param_),
       is_first_prefill,
@@ -1499,8 +1496,27 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   node.variantPack.inTensors.at(idx++) =
       atb_speed::Utils::AtTensor2Tensor(attn_mask);
 
-  torch::Tensor k_cache = kv_cache.get_k_cache();
-  torch::Tensor v_cache = kv_cache.get_v_cache();
+  auto k_cache = kv_cache.get_k_cache();
+  auto v_cache = kv_cache.get_v_cache();
+  const auto* onerec_xattn_params = input_params.onerec_xattention_params();
+  if (param.use_xattn && onerec_xattn_params != nullptr &&
+      static_cast<size_t>(param.layerId) <
+          onerec_xattn_params->unshared_k_caches.size() &&
+      static_cast<size_t>(param.layerId) <
+          onerec_xattn_params->unshared_v_caches.size()) {
+    if (onerec_xattn_params
+            ->unshared_k_caches[static_cast<size_t>(param.layerId)]
+            .defined()) {
+      k_cache = onerec_xattn_params
+                    ->unshared_k_caches[static_cast<size_t>(param.layerId)];
+    }
+    if (onerec_xattn_params
+            ->unshared_v_caches[static_cast<size_t>(param.layerId)]
+            .defined()) {
+      v_cache = onerec_xattn_params
+                    ->unshared_v_caches[static_cast<size_t>(param.layerId)];
+    }
+  }
   node.variantPack.inTensors.at(idx++) =
       k_cache.defined() ? atb_speed::Utils::AtTensor2Tensor(k_cache)
                         : placeholder_;
@@ -1516,11 +1532,11 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   } else {
     int32_t seq_len = std::max(static_cast<int32_t>(x.size(0)), 1);
     seq_lens_vec_ = {seq_len};
-    fallback_kv_seq_lens_tensor_ = torch::tensor(
+    auto seq_len_tensor = torch::tensor(
         seq_lens_vec_,
         torch::TensorOptions().dtype(torch::kInt32).device(device_));
     node.variantPack.inTensors.at(idx) =
-        atb_speed::Utils::AtTensor2Tensor(fallback_kv_seq_lens_tensor_);
+        atb_speed::Utils::AtTensor2Tensor(seq_len_tensor);
     node.variantPack.inTensors.at(idx).hostData = seq_lens_vec_.data();
   }
   idx++;
@@ -1566,7 +1582,10 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   }
   idx++;
 
-  const auto* onerec_params = input_params.onerec_params();
+  const auto* onerec_params =
+      onerec_xattn_params != nullptr
+          ? static_cast<const OneRecModelInputParams*>(onerec_xattn_params)
+          : input_params.onerec_params();
   const bool minimize_cross_attn_inputs =
       param.enableOneRecPrefillOnly && !param.enableSplitFuse && !param.isFA;
   if (!minimize_cross_attn_inputs) {
@@ -1574,8 +1593,8 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
         onerec_params->cross_attn_kv_cu_seq_lens.defined()) {
       node.variantPack.inTensors.at(idx) = atb_speed::Utils::AtTensor2Tensor(
           onerec_params->cross_attn_kv_cu_seq_lens);
-      node.variantPack.inTensors.at(idx).hostData = const_cast<int32_t*>(
-          onerec_params->cross_attn_kv_cu_seq_lens_vec.data());
+      node.variantPack.inTensors.at(idx).hostData =
+          const_cast<int*>(onerec_params->cross_attn_kv_cu_seq_lens_vec.data());
     } else {
       node.variantPack.inTensors.at(idx) = placeholder_;
       node.variantPack.inTensors.at(idx).hostData = placeholder_vec_.data();
@@ -1614,6 +1633,31 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
     node.variantPack.inTensors.at(idx).hostData = placeholder_vec_.data();
   }
   idx++;
+
+  if (param.use_xattn) {
+    CHECK(onerec_xattn_params != nullptr)
+        << "OneRec xattention requires onerec_xattention_params.";
+    CHECK_LT(static_cast<size_t>(param.layerId),
+             onerec_xattn_params->shared_k_caches.size())
+        << "Missing OneRec shared_k_caches for layer " << param.layerId;
+    CHECK_LT(static_cast<size_t>(param.layerId),
+             onerec_xattn_params->shared_v_caches.size())
+        << "Missing OneRec shared_v_caches for layer " << param.layerId;
+    CHECK(onerec_xattn_params->beam_width_tensor.defined())
+        << "OneRec xattention requires beam_width_tensor";
+    CHECK(onerec_xattn_params->current_round_tensor.defined())
+        << "OneRec xattention requires current_round_tensor";
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        onerec_xattn_params
+            ->shared_k_caches[static_cast<size_t>(param.layerId)]);
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        onerec_xattn_params
+            ->shared_v_caches[static_cast<size_t>(param.layerId)]);
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        onerec_xattn_params->beam_width_tensor);
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        onerec_xattn_params->current_round_tensor);
+  }
 
   if (param.enableOneRecPrefillOnly && cross_k_cache_.defined() &&
       cross_v_cache_.defined()) {
@@ -1664,7 +1708,7 @@ void NpuOneRecBlockLayerImpl::build_decoder_node_variant_pack(
       attn_mask,
       kv_cache,
       input_params,
-      (FLAGS_enable_rec_prefill_only && is_prefill && !is_first_prefill)
+      (use_legacy_onerec_prefill_only_mode() && is_prefill && !is_first_prefill)
           ? decoder_prefill_only_decode_param_
           : (is_prefill ? prefill_param_ : decode_param_),
       is_first_prefill,
@@ -1713,13 +1757,12 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
                    << ": " << fused_weight.sizes();
       return;
     }
-    torch::Tensor reshaped = fused_weight.contiguous().view(
+    auto reshaped = fused_weight.contiguous().view(
         {num_experts_per_partition_, fused_weight.size(0), -1});
     CHECK_EQ(reshaped.size(2) % 2, 0)
         << "OneRec fused expert weight1 last dim must be even for " << name
         << ", got shape " << fused_weight.sizes();
-    std::vector<torch::Tensor> gate_up_chunks =
-        reshaped.chunk(/*chunks=*/2, /*dim=*/-1);
+    auto gate_up_chunks = reshaped.chunk(2, -1);
     for (int32_t i = 0; i < num_experts_per_partition_; ++i) {
       experts_weights_["gate_proj.weight"][i] =
           gate_up_chunks[0][i].transpose(0, 1).contiguous();
@@ -1738,7 +1781,7 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
                    << ": " << fused_weight.sizes();
       return;
     }
-    torch::Tensor reshaped = fused_weight.contiguous().view(
+    auto reshaped = fused_weight.contiguous().view(
         {num_experts_per_partition_, -1, fused_weight.size(1)});
     for (int32_t i = 0; i < num_experts_per_partition_; ++i) {
       experts_weights_["down_proj.weight"][i] =
@@ -1936,49 +1979,40 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
         experts_weights_.count("up_proj.weight_offset") > 0) {
       std::vector<torch::Tensor> gate_offset_1d;
       std::vector<torch::Tensor> up_offset_1d;
-      gate_offset_1d.reserve(
-          experts_weights_["gate_proj.weight_offset"].size());
-      up_offset_1d.reserve(experts_weights_["up_proj.weight_offset"].size());
       for (const auto& tensor : experts_weights_["gate_proj.weight_offset"]) {
         if (tensor.defined()) {
-          gate_offset_1d.emplace_back(tensor);
+          gate_offset_1d.push_back(tensor);
         }
       }
       for (const auto& tensor : experts_weights_["up_proj.weight_offset"]) {
         if (tensor.defined()) {
-          up_offset_1d.emplace_back(tensor);
+          up_offset_1d.push_back(tensor);
         }
       }
       if (!gate_offset_1d.empty() &&
           gate_offset_1d.size() == up_offset_1d.size()) {
         at_weight_tensors_[kInMlpGateUpOffsetExpert] =
-            merge_experts_weights(gate_offset_1d,
-                                  up_offset_1d,
-                                  /*transpose=*/false);
+            merge_experts_weights(gate_offset_1d, up_offset_1d, false);
       }
     }
     if (experts_weights_.count("gate_proj.weight_scale") > 0 &&
         experts_weights_.count("up_proj.weight_scale") > 0) {
       std::vector<torch::Tensor> gate_scale_1d;
       std::vector<torch::Tensor> up_scale_1d;
-      gate_scale_1d.reserve(experts_weights_["gate_proj.weight_scale"].size());
-      up_scale_1d.reserve(experts_weights_["up_proj.weight_scale"].size());
       for (const auto& tensor : experts_weights_["gate_proj.weight_scale"]) {
         if (tensor.defined()) {
-          gate_scale_1d.emplace_back(tensor);
+          gate_scale_1d.push_back(tensor);
         }
       }
       for (const auto& tensor : experts_weights_["up_proj.weight_scale"]) {
         if (tensor.defined()) {
-          up_scale_1d.emplace_back(tensor);
+          up_scale_1d.push_back(tensor);
         }
       }
       if (!gate_scale_1d.empty() &&
           gate_scale_1d.size() == up_scale_1d.size()) {
         at_weight_tensors_[kInMlpGateUpScaleExpert] =
-            merge_experts_weights(gate_scale_1d,
-                                  up_scale_1d,
-                                  /*transpose=*/false);
+            merge_experts_weights(gate_scale_1d, up_scale_1d, false);
       }
     }
   }
@@ -1992,29 +2026,26 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
   if (quantize_type_ == "w8a8_dynamic") {
     if (experts_weights_.count("down_proj.weight_offset") > 0) {
       std::vector<torch::Tensor> down_offset_1d;
-      down_offset_1d.reserve(
-          experts_weights_["down_proj.weight_offset"].size());
       for (const auto& tensor : experts_weights_["down_proj.weight_offset"]) {
         if (tensor.defined()) {
-          down_offset_1d.emplace_back(tensor);
+          down_offset_1d.push_back(tensor);
         }
       }
       if (!down_offset_1d.empty()) {
         at_weight_tensors_[kInMlpDownOffsetExpert] =
-            merge_experts_weights(down_offset_1d, /*transpose=*/false);
+            merge_experts_weights(down_offset_1d, false);
       }
     }
     if (experts_weights_.count("down_proj.weight_scale") > 0) {
       std::vector<torch::Tensor> down_scale_1d;
-      down_scale_1d.reserve(experts_weights_["down_proj.weight_scale"].size());
       for (const auto& tensor : experts_weights_["down_proj.weight_scale"]) {
         if (tensor.defined()) {
-          down_scale_1d.emplace_back(tensor);
+          down_scale_1d.push_back(tensor);
         }
       }
       if (!down_scale_1d.empty()) {
         at_weight_tensors_[kInMlpDownScaleExpert] =
-            merge_experts_weights(down_scale_1d, /*transpose=*/false);
+            merge_experts_weights(down_scale_1d, false);
       }
     }
   }
@@ -2046,10 +2077,10 @@ void NpuOneRecBlockLayerImpl::merge_shared_experts_weights() {
   };
 
   if (gate_weight.defined() && up_weight.defined()) {
-    torch::Tensor merged_gate = prepare_shared_weight_2d(gate_weight, "gate");
-    torch::Tensor merged_up = prepare_shared_weight_2d(up_weight, "up");
+    auto merged_gate = prepare_shared_weight_2d(gate_weight, "gate");
+    auto merged_up = prepare_shared_weight_2d(up_weight, "up");
     at_weight_tensors_[kInMlpGateUpWeightSharedExpert] =
-        torch::cat({merged_gate, merged_up}, /*dim=*/0).contiguous();
+        torch::cat({merged_gate, merged_up}, 0).contiguous();
   } else if (gate_weight.defined()) {
     at_weight_tensors_[kInMlpGateUpWeightSharedExpert] =
         prepare_shared_weight_2d(gate_weight, "gate_only");
