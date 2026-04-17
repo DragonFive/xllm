@@ -165,6 +165,8 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
   }
   output_targets_.clear();
   if (rec_type == RecType::kOneRec) {
+    const bool use_onerec_prefill_only =
+        FLAGS_enable_rec_prefill_only && FLAGS_max_decode_rounds == 0;
     if (!sequence_groups_.empty()) {
       // OneRec REC batches are tracked via sequence_groups_, while output
       // target generation still walks sequences_. Refresh the flattened
@@ -172,7 +174,7 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
       // beam search expands or replaces the group-owned Sequence instances.
       refresh_sequences_from_groups();
     }
-    if (FLAGS_enable_rec_prefill_only) {
+    if (use_onerec_prefill_only) {
       refresh_onerec_prefill_output_targets();
     } else {
       refresh_output_targets();

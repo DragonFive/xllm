@@ -65,6 +65,38 @@ RecVocabDict* get_onerec_vocab_dict(const std::string& model_weights_path) {
   return VersionSingleton<RecVocabDict>::GetInstance(model_version);
 }
 
+bool enable_onerec_xattention_runtime() { return FLAGS_max_decode_rounds > 0; }
+
+int32_t get_onerec_current_round(const OneRecModelInputParams& params) {
+  if (params.rec_stage != OneRecModelInputParams::RecStage::DECODE ||
+      params.generated_tokens.empty()) {
+    return 0;
+  }
+  return std::max<int32_t>(
+      static_cast<int32_t>(params.generated_tokens.front().size()) - 1, 0);
+}
+
+torch::Tensor get_onerec_shared_kv_view(const torch::Tensor& cache,
+                                        int64_t shared_kv_tokens,
+                                        int64_t kv_heads,
+                                        int64_t head_dim) {
+  if (!cache.defined()) {
+    return torch::Tensor();
+  }
+  if (cache.dim() == 1) {
+    const int64_t total_tokens =
+        cache.numel() / std::max<int64_t>(kv_heads * head_dim, 1);
+    const int64_t shared_tokens = std::min(shared_kv_tokens, total_tokens);
+    return cache.narrow(0, 0, shared_tokens * kv_heads * head_dim)
+        .view({shared_tokens, kv_heads, head_dim});
+  }
+  if (cache.dim() >= 3) {
+    const int64_t shared_tokens = std::min(shared_kv_tokens, cache.size(0));
+    return cache.narrow(0, 0, shared_tokens);
+  }
+  return cache;
+}
+
 }  // namespace
 
 // ============================================================
@@ -327,6 +359,39 @@ void RecWorkerImpl::OneRecWorkPipeline::prepare_work_before_execute(
   RecWorkPipeline::prepare_work_before_execute(inputs, processed_inputs);
 
   auto& onerec_params = processed_inputs.input_params.mutable_onerec_params();
+  if (enable_onerec_xattention_runtime()) {
+    const auto& args = runtime_.context->get_model_args();
+    const auto& parallel_args = runtime_.context->get_parallel_args();
+    const int64_t decoder_kv_heads =
+        args.decoder_n_kv_heads().value_or(args.decoder_n_heads());
+    const int64_t local_kv_heads =
+        decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
+    const int64_t head_dim = args.decoder_head_dim();
+    const int64_t shared_kv_tokens =
+        runtime_.worker.options_.max_tokens_per_batch();
+
+    onerec_params.shared_k_caches.clear();
+    onerec_params.shared_v_caches.clear();
+    onerec_params.shared_k_caches.reserve(runtime_.worker.kv_caches_.size());
+    onerec_params.shared_v_caches.reserve(runtime_.worker.kv_caches_.size());
+    for (const auto& kv_cache : runtime_.worker.kv_caches_) {
+      onerec_params.shared_k_caches.push_back(get_onerec_shared_kv_view(
+          kv_cache.get_k_cache(), shared_kv_tokens, local_kv_heads, head_dim));
+      onerec_params.shared_v_caches.push_back(get_onerec_shared_kv_view(
+          kv_cache.get_v_cache(), shared_kv_tokens, local_kv_heads, head_dim));
+    }
+
+    const int32_t beam_width = onerec_params.group_width > 0
+                                   ? onerec_params.group_width
+                                   : runtime_.worker.options_.beam_width();
+    const auto int_options = torch::TensorOptions()
+                                 .dtype(torch::kInt32)
+                                 .device(runtime_.worker.device());
+    onerec_params.beam_width_tensor = torch::tensor({beam_width}, int_options);
+    onerec_params.current_round_tensor =
+        torch::tensor({get_onerec_current_round(onerec_params)}, int_options);
+  }
+
   if (!onerec_params.decoder_context_embedding.defined()) {
     return;
   }

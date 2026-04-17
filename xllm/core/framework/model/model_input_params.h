@@ -70,6 +70,12 @@ struct OneRecModelInputParams {
   torch::Tensor cross_attn_block_tables;
   std::vector<int> cross_attn_kv_cu_seq_lens_vec;
 
+  // OneRec xattention runtime tensors prepared on worker side.
+  std::vector<torch::Tensor> shared_k_caches;
+  std::vector<torch::Tensor> shared_v_caches;
+  torch::Tensor beam_width_tensor;
+  torch::Tensor current_round_tensor;
+
   torch::Tensor encoder_token_ids;
   torch::Tensor encoder_positions;
 
@@ -94,6 +100,22 @@ struct OneRecModelInputParams {
     if (cross_attn_block_tables.defined()) {
       result.cross_attn_block_tables = cross_attn_block_tables.to(device);
     }
+    result.shared_k_caches.clear();
+    result.shared_v_caches.clear();
+    result.shared_k_caches.reserve(shared_k_caches.size());
+    result.shared_v_caches.reserve(shared_v_caches.size());
+    for (const auto& t : shared_k_caches) {
+      result.shared_k_caches.push_back(safe_to(t, device));
+    }
+    for (const auto& t : shared_v_caches) {
+      result.shared_v_caches.push_back(safe_to(t, device));
+    }
+    if (beam_width_tensor.defined()) {
+      result.beam_width_tensor = safe_to(beam_width_tensor, device, true);
+    }
+    if (current_round_tensor.defined()) {
+      result.current_round_tensor = safe_to(current_round_tensor, device, true);
+    }
     if (encoder_token_ids.defined()) {
       result.encoder_token_ids = encoder_token_ids.to(device);
     }
@@ -114,6 +136,8 @@ struct OneRecModelInputParams {
               << " encoder_max_seq_len: " << encoder_max_seq_len
               << " is_first_prefill: " << is_first_prefill << " bs: " << bs
               << " group_width: " << group_width << " seq_len: " << seq_len
+              << " shared_k_caches size: " << shared_k_caches.size()
+              << " shared_v_caches size: " << shared_v_caches.size()
               << " encoder_seq_lens size: " << encoder_seq_lens.size()
               << " cross_attn_kv_cu_seq_lens_vec size: "
               << cross_attn_kv_cu_seq_lens_vec.size()
@@ -141,6 +165,13 @@ struct OneRecModelInputParams {
     if (cross_attn_block_tables.defined()) {
       LOG(INFO) << " cross_attn_block_tables shape: "
                 << cross_attn_block_tables.sizes();
+    }
+    if (beam_width_tensor.defined()) {
+      LOG(INFO) << " beam_width_tensor shape: " << beam_width_tensor.sizes();
+    }
+    if (current_round_tensor.defined()) {
+      LOG(INFO) << " current_round_tensor shape: "
+                << current_round_tensor.sizes();
     }
     if (encoder_token_ids.defined()) {
       LOG(INFO) << " encoder_token_ids shape: " << encoder_token_ids.sizes();

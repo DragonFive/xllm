@@ -66,7 +66,8 @@ void apply_multi_round_pipeline_toggles() {
 }
 
 void apply_onerec_pipeline_toggles(xllm::Options* options) {
-  FLAGS_enable_rec_prefill_only = true;
+  const bool enable_onerec_xattention = FLAGS_max_decode_rounds > 0;
+  FLAGS_enable_rec_prefill_only = !enable_onerec_xattention;
   FLAGS_enable_constrained_decoding = true;
   FLAGS_enable_prefix_cache = false;
   FLAGS_enable_schedule_overlap = false;
@@ -76,8 +77,10 @@ void apply_onerec_pipeline_toggles(xllm::Options* options) {
       .enable_schedule_overlap(false)
       .enable_chunked_prefill(false);
 
-  // OneRec does not use Rec multi-round decode rounds.
-  FLAGS_max_decode_rounds = 0;
+  if (!enable_onerec_xattention) {
+    // Legacy OneRec keeps the historical fixed decode-step behavior.
+    FLAGS_max_decode_rounds = 0;
+  }
 }
 
 }  // namespace

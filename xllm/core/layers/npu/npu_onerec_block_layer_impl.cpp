@@ -39,6 +39,12 @@ static constexpr uint64_t kOneRecMoeWeightCountPerLayer = 97;
 static constexpr bool kEnableOneRecAclnnAttentionLinear = true;
 static constexpr int32_t kOneRecAclnnAttentionLinearMinTokens = 128;
 
+bool enable_onerec_xattention_runtime() { return FLAGS_max_decode_rounds > 0; }
+
+bool use_onerec_prefill_only_mode() {
+  return FLAGS_enable_rec_prefill_only && !enable_onerec_xattention_runtime();
+}
+
 enum class OneRecBlockLayerTensorId : int32_t {
   // Self-attention layer norm
   IN_LAYER_NORM_WEIGHT = 0,
@@ -604,7 +610,7 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
   param_from_args(prefill_param_atb_, args, parallel_args, /*is_prefill=*/true);
   prefill_param_atb_.matmulBackend = atb_speed::common::OpBackend::ATB;
   param_from_args(decode_param_, args, parallel_args, /*is_prefill=*/false);
-  if (FLAGS_enable_rec_prefill_only && is_decoder_) {
+  if (use_onerec_prefill_only_mode() && is_decoder_) {
     param_from_args(decoder_prefill_only_decode_param_,
                     args,
                     parallel_args,
@@ -674,7 +680,8 @@ void NpuOneRecBlockLayerImpl::param_from_args(
   param.enableInterLayerAddNorm = false;
   param.isDecoder = is_decoder_;
   param.isOneRecEncoder = !is_decoder_;
-  param.enableOneRecPrefillOnly = FLAGS_enable_rec_prefill_only;
+  param.use_xattn = is_decoder_ && enable_onerec_xattention_runtime();
+  param.enableOneRecPrefillOnly = use_onerec_prefill_only_mode();
   param.backend = FLAGS_communication_backend;
   param.matmulBackend = kEnableOneRecAclnnAttentionLinear
                             ? atb_speed::common::OpBackend::ACLNN
@@ -1160,7 +1167,7 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
         init_node(prefill_node_atb_, prefill_param_atb_));
   }
   if (is_decoder_) {
-    if (FLAGS_enable_rec_prefill_only) {
+    if (prefill_param_.enableOneRecPrefillOnly) {
       CHECK_OPERATION_STATUS_RETURN(
           init_node(decoder_prefill_only_decode_node_,
                     decoder_prefill_only_decode_param_));
@@ -1254,7 +1261,7 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   atb::Status st;
   if (is_prefill) {
     if (is_decoder_) {
-      if (FLAGS_enable_rec_prefill_only) {
+      if (prefill_param_.enableOneRecPrefillOnly) {
         if (is_first_prefill && encoder_output != nullptr) {
           const int64_t bs = encoder_output->size(0);
           const int64_t seq_len = encoder_output->size(1);
@@ -1470,7 +1477,8 @@ void NpuOneRecBlockLayerImpl::build_decoder_moe_node_variant_pack(
       attn_mask,
       kv_cache,
       input_params,
-      (FLAGS_enable_rec_prefill_only && is_prefill && !is_first_prefill)
+      (prefill_param_.enableOneRecPrefillOnly && is_prefill &&
+       !is_first_prefill)
           ? decoder_prefill_only_decode_param_
           : (is_prefill ? prefill_param_ : decode_param_),
       is_first_prefill,
@@ -1618,6 +1626,29 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   }
   idx++;
 
+  if (param.use_xattn) {
+    CHECK(onerec_params != nullptr)
+        << "OneRec xattention requires onerec_params.";
+    CHECK_LT(static_cast<size_t>(param.layerId),
+             onerec_params->shared_k_caches.size())
+        << "Missing OneRec shared_k_caches for layer " << param.layerId;
+    CHECK_LT(static_cast<size_t>(param.layerId),
+             onerec_params->shared_v_caches.size())
+        << "Missing OneRec shared_v_caches for layer " << param.layerId;
+    CHECK(onerec_params->beam_width_tensor.defined())
+        << "OneRec xattention requires beam_width_tensor";
+    CHECK(onerec_params->current_round_tensor.defined())
+        << "OneRec xattention requires current_round_tensor";
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        onerec_params->shared_k_caches[static_cast<size_t>(param.layerId)]);
+    node.variantPack.inTensors.at(idx++) = atb_speed::Utils::AtTensor2Tensor(
+        onerec_params->shared_v_caches[static_cast<size_t>(param.layerId)]);
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(onerec_params->beam_width_tensor);
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(onerec_params->current_round_tensor);
+  }
+
   if (param.enableOneRecPrefillOnly && cross_k_cache_.defined() &&
       cross_v_cache_.defined()) {
     if (is_first_prefill && node.variantPack.outTensors.size() >= 3) {
@@ -1667,7 +1698,8 @@ void NpuOneRecBlockLayerImpl::build_decoder_node_variant_pack(
       attn_mask,
       kv_cache,
       input_params,
-      (FLAGS_enable_rec_prefill_only && is_prefill && !is_first_prefill)
+      (prefill_param_.enableOneRecPrefillOnly && is_prefill &&
+       !is_first_prefill)
           ? decoder_prefill_only_decode_param_
           : (is_prefill ? prefill_param_ : decode_param_),
       is_first_prefill,

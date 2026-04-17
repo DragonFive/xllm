@@ -426,7 +426,8 @@ class OneRecStackImpl : public torch::nn::Module {
                                    ? layer_position_bias
                                    : layer_position_bias.contiguous();
 
-    if (is_decoder_ && FLAGS_enable_rec_prefill_only) {
+    if (is_decoder_ && FLAGS_enable_rec_prefill_only &&
+        FLAGS_max_decode_rounds == 0) {
       const float mask_value = -9984.0f;
       auto upper_tri_mask =
           torch::triu(torch::ones({query_length, query_length},
