@@ -44,7 +44,7 @@
 	fetchRecurseSubmodules = false
 [submodule "third_party/xllm_atb_layers"]
 	path = third_party/xllm_atb_layers
-	url = git@coding.jd.com:maxiaolong.maxwell/xllm_atb_layers.git
+	url = https://gitcode.com/xLLM-AI/xllm_atb_layers.git
 	fetchRecurseSubmodules = false
 [submodule "third_party/xxHash"]
 	path = third_party/xxHash
