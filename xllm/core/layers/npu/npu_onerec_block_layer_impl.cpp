@@ -708,9 +708,6 @@ void NpuOneRecBlockLayerImpl::param_from_args(
                      decoder_kv_heads.value() != args.decoder_n_heads())
                   : (general_kv_heads.has_value() &&
                      general_kv_heads.value() != args.n_heads());
-  param.useOneRec3bOptimizations = args.use_attention_scaling() ||
-                                   is_grouped_query_attention ||
-                                   args.moe_use_shared_experts();
   const int64_t args_kv_heads =
       is_decoder_ ? decoder_kv_heads.value_or(args.decoder_n_heads())
                   : general_kv_heads.value_or(args.n_heads());
