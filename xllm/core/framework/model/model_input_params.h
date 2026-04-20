@@ -151,6 +151,64 @@ struct OneRecModelInputParams {
   }
 };
 
+struct OneRecXAttentionParams : public OneRecModelInputParams {
+  std::vector<torch::Tensor> unshared_k_caches;
+  std::vector<torch::Tensor> unshared_v_caches;
+  std::vector<torch::Tensor> shared_k_caches;
+  std::vector<torch::Tensor> shared_v_caches;
+  torch::Tensor beam_width_tensor;
+  torch::Tensor current_round_tensor;
+
+  OneRecXAttentionParams to(const c10::Device& device) const {
+    OneRecXAttentionParams result = *this;
+    static_cast<OneRecModelInputParams&>(result) =
+        OneRecModelInputParams::to(device);
+    result.unshared_k_caches.clear();
+    result.unshared_v_caches.clear();
+    result.shared_k_caches.clear();
+    result.shared_v_caches.clear();
+    result.unshared_k_caches.reserve(unshared_k_caches.size());
+    result.unshared_v_caches.reserve(unshared_v_caches.size());
+    result.shared_k_caches.reserve(shared_k_caches.size());
+    result.shared_v_caches.reserve(shared_v_caches.size());
+    for (const auto& t : unshared_k_caches) {
+      result.unshared_k_caches.push_back(safe_to(t, device));
+    }
+    for (const auto& t : unshared_v_caches) {
+      result.unshared_v_caches.push_back(safe_to(t, device));
+    }
+    for (const auto& t : shared_k_caches) {
+      result.shared_k_caches.push_back(safe_to(t, device));
+    }
+    for (const auto& t : shared_v_caches) {
+      result.shared_v_caches.push_back(safe_to(t, device));
+    }
+    if (beam_width_tensor.defined()) {
+      result.beam_width_tensor = safe_to(beam_width_tensor, device, true);
+    }
+    if (current_round_tensor.defined()) {
+      result.current_round_tensor = safe_to(current_round_tensor, device, true);
+    }
+    return result;
+  }
+
+  void print() const {
+    LOG(INFO) << "OneRecXAttentionParams:";
+    OneRecModelInputParams::print();
+    LOG(INFO) << " unshared_k_caches size: " << unshared_k_caches.size()
+              << " unshared_v_caches size: " << unshared_v_caches.size()
+              << " shared_k_caches size: " << shared_k_caches.size()
+              << " shared_v_caches size: " << shared_v_caches.size();
+    if (beam_width_tensor.defined()) {
+      LOG(INFO) << " beam_width_tensor shape: " << beam_width_tensor.sizes();
+    }
+    if (current_round_tensor.defined()) {
+      LOG(INFO) << " current_round_tensor shape: "
+                << current_round_tensor.sizes();
+    }
+  }
+};
+
 // Parameters for LLM Rec multi-round mode (device loop, beam search).
 struct LlmRecMultiRoundParams {
   // full kv caches provided by engine for step-level decode, per layer
@@ -260,8 +318,10 @@ struct LlmRecMultiRoundParams {
   }
 };
 
-using RecModelInputParams = std::
-    variant<std::monostate, OneRecModelInputParams, LlmRecMultiRoundParams>;
+using RecModelInputParams = std::variant<std::monostate,
+                                         OneRecModelInputParams,
+                                         OneRecXAttentionParams,
+                                         LlmRecMultiRoundParams>;
 
 enum class TransferType : uint8_t {
   G2H = 0,  // global memory(KVCache store) to host memory(DRAM)
@@ -425,7 +485,9 @@ struct ModelInputParams {
     params.dit_forward_input = dit_forward_input.to(device);
 
     // rec_params device conversion for both OneRec and LLM-Rec variants
-    if (const auto* onerec = onerec_params()) {
+    if (const auto* onerec_xattn = onerec_xattention_params()) {
+      params.rec_params = onerec_xattn->to(device);
+    } else if (const auto* onerec = onerec_params()) {
       params.rec_params = onerec->to(device);
     } else if (const auto* llmrec = llmrec_params()) {
       params.rec_params = llmrec->to(device);
@@ -453,7 +515,10 @@ struct ModelInputParams {
     LOG(INFO) << "ModelInputParams: dp_global_token_nums is "
               << dp_global_token_nums << ", dp_is_decode: " << dp_is_decode;
 
-    if (const auto* onerec = onerec_params()) {
+    if (const auto* onerec_xattn = onerec_xattention_params()) {
+      LOG(INFO) << "ModelInputParams: has onerec_xattention_params";
+      onerec_xattn->print();
+    } else if (const auto* onerec = onerec_params()) {
       LOG(INFO) << "ModelInputParams: has onerec_params";
       onerec->print();
     } else if (const auto* llmrec = llmrec_params()) {
@@ -621,16 +686,43 @@ struct ModelInputParams {
   DiTForwardInput dit_forward_input;
 
   const OneRecModelInputParams* onerec_params() const {
-    return std::get_if<OneRecModelInputParams>(&rec_params);
+    if (const auto* params = std::get_if<OneRecModelInputParams>(&rec_params)) {
+      return params;
+    }
+    if (const auto* params = std::get_if<OneRecXAttentionParams>(&rec_params)) {
+      return static_cast<const OneRecModelInputParams*>(params);
+    }
+    return nullptr;
   }
 
   bool has_onerec_params() const { return onerec_params() != nullptr; }
 
   OneRecModelInputParams& mutable_onerec_params() {
+    if (auto* params = std::get_if<OneRecModelInputParams>(&rec_params)) {
+      return *params;
+    }
+    if (auto* params = std::get_if<OneRecXAttentionParams>(&rec_params)) {
+      return static_cast<OneRecModelInputParams&>(*params);
+    }
     if (!has_onerec_params()) {
       rec_params.emplace<OneRecModelInputParams>();
     }
     return std::get<OneRecModelInputParams>(rec_params);
+  }
+
+  const OneRecXAttentionParams* onerec_xattention_params() const {
+    return std::get_if<OneRecXAttentionParams>(&rec_params);
+  }
+
+  bool has_onerec_xattention_params() const {
+    return onerec_xattention_params() != nullptr;
+  }
+
+  OneRecXAttentionParams& mutable_onerec_xattention_params() {
+    if (!has_onerec_xattention_params()) {
+      rec_params.emplace<OneRecXAttentionParams>();
+    }
+    return std::get<OneRecXAttentionParams>(rec_params);
   }
 
   // Accessors for LLM Rec multi-round params inside rec_params variant

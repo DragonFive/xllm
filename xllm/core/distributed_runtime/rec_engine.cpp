@@ -735,6 +735,16 @@ ForwardOutput RecEngine::OneRecEnginePipeline::get_model_output(
           safe_to(sample_output.top_logprobs, torch::kCPU, true);
     }
   }
+  if (output.beam_sequence_group.defined() &&
+      output.beam_sequence_group.numel() > 0) {
+    output.beam_sequence_group =
+        safe_to(output.beam_sequence_group, torch::kCPU, true);
+  }
+  if (output.beam_search_output.out_logprobs.defined() &&
+      output.beam_search_output.out_logprobs.numel() > 0) {
+    output.beam_search_output.out_logprobs =
+        safe_to(output.beam_search_output.out_logprobs, torch::kCPU, true);
+  }
   Device(engine_.workers_[0]->device()).synchronize_default_stream();
 
   return output;
@@ -742,6 +752,239 @@ ForwardOutput RecEngine::OneRecEnginePipeline::get_model_output(
 
 std::vector<int64_t>
 RecEngine::OneRecEnginePipeline::get_active_activation_memory() const {
+  std::vector<folly::SemiFuture<int64_t>> futures;
+  futures.reserve(engine_.workers_.size());
+  for (auto& worker : engine_.workers_) {
+    futures.push_back(worker->get_active_activation_memory_async());
+  }
+
+  auto results = folly::collectAll(futures).get();
+  std::vector<int64_t> active_activation_memories;
+  active_activation_memories.reserve(futures.size());
+  for (auto& result : results) {
+    active_activation_memories.push_back(result.value());
+  }
+  return active_activation_memories;
+}
+
+// ============================================================
+// OneRecXAttentionEnginePipeline Implementation
+// ============================================================
+
+RecEngine::OneRecXAttentionEnginePipeline::OneRecXAttentionEnginePipeline(
+    RecEngine& engine)
+    : RecEnginePipeline(engine) {}
+
+void RecEngine::OneRecXAttentionEnginePipeline::setup_workers() {
+  // OneRec xattention uses local workers, no DistManager setup needed
+}
+
+void RecEngine::OneRecXAttentionEnginePipeline::process_group_test() {
+  if (engine_.workers_.size() > 1) {
+    std::vector<folly::SemiFuture<folly::Unit>> futures;
+    futures.reserve(engine_.workers_.size());
+    for (auto& worker : engine_.workers_) {
+      futures.emplace_back(worker->process_group_test_async());
+    }
+    const int timeout_seconds = util::get_process_group_test_timeout_seconds();
+    folly::collectAll(futures)
+        .within(std::chrono::seconds(timeout_seconds))
+        .get();
+  }
+}
+
+bool RecEngine::OneRecXAttentionEnginePipeline::init_model_workers(
+    const std::string& model_path) {
+  const auto& devices = engine_.options_.devices();
+  const int32_t world_size = static_cast<int32_t>(devices.size());
+
+  if (world_size == 1) {
+    engine_.process_groups_.clear();
+    engine_.process_groups_.emplace_back(
+        std::make_unique<ProcessGroup>(/*rank=*/0, world_size, devices[0]));
+  }
+#if defined(USE_NPU)
+  else {
+    engine_.process_groups_ =
+        parallel_state::create_npu_process_groups(devices);
+  }
+#else
+  else {
+    engine_.process_groups_ =
+        parallel_state::create_local_process_groups(devices, engine_.options_);
+  }
+#endif
+
+  engine_.workers_.clear();
+  WorkerType worker_type = WorkerType::REC;
+  for (int32_t rank = 0; rank < world_size; ++rank) {
+    ProcessGroup* pg = engine_.process_groups_[rank].get();
+    ParallelArgs parallel_args(rank, world_size, pg);
+    parallel_args.tp_group_ = pg;
+    engine_.workers_.emplace_back(std::make_unique<Worker>(
+        parallel_args, devices[rank], engine_.options_, worker_type));
+  }
+
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(engine_.workers_.size());
+  for (auto& worker : engine_.workers_) {
+    futures.push_back(worker->init_model_async(
+        model_path, FLAGS_random_seed, MasterStatus::WAKEUP));
+  }
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int64_t
+RecEngine::OneRecXAttentionEnginePipeline::estimate_min_available_memory() {
+  const int64_t max_cache_size = engine_.options_.max_cache_size();
+  const double max_memory_utilization =
+      engine_.options_.max_memory_utilization();
+
+  std::vector<folly::SemiFuture<std::tuple<int64_t, int64_t>>> futures;
+  futures.reserve(engine_.workers_.size());
+  for (auto& worker : engine_.workers_) {
+    futures.push_back(worker->estimate_kv_cache_capacity_async());
+  }
+
+  int64_t cache_size_in_bytes = std::numeric_limits<int64_t>::max();
+  auto results = folly::collectAll(futures).get();
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (!results[i].hasValue()) {
+      LOG(ERROR) << "Failed to profile memory usage for worker: " << i;
+      continue;
+    }
+    auto [available_memory, total_memory] = results[i].value();
+    LOG(INFO) << "worker #" << i
+              << ": available memory: " << readable_size(available_memory)
+              << ", total memory: " << readable_size(total_memory)
+              << ". Using max_memory_utilization: " << max_memory_utilization
+              << ", max_cache_size: " << readable_size(max_cache_size);
+    if (max_memory_utilization < 1.0) {
+      const int64_t buffer_memory =
+          total_memory * (1.0 - max_memory_utilization);
+      available_memory -= buffer_memory;
+    }
+    if (max_cache_size > 0) {
+      available_memory = std::min(available_memory, max_cache_size);
+    }
+    cache_size_in_bytes = std::min(cache_size_in_bytes, available_memory);
+  }
+  return cache_size_in_bytes;
+}
+
+bool RecEngine::OneRecXAttentionEnginePipeline::allocate_kv_cache(
+    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(engine_.workers_.size());
+  for (auto& worker : engine_.workers_) {
+    futures.push_back(worker->allocate_kv_cache_async(kv_cache_shape));
+  }
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t RecEngine::OneRecXAttentionEnginePipeline::num_workers() const {
+  return engine_.workers_.size();
+}
+
+ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
+    std::vector<Batch>& batches) {
+  if (engine_.workers_.empty()) {
+    return {};
+  }
+
+  Timer timer;
+  auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
+  COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
+
+  if (!forward_inputs.token_ids.defined()) {
+    return {};
+  }
+
+  timer.reset();
+  const auto& output = get_model_output(forward_inputs);
+  COUNTER_ADD(rec_first_token_latency_microseconds,
+              timer.elapsed_microseconds());
+
+  timer.reset();
+  if (output.beam_sequence_group.defined() &&
+      output.beam_sequence_group.numel() > 0) {
+    batches[0].process_beam_sequence_group(output);
+  } else {
+    batches[0].process_sample_output(output.sample_output, false);
+  }
+  COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
+
+  batches[0].finish();
+  return output;
+}
+
+ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
+    const ForwardInput& model_inputs) {
+  std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
+  futures.reserve(engine_.workers_.size());
+  for (auto& worker : engine_.workers_) {
+    futures.emplace_back(worker->step_async(model_inputs));
+  }
+  auto results = folly::collectAll(futures).get();
+
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (results[i].hasException()) {
+      LOG(FATAL) << "Worker " << i
+                 << " failed with exception: " << results[i].exception().what();
+    }
+    CHECK(results[i].value().has_value())
+        << "Worker " << i << " failed to execute model and returned no output.";
+  }
+
+  auto forward_output = results.front().value();
+  CHECK(forward_output.has_value()) << "Failed to execute model";
+
+  auto& output = forward_output.value();
+  auto& sample_output = output.sample_output;
+
+  if (sample_output.embeddings.defined()) {
+    sample_output.embeddings = safe_to(
+        sample_output.embeddings,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*non_blocking=*/true);
+  }
+
+  if (sample_output.next_tokens.defined()) {
+    sample_output.next_tokens =
+        safe_to(sample_output.next_tokens, torch::kCPU, /*non_blocking=*/true);
+    if (sample_output.logprobs.defined()) {
+      sample_output.logprobs =
+          safe_to(sample_output.logprobs, torch::kCPU, true);
+    }
+    if (sample_output.top_tokens.defined()) {
+      sample_output.top_tokens =
+          safe_to(sample_output.top_tokens, torch::kCPU, true);
+    }
+    if (sample_output.top_logprobs.defined()) {
+      sample_output.top_logprobs =
+          safe_to(sample_output.top_logprobs, torch::kCPU, true);
+    }
+  }
+  Device(engine_.workers_[0]->device()).synchronize_default_stream();
+
+  return output;
+}
+
+std::vector<int64_t>
+RecEngine::OneRecXAttentionEnginePipeline::get_active_activation_memory()
+    const {
   std::vector<folly::SemiFuture<int64_t>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
@@ -996,6 +1239,8 @@ std::unique_ptr<RecEngine::RecEnginePipeline> RecEngine::create_pipeline(
       return std::make_unique<RecMultiRoundEnginePipeline>(engine);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecEnginePipeline>(engine);
+    case RecPipelineType::kOneRecXAttentionPipeline:
+      return std::make_unique<OneRecXAttentionEnginePipeline>(engine);
     default:
       LOG(FATAL) << "Unknown RecEngine pipeline type: "
                  << static_cast<int>(type);

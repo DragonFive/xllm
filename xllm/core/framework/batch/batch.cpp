@@ -172,7 +172,7 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
       // beam search expands or replaces the group-owned Sequence instances.
       refresh_sequences_from_groups();
     }
-    if (FLAGS_enable_rec_prefill_only) {
+    if (use_legacy_onerec_prefill_only_mode()) {
       refresh_onerec_prefill_output_targets();
     } else {
       refresh_output_targets();

@@ -459,6 +459,36 @@ std::shared_ptr<Request> RecMaster::OneRecMasterPipeline::generate_request(
                                       /*build_stop_checker=*/false);
 }
 
+std::shared_ptr<Request>
+RecMaster::OneRecXAttentionMasterPipeline::generate_request(
+    std::string prompt,
+    std::optional<std::vector<int>> prompt_tokens,
+    std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+    const RequestParams& sp,
+    OutputCallback callback) {
+  Timer timer;
+  std::vector<int32_t> local_prompt_tokens;
+  MMData processed_mm_data;
+
+  if (!process_onerec_inputs(prompt_tokens,
+                             input_tensors,
+                             master_.model_args_,
+                             &local_prompt_tokens,
+                             &processed_mm_data,
+                             callback)) {
+    return nullptr;
+  }
+
+  COUNTER_ADD(tokenization_latency_seconds, timer.elapsed_seconds());
+
+  return master_.build_request_common(std::move(prompt),
+                                      std::move(local_prompt_tokens),
+                                      std::move(processed_mm_data),
+                                      sp,
+                                      callback,
+                                      /*build_stop_checker=*/true);
+}
+
 // ============================================================
 // RecMaster pipeline factory (static method)
 // ============================================================
@@ -473,6 +503,8 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
       return std::make_unique<LlmRecWithMmDataMasterPipeline>(master);
     case RecPipelineType::kOneRecDefault:
       return std::make_unique<OneRecMasterPipeline>(master);
+    case RecPipelineType::kOneRecXAttentionPipeline:
+      return std::make_unique<OneRecXAttentionMasterPipeline>(master);
     default:
       LOG(FATAL) << "Unknown RecMaster pipeline type: "
                  << static_cast<int>(type);
