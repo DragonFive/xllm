@@ -561,14 +561,12 @@ RecWorkerImpl::OneRecXAttentionWorkPipeline::OneRecXAttentionWorkPipeline(
   if (!FLAGS_enable_constrained_decoding) {
     return;
   }
-  const auto* vocab_dict =
-      get_onerec_vocab_dict(runtime_.worker.model_weights_path_);
+  auto* vocab_dict = get_onerec_vocab_dict(runtime_.worker.model_weights_path_);
   if (vocab_dict == nullptr) {
     return;
   }
 
-  const int32_t vocab_size =
-      runtime_.worker.context_->get_model_args().vocab_size();
+  const int32_t vocab_size = runtime_.context->get_model_args().vocab_size();
   constrained_decoding_ =
       std::make_unique<RecConstrainedDecoding>(vocab_dict,
                                                vocab_size,

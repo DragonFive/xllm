@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/util/rec_model_utils.h"
+#include "core/util/utils.h"
 #include "util/tensor_helper.h"
 
 namespace xllm {
