@@ -121,9 +121,24 @@ class RecMaster : public Master {
   };
 
   // OneRecMasterPipeline - OneRec (prompt-based with input_tensors)
-  class OneRecMasterPipeline final : public RecMasterPipeline {
+  class OneRecMasterPipeline : public RecMasterPipeline {
    public:
     explicit OneRecMasterPipeline(RecMaster& master);
+    std::shared_ptr<Request> generate_request(
+        std::string prompt,
+        std::optional<std::vector<int>> prompt_tokens,
+        std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+        const RequestParams& sp,
+        OutputCallback callback) override;
+  };
+
+  // OneRecXAttentionMasterPipeline - OneRec xattention (prompt-based with
+  // input_tensors, isolated from legacy prefill-only path)
+  class OneRecXAttentionMasterPipeline final : public RecMasterPipeline {
+   public:
+    explicit OneRecXAttentionMasterPipeline(RecMaster& master)
+        : RecMasterPipeline(master) {}
+
     std::shared_ptr<Request> generate_request(
         std::string prompt,
         std::optional<std::vector<int>> prompt_tokens,
