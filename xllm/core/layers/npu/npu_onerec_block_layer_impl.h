@@ -150,6 +150,8 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   atb::Tensor placeholder_;
 
   at::Tensor encoder_output_contiguous_;
+  at::Tensor decode_attn_mask_;
+  at::Tensor prefill_attn_mask_;
   at::Tensor at_placeholder_;
   std::vector<int32_t> placeholder_vec_;
   torch::Tensor cross_k_cache_;

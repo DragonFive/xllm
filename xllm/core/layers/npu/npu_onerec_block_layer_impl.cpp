@@ -1182,7 +1182,13 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
   return atb::NO_ERROR;
 }
 
-int64_t NpuOneRecBlockLayerImpl::init_attn_mask() { return atb::NO_ERROR; }
+int64_t NpuOneRecBlockLayerImpl::init_attn_mask() {
+  torch::Dtype dtype =
+      prefill_param_.isBF16 ? torch::kBFloat16 : torch::kFloat16;
+  decode_attn_mask_ = torch::zeros({1}).to(device_).to(dtype);
+  prefill_attn_mask_ = torch::zeros({1, 1, 1, 1}).to(device_).to(dtype);
+  return atb::NO_ERROR;
+}
 
 int64_t NpuOneRecBlockLayerImpl::init_node(
     atb_speed::Model::Node& node,
@@ -1392,8 +1398,16 @@ void NpuOneRecBlockLayerImpl::build_encoder_node_variant_pack(
   const int32_t seq_len_idx = layer_id_idx + 1;
 
   node.variantPack.inTensors.at(input_tensor_idx) = internal_tensors_;
-  node.variantPack.inTensors.at(attention_mask_idx) =
-      atb_speed::Utils::AtTensor2Tensor(attn_mask);
+  if (attn_mask.defined()) {
+    auto mask_dtype =
+        prefill_param_.isBF16 ? torch::kBFloat16 : torch::kFloat16;
+    prefill_attn_mask_ = attn_mask.to(device_).to(mask_dtype);
+    node.variantPack.inTensors.at(attention_mask_idx) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_attn_mask_);
+  } else {
+    node.variantPack.inTensors.at(attention_mask_idx) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_attn_mask_);
+  }
 
   node.variantPack.inTensors.at(token_offset_idx) = placeholder_;
   node.variantPack.inTensors.at(token_offset_idx).hostData =
@@ -1493,8 +1507,15 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
 
   int32_t idx = start_tensor_idx;
   node.variantPack.inTensors.at(idx++) = internal_tensors_;
-  node.variantPack.inTensors.at(idx++) =
-      atb_speed::Utils::AtTensor2Tensor(attn_mask);
+  if (attn_mask.defined()) {
+    auto mask_dtype = param.isBF16 ? torch::kBFloat16 : torch::kFloat16;
+    prefill_attn_mask_ = attn_mask.to(device_).to(mask_dtype);
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(prefill_attn_mask_);
+  } else {
+    node.variantPack.inTensors.at(idx++) =
+        atb_speed::Utils::AtTensor2Tensor(decode_attn_mask_);
+  }
 
   auto k_cache = kv_cache.get_k_cache();
   auto v_cache = kv_cache.get_v_cache();
