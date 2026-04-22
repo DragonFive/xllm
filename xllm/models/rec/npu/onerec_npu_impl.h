@@ -449,12 +449,19 @@ class OneRecStackImpl : public torch::nn::Module {
       return torch::Tensor();
     }
 
-    if (effective_attn_mask.device() != h.device()) {
-      return effective_attn_mask.to(h.device()).contiguous();
+    auto result = effective_attn_mask;
+    if (result.device() != h.device()) {
+      result = result.to(h.device());
     }
-    return effective_attn_mask.is_contiguous()
-               ? effective_attn_mask
-               : effective_attn_mask.contiguous();
+    if (!result.is_contiguous()) {
+      result = result.contiguous();
+    }
+    if (result.device().type() == torch::DeviceType::PrivateUse1 &&
+        at_npu::native::get_npu_format(result) != ACL_FORMAT_ND) {
+      result =
+          at_npu::native::npu_format_cast(result, ACL_FORMAT_ND).contiguous();
+    }
+    return result;
   }
 
   int64_t hidden_size_ = 0;
