@@ -20,6 +20,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/npu/npu_onerec_block_layer_impl.h"
+#include "core/util/env_var.h"
 #include "core/util/rec_model_utils.h"
 
 namespace xllm {
@@ -248,6 +249,31 @@ class OneRecStackImpl : public torch::nn::Module {
 
     ModelInputParams input_params_local = input_params;
     auto& mutable_onerec_params = input_params_local.mutable_onerec_params();
+    const auto* onerec_xattn_params = input_params.onerec_xattention_params();
+
+#if defined(USE_NPU)
+    auto validate_selected_token_idxes_stage = [&](const char* stage_name) {
+      if (!is_decoder_ || onerec_xattn_params == nullptr ||
+          util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_SELECTED_TOKEN_CPU_CHECK",
+                             false) ||
+          !onerec_xattn_params->debug_selected_token_idxes.defined() ||
+          onerec_xattn_params->debug_selected_token_idxes_expected.empty()) {
+        return;
+      }
+      auto selected_cpu = onerec_xattn_params->debug_selected_token_idxes.to(
+          torch::kCPU, /*non_blocking=*/false);
+      auto selected_cpu_i64 = selected_cpu.to(torch::kInt64).contiguous();
+      auto expected_cpu = torch::tensor(
+          onerec_xattn_params->debug_selected_token_idxes_expected,
+          torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+      CHECK(torch::equal(selected_cpu_i64, expected_cpu))
+          << "OneRec decoder selected_token_idxes changed after " << stage_name
+          << ", actual=" << selected_cpu_i64 << ", expected=" << expected_cpu
+          << ", rec_stage="
+          << static_cast<int32_t>(onerec_xattn_params->rec_stage)
+          << ", is_first_prefill=" << onerec_xattn_params->is_first_prefill;
+    };
+#endif
 
     const bool is_decode_stage = is_decoder_ && !is_prefill;
     torch::Tensor effective_attn_mask;
@@ -281,8 +307,14 @@ class OneRecStackImpl : public torch::nn::Module {
     }
 
     for (size_t i = 0; i < layers_.size(); ++i) {
-      if (input_params.layer_synchronizer) {
-        input_params.layer_synchronizer->synchronize_layer(i);
+      aclrtEvent* event{nullptr};
+      std::atomic<bool>* event_flag{nullptr};
+      if (input_params.layer_synchronizer != nullptr) {
+        event = input_params.layer_synchronizer->get_event(i);
+        event_flag = input_params.layer_synchronizer->get_event_flag(i);
+      }
+      if (!input_params.synchronize_layer(i)) {
+        return torch::Tensor();
       }
 
       KVCache dummy_kv_cache;
@@ -299,13 +331,28 @@ class OneRecStackImpl : public torch::nn::Module {
           input_params_local,
           npu_encoder_output.defined() ? &npu_encoder_output : nullptr,
           static_cast<int>(i),
-          nullptr,
-          nullptr,
+          event,
+          event_flag,
           expert_array);
+
+#if defined(USE_NPU)
+      if (input_params.layer_synchronizer != nullptr &&
+          !input_params.layer_synchronizer->synchronize_layer(i)) {
+        return torch::Tensor();
+      }
+      validate_selected_token_idxes_stage(
+          (std::string("decoder_layer_") + std::to_string(i)).c_str());
+#endif
     }
 
+#if defined(USE_NPU)
+    validate_selected_token_idxes_stage("decoder_layer_loop");
+#endif
     std::optional<torch::Tensor> residual = std::nullopt;
     h = std::get<0>(norm_->forward(h, residual));
+#if defined(USE_NPU)
+    validate_selected_token_idxes_stage("decoder_final_norm");
+#endif
     return h;
   }
 
@@ -387,19 +434,24 @@ class OneRecStackImpl : public torch::nn::Module {
                                           const torch::Tensor& h,
                                           bool is_decoder,
                                           int64_t batch_size) const {
+    (void)batch_size;
     if (!is_decoder) {
       return torch::ones({num_heads_, seq_length, seq_length}, h.options());
     }
 
-    batch_size = std::max<int64_t>(1, batch_size);
-    auto mask = torch::triu(torch::ones({seq_length, seq_length},
-                                        h.options().dtype(torch::kUInt8)),
-                            1)
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                    .expand({batch_size, 1, seq_length, seq_length})
-                    .contiguous();
-    return mask;
+    const float mask_value = -9984.0f;
+    auto upper_tri_mask =
+        torch::triu(torch::ones({seq_length, seq_length},
+                                torch::dtype(h.dtype()).device(h.device())),
+                    1);
+    auto expanded_mask = upper_tri_mask.unsqueeze(0).expand(
+        {num_heads_, seq_length, seq_length});
+    auto effective_attn_mask =
+        torch::zeros({num_heads_, seq_length, seq_length},
+                     torch::dtype(h.dtype()).device(h.device()));
+    effective_attn_mask.masked_fill_(expanded_mask.to(torch::kBool),
+                                     mask_value);
+    return effective_attn_mask;
   }
 
   torch::Tensor compute_position_bias_mask(

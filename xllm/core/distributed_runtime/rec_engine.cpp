@@ -925,12 +925,24 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
 
 ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
     const ForwardInput& model_inputs) {
+  const bool trace_engine_output =
+      util::get_bool_env("XLLM_DEBUG_ONEREC_ENGINE_TRACE", false);
+  auto log_engine_stage = [&](const char* stage_name,
+                              const torch::Tensor& tensor = torch::Tensor()) {
+    if (!trace_engine_output) {
+      return;
+    }
+    LOG(INFO) << "OneRec xattention engine stage=" << stage_name
+              << ", tensor_defined=" << tensor.defined() << ", tensor_shape="
+              << (tensor.defined() ? tensor.sizes() : c10::IntArrayRef{});
+  };
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
     futures.emplace_back(worker->step_async(model_inputs));
   }
   auto results = folly::collectAll(futures).get();
+  log_engine_stage("after_collect_all");
 
   for (size_t i = 0; i < results.size(); ++i) {
     if (results[i].hasException()) {
@@ -948,29 +960,60 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
   auto& sample_output = output.sample_output;
 
   if (sample_output.embeddings.defined()) {
+    log_engine_stage("before_embeddings_to_cpu", sample_output.embeddings);
     sample_output.embeddings = safe_to(
         sample_output.embeddings,
         torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
         /*non_blocking=*/true);
+    log_engine_stage("after_embeddings_to_cpu", sample_output.embeddings);
   }
 
   if (sample_output.next_tokens.defined()) {
+    log_engine_stage("before_next_tokens_to_cpu", sample_output.next_tokens);
     sample_output.next_tokens =
         safe_to(sample_output.next_tokens, torch::kCPU, /*non_blocking=*/true);
+    log_engine_stage("after_next_tokens_to_cpu", sample_output.next_tokens);
     if (sample_output.logprobs.defined()) {
+      log_engine_stage("before_logprobs_to_cpu", sample_output.logprobs);
       sample_output.logprobs =
           safe_to(sample_output.logprobs, torch::kCPU, true);
+      log_engine_stage("after_logprobs_to_cpu", sample_output.logprobs);
     }
     if (sample_output.top_tokens.defined()) {
+      log_engine_stage("before_top_tokens_to_cpu", sample_output.top_tokens);
       sample_output.top_tokens =
           safe_to(sample_output.top_tokens, torch::kCPU, true);
+      log_engine_stage("after_top_tokens_to_cpu", sample_output.top_tokens);
     }
     if (sample_output.top_logprobs.defined()) {
+      log_engine_stage("before_top_logprobs_to_cpu",
+                       sample_output.top_logprobs);
       sample_output.top_logprobs =
           safe_to(sample_output.top_logprobs, torch::kCPU, true);
+      log_engine_stage("after_top_logprobs_to_cpu", sample_output.top_logprobs);
     }
   }
+  if (output.beam_sequence_group.defined() &&
+      output.beam_sequence_group.numel() > 0) {
+    log_engine_stage("before_beam_sequence_group_to_cpu",
+                     output.beam_sequence_group);
+    output.beam_sequence_group =
+        safe_to(output.beam_sequence_group, torch::kCPU, true);
+    log_engine_stage("after_beam_sequence_group_to_cpu",
+                     output.beam_sequence_group);
+  }
+  if (output.beam_search_output.out_logprobs.defined() &&
+      output.beam_search_output.out_logprobs.numel() > 0) {
+    log_engine_stage("before_beam_out_logprobs_to_cpu",
+                     output.beam_search_output.out_logprobs);
+    output.beam_search_output.out_logprobs =
+        safe_to(output.beam_search_output.out_logprobs, torch::kCPU, true);
+    log_engine_stage("after_beam_out_logprobs_to_cpu",
+                     output.beam_search_output.out_logprobs);
+  }
+  log_engine_stage("before_default_stream_sync");
   Device(engine_.workers_[0]->device()).synchronize_default_stream();
+  log_engine_stage("after_default_stream_sync");
 
   return output;
 }

@@ -158,6 +158,8 @@ struct OneRecXAttentionParams : public OneRecModelInputParams {
   std::vector<torch::Tensor> shared_v_caches;
   torch::Tensor beam_width_tensor;
   torch::Tensor current_round_tensor;
+  torch::Tensor debug_selected_token_idxes;
+  std::vector<int64_t> debug_selected_token_idxes_expected;
 
   OneRecXAttentionParams to(const c10::Device& device) const {
     OneRecXAttentionParams result = *this;
@@ -188,6 +190,10 @@ struct OneRecXAttentionParams : public OneRecModelInputParams {
     }
     if (current_round_tensor.defined()) {
       result.current_round_tensor = safe_to(current_round_tensor, device, true);
+    }
+    if (debug_selected_token_idxes.defined()) {
+      result.debug_selected_token_idxes =
+          safe_to(debug_selected_token_idxes, device);
     }
     return result;
   }
