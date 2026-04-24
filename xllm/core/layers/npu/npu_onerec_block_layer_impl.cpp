@@ -28,6 +28,70 @@ namespace xllm {
 namespace layer {
 namespace {
 
+torch::Tensor EnsureNdFormat(torch::Tensor tensor) {
+  if (!tensor.defined()) {
+    return tensor;
+  }
+  if (!tensor.is_contiguous()) {
+    tensor = tensor.contiguous();
+  }
+  if (tensor.device().type() == torch::DeviceType::PrivateUse1 &&
+      at_npu::native::get_npu_format(tensor) != ACL_FORMAT_ND) {
+    tensor =
+        at_npu::native::npu_format_cast(tensor, ACL_FORMAT_ND).contiguous();
+  }
+  return tensor;
+}
+
+torch::Tensor PrepareOneRecAttentionMask(const at::Tensor& attn_mask,
+                                         const at::Device& device,
+                                         torch::Dtype dtype) {
+  if (!attn_mask.defined()) {
+    return torch::Tensor();
+  }
+  torch::Tensor result = attn_mask;
+  if (result.device() != device) {
+    result = result.to(device);
+  }
+  if (result.scalar_type() != dtype) {
+    result = result.to(dtype);
+  }
+  return EnsureNdFormat(result);
+}
+
+int64_t ResolveOneRecBatchSize(const ModelInputParams& input_params) {
+  const auto* onerec_params = input_params.onerec_xattention_params() != nullptr
+                                  ? static_cast<const OneRecModelInputParams*>(
+                                        input_params.onerec_xattention_params())
+                                  : input_params.onerec_params();
+  if (onerec_params != nullptr && onerec_params->bs > 0) {
+    return onerec_params->bs;
+  }
+  return std::max<int64_t>(input_params.num_sequences, 1);
+}
+
+torch::Tensor NormalizeOneRecDecodeFasMask(torch::Tensor attn_mask,
+                                           int64_t batch_size) {
+  if (!attn_mask.defined() || attn_mask.dim() == 2 || attn_mask.dim() == 4) {
+    return EnsureNdFormat(attn_mask);
+  }
+  if (attn_mask.dim() != 3) {
+    return EnsureNdFormat(attn_mask);
+  }
+
+  batch_size = std::max<int64_t>(batch_size, 1);
+  if (attn_mask.size(0) == batch_size) {
+    return EnsureNdFormat(attn_mask.unsqueeze(1));
+  }
+
+  auto collapsed_mask = attn_mask.narrow(0, 0, 1);
+  if (batch_size > 1) {
+    collapsed_mask = collapsed_mask.expand(
+        {batch_size, collapsed_mask.size(1), collapsed_mask.size(2)});
+  }
+  return EnsureNdFormat(collapsed_mask.unsqueeze(1));
+}
+
 // Decoder normal mode: self-attn(29) + cross-attn(28) + layer-norm(4) + mlp(18)
 // = 79
 static constexpr uint64_t kOneRecWeightCountPerLayer = 79;
@@ -1185,8 +1249,10 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
 int64_t NpuOneRecBlockLayerImpl::init_attn_mask() {
   torch::Dtype dtype =
       prefill_param_.isBF16 ? torch::kBFloat16 : torch::kFloat16;
-  decode_attn_mask_ = torch::zeros({1}).to(device_).to(dtype);
-  prefill_attn_mask_ = torch::zeros({1, 1, 1, 1}).to(device_).to(dtype);
+  decode_attn_mask_ = EnsureNdFormat(
+      torch::zeros({1}, torch::TensorOptions().device(device_).dtype(dtype)));
+  prefill_attn_mask_ = EnsureNdFormat(torch::zeros(
+      {1, 1, 1, 1}, torch::TensorOptions().device(device_).dtype(dtype)));
   return atb::NO_ERROR;
 }
 
@@ -1254,20 +1320,22 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   atb::Status st;
   if (is_prefill) {
     if (is_decoder_) {
-      if (use_legacy_onerec_prefill_only_mode()) {
-        if (is_first_prefill && encoder_output != nullptr) {
-          const int64_t bs = encoder_output->size(0);
-          const int64_t seq_len = encoder_output->size(1);
-          const int64_t kv_hidden_size =
-              prefill_param_.numKeyValueHeadsPerRank *
-              prefill_param_.hiddenSizePerAttentionHead;
-          auto options = torch::TensorOptions()
-                             .dtype(encoder_output->dtype())
-                             .device(encoder_output->device());
-          cross_k_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
-          cross_v_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
-        }
+      if (is_first_prefill && encoder_output != nullptr &&
+          (use_legacy_onerec_prefill_only_mode() ||
+           is_onerec_xattention_mode())) {
+        const int64_t bs = encoder_output->size(0);
+        const int64_t seq_len = encoder_output->size(1);
+        const int64_t kv_hidden_size =
+            prefill_param_.numKeyValueHeadsPerRank *
+            prefill_param_.hiddenSizePerAttentionHead;
+        auto options = torch::TensorOptions()
+                           .dtype(encoder_output->dtype())
+                           .device(encoder_output->device());
+        cross_k_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
+        cross_v_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
+      }
 
+      if (use_legacy_onerec_prefill_only_mode()) {
         atb_speed::Model::Node& target_node =
             is_first_prefill
                 ? ((use_atb_small_tokens &&
@@ -1401,10 +1469,12 @@ void NpuOneRecBlockLayerImpl::build_encoder_node_variant_pack(
   if (attn_mask.defined()) {
     auto mask_dtype =
         prefill_param_.isBF16 ? torch::kBFloat16 : torch::kFloat16;
-    prefill_attn_mask_ = attn_mask.to(device_).to(mask_dtype);
+    prefill_attn_mask_ =
+        PrepareOneRecAttentionMask(attn_mask, device_, mask_dtype);
     node.variantPack.inTensors.at(attention_mask_idx) =
         atb_speed::Utils::AtTensor2Tensor(prefill_attn_mask_);
   } else {
+    prefill_attn_mask_ = EnsureNdFormat(prefill_attn_mask_);
     node.variantPack.inTensors.at(attention_mask_idx) =
         atb_speed::Utils::AtTensor2Tensor(prefill_attn_mask_);
   }
@@ -1508,11 +1578,19 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   int32_t idx = start_tensor_idx;
   node.variantPack.inTensors.at(idx++) = internal_tensors_;
   if (attn_mask.defined()) {
-    auto mask_dtype = param.isBF16 ? torch::kBFloat16 : torch::kFloat16;
-    prefill_attn_mask_ = attn_mask.to(device_).to(mask_dtype);
+    auto mask_dtype = (!param.isPrefill && param.isDecoder)
+                          ? torch::kBool
+                          : (param.isBF16 ? torch::kBFloat16 : torch::kFloat16);
+    prefill_attn_mask_ =
+        PrepareOneRecAttentionMask(attn_mask, device_, mask_dtype);
+    if (!param.isPrefill && param.isDecoder) {
+      prefill_attn_mask_ = NormalizeOneRecDecodeFasMask(
+          prefill_attn_mask_, ResolveOneRecBatchSize(input_params));
+    }
     node.variantPack.inTensors.at(idx++) =
         atb_speed::Utils::AtTensor2Tensor(prefill_attn_mask_);
   } else {
+    decode_attn_mask_ = EnsureNdFormat(decode_attn_mask_);
     node.variantPack.inTensors.at(idx++) =
         atb_speed::Utils::AtTensor2Tensor(decode_attn_mask_);
   }
@@ -1680,8 +1758,8 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
         onerec_xattn_params->current_round_tensor);
   }
 
-  if (param.enableOneRecPrefillOnly && cross_k_cache_.defined() &&
-      cross_v_cache_.defined()) {
+  if ((param.enableOneRecPrefillOnly || param.use_xattn) &&
+      cross_k_cache_.defined() && cross_v_cache_.defined()) {
     if (is_first_prefill && node.variantPack.outTensors.size() >= 3) {
       node.variantPack.outTensors.at(1) =
           atb_speed::Utils::AtTensor2Tensor(cross_k_cache_);

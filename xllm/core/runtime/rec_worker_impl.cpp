@@ -74,27 +74,6 @@ int32_t get_onerec_current_round(const OneRecXAttentionParams& params) {
       static_cast<int32_t>(params.generated_tokens.front().size()) - 1, 0);
 }
 
-torch::Tensor get_onerec_shared_kv_view(const torch::Tensor& cache,
-                                        int64_t shared_kv_tokens,
-                                        int64_t kv_heads,
-                                        int64_t head_dim) {
-  if (!cache.defined()) {
-    return torch::Tensor();
-  }
-  if (cache.dim() == 1) {
-    const int64_t total_tokens =
-        cache.numel() / std::max<int64_t>(kv_heads * head_dim, 1);
-    const int64_t shared_tokens = std::min(shared_kv_tokens, total_tokens);
-    return cache.narrow(0, 0, shared_tokens * kv_heads * head_dim)
-        .view({shared_tokens, kv_heads, head_dim});
-  }
-  if (cache.dim() >= 3) {
-    const int64_t shared_tokens = std::min(shared_kv_tokens, cache.size(0));
-    return cache.narrow(0, 0, shared_tokens);
-  }
-  return cache;
-}
-
 }  // namespace
 
 // ============================================================
@@ -555,7 +534,7 @@ RecWorkerImpl::OneRecXAttentionWorkPipeline::OneRecXAttentionWorkPipeline(
       filter_mask_threadpool_(std::make_unique<ThreadPool>(1)) {
   max_seqs_per_batch_ = runtime_.worker.options_.max_seqs_per_batch();
   beam_width_ = std::max<int32_t>(1, runtime_.worker.options_.beam_width());
-  max_decode_step_ = std::max(0, get_rec_multi_round_decode_rounds() - 1);
+  max_decode_step_ = std::max(0, get_rec_multi_round_decode_rounds());
   allocate_unshared_kv_caches();
 
   if (!FLAGS_enable_constrained_decoding) {
@@ -724,6 +703,31 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
     ForwardInput& processed_inputs) {
   RecWorkPipeline::prepare_work_before_execute(inputs, processed_inputs);
 
+#if defined(USE_NPU)
+  auto validate_selected_token_idxes_roundtrip =
+      [](const torch::Tensor& host_tensor,
+         const torch::Tensor& device_tensor,
+         const char* tensor_name) {
+        if (!host_tensor.defined() || !device_tensor.defined()) {
+          return;
+        }
+        auto host_cpu = host_tensor.to(torch::kCPU, /*non_blocking=*/false);
+        auto device_cpu = device_tensor.to(torch::kCPU, /*non_blocking=*/false);
+        CHECK(torch::equal(host_cpu, device_cpu))
+            << "OneRec xattention " << tensor_name
+            << " changed during H2D round-trip, host=" << host_cpu
+            << ", device_roundtrip=" << device_cpu;
+      };
+  validate_selected_token_idxes_roundtrip(
+      inputs.sampling_params.selected_token_idxes,
+      processed_inputs.sampling_params.selected_token_idxes,
+      "sampling_params.selected_token_idxes");
+  validate_selected_token_idxes_roundtrip(
+      inputs.decoder_sampling_params.selected_token_idxes,
+      processed_inputs.decoder_sampling_params.selected_token_idxes,
+      "decoder_sampling_params.selected_token_idxes");
+#endif
+
   auto& onerec_params =
       processed_inputs.input_params.mutable_onerec_xattention_params();
   const auto& args = runtime_.context->get_model_args();
@@ -733,18 +737,28 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   const int64_t local_kv_heads =
       decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
   const int64_t head_dim = args.decoder_head_dim();
-  const int64_t shared_kv_tokens =
-      runtime_.worker.options_.max_tokens_per_batch();
+  const int64_t cross_kv_hidden_size =
+      std::max<int64_t>(local_kv_heads, 1) * std::max<int64_t>(head_dim, 1);
+  const int64_t batch_size = std::max<int64_t>(
+      onerec_params.bs > 0 ? onerec_params.bs
+                           : inputs.input_params.num_sequences,
+      1);
+  const int64_t encoder_max_seq_len =
+      std::max<int64_t>(onerec_params.encoder_max_seq_len, 1);
+  const int32_t decoder_layers = static_cast<int32_t>(args.n_layers());
+  auto fp_options = torch::TensorOptions()
+                        .dtype(runtime_.worker.dtype())
+                        .device(runtime_.worker.device());
 
   onerec_params.shared_k_caches.clear();
   onerec_params.shared_v_caches.clear();
-  onerec_params.shared_k_caches.reserve(runtime_.worker.kv_caches_.size());
-  onerec_params.shared_v_caches.reserve(runtime_.worker.kv_caches_.size());
-  for (const auto& kv_cache : runtime_.worker.kv_caches_) {
-    onerec_params.shared_k_caches.push_back(get_onerec_shared_kv_view(
-        kv_cache.get_k_cache(), shared_kv_tokens, local_kv_heads, head_dim));
-    onerec_params.shared_v_caches.push_back(get_onerec_shared_kv_view(
-        kv_cache.get_v_cache(), shared_kv_tokens, local_kv_heads, head_dim));
+  onerec_params.shared_k_caches.reserve(decoder_layers);
+  onerec_params.shared_v_caches.reserve(decoder_layers);
+  for (int32_t layer_id = 0; layer_id < decoder_layers; ++layer_id) {
+    onerec_params.shared_k_caches.emplace_back(torch::zeros(
+        {batch_size, encoder_max_seq_len, cross_kv_hidden_size}, fp_options));
+    onerec_params.shared_v_caches.emplace_back(torch::zeros(
+        {batch_size, encoder_max_seq_len, cross_kv_hidden_size}, fp_options));
   }
   prepare_unshared_kv_caches_for_input(inputs, onerec_params);
 
@@ -758,6 +772,19 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   onerec_params.beam_width_tensor = torch::tensor({beam_width}, int_options);
   onerec_params.current_round_tensor =
       torch::tensor({get_onerec_current_round(onerec_params)}, int_options);
+  if (processed_inputs.sampling_params.selected_token_idxes.defined()) {
+    onerec_params.debug_selected_token_idxes =
+        processed_inputs.sampling_params.selected_token_idxes;
+    auto selected_cpu = inputs.sampling_params.selected_token_idxes.to(
+        torch::kCPU, /*non_blocking=*/false);
+    auto selected_cpu_i64 = selected_cpu.to(torch::kInt64).contiguous();
+    const int64_t* ptr = selected_cpu_i64.data_ptr<int64_t>();
+    onerec_params.debug_selected_token_idxes_expected.assign(
+        ptr, ptr + selected_cpu_i64.numel());
+  } else {
+    onerec_params.debug_selected_token_idxes = torch::Tensor();
+    onerec_params.debug_selected_token_idxes_expected.clear();
+  }
 
   if (!onerec_params.decoder_context_embedding.defined()) {
     return;
@@ -837,6 +864,27 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         round_params->decoder_context_embedding.defined();
     const bool has_encoder_context =
         round_params->has_encoder_output || has_decoder_context;
+    const bool skip_selected_token_cpu_check = util::get_bool_env(
+        "XLLM_DEBUG_ONEREC_SKIP_SELECTED_TOKEN_CPU_CHECK", false);
+    const bool trace_post_decoder =
+        util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false);
+    const bool skip_lm_head =
+        util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_LM_HEAD", false);
+    auto log_post_decoder_stage =
+        [&](const char* stage_name, const torch::Tensor& stage_hidden_states) {
+          if (!trace_post_decoder) {
+            return;
+          }
+          LOG(INFO) << "OneRec xattention post-decoder stage=" << stage_name
+                    << ", rec_stage="
+                    << static_cast<int32_t>(round_params->rec_stage)
+                    << ", is_first_prefill=" << round_params->is_first_prefill
+                    << ", has_hidden_states=" << stage_hidden_states.defined()
+                    << ", hidden_shape="
+                    << (stage_hidden_states.defined()
+                            ? stage_hidden_states.sizes()
+                            : c10::IntArrayRef{});
+        };
 
     std::optional<folly::SemiFuture<torch::Tensor>> filter_mask_future;
     if ((runtime_.worker.driver_ || runtime_.worker.dp_driver_) &&
@@ -845,6 +893,53 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       filter_mask_future =
           prepare_filter_mask_async(round_params->generated_tokens);
     }
+
+    torch::Tensor selected_token_idxes_for_logits;
+    torch::Tensor selected_token_idxes_before_cpu;
+    if (sampling_params.selected_token_idxes.defined()) {
+#if defined(USE_NPU)
+      selected_token_idxes_for_logits =
+          sampling_params.selected_token_idxes.to(torch::kInt64).contiguous();
+      if (!skip_selected_token_cpu_check) {
+        selected_token_idxes_before_cpu = selected_token_idxes_for_logits.to(
+            torch::kCPU, /*non_blocking=*/false);
+        if (selected_token_idxes_before_cpu.numel() > 0) {
+          const int64_t min_idx_before =
+              selected_token_idxes_before_cpu.min().item<int64_t>();
+          CHECK_GE(min_idx_before, 0)
+              << "OneRec xattention selected_token_idxes already negative "
+                 "before model forward, min_idx="
+              << min_idx_before
+              << ", values=" << selected_token_idxes_before_cpu
+              << ", rec_stage=" << static_cast<int32_t>(round_params->rec_stage)
+              << ", is_first_prefill=" << round_params->is_first_prefill;
+        }
+      }
+      selected_token_idxes_for_logits = selected_token_idxes_for_logits.clone();
+#else
+      selected_token_idxes_for_logits = sampling_params.selected_token_idxes;
+#endif
+    }
+
+#if defined(USE_NPU)
+    auto validate_selected_token_idxes_stage = [&](const char* stage_name) {
+      if (skip_selected_token_cpu_check ||
+          !sampling_params.selected_token_idxes.defined()) {
+        return;
+      }
+      auto selected_token_idxes_stage_cpu = sampling_params.selected_token_idxes
+                                                .to(torch::kCPU,
+                                                    /*non_blocking=*/false)
+                                                .to(torch::kInt64);
+      CHECK(torch::equal(selected_token_idxes_stage_cpu,
+                         selected_token_idxes_before_cpu))
+          << "OneRec xattention selected_token_idxes changed after "
+          << stage_name << ", before=" << selected_token_idxes_before_cpu
+          << ", after=" << selected_token_idxes_stage_cpu
+          << ", rec_stage=" << static_cast<int32_t>(round_params->rec_stage)
+          << ", is_first_prefill=" << round_params->is_first_prefill;
+    };
+#endif
 
     torch::Tensor hidden_states;
     if (round_params->rec_stage == OneRecModelInputParams::RecStage::PREFILL) {
@@ -864,6 +959,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                        mutable_input.positions,
                                        runtime_.worker.kv_caches_,
                                        decoder_params);
+#if defined(USE_NPU)
+        validate_selected_token_idxes_stage("decoder_forward");
+#endif
         hidden_states = model_output.hidden_states;
       } else {
         const bool has_sparse_embedding =
@@ -897,6 +995,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                        round_params->encoder_positions,
                                        runtime_.worker.kv_caches_,
                                        encoder_params);
+#if defined(USE_NPU)
+        validate_selected_token_idxes_stage("encoder_forward");
+#endif
 
         ModelInputParams decoder_params = mutable_input.input_params;
         auto& decoder_onerec_params =
@@ -909,6 +1010,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                        mutable_input.positions,
                                        runtime_.worker.kv_caches_,
                                        decoder_params);
+#if defined(USE_NPU)
+        validate_selected_token_idxes_stage("decoder_forward");
+#endif
         hidden_states = model_output.hidden_states;
       }
     } else {
@@ -926,6 +1030,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                                      mutable_input.positions,
                                                      runtime_.worker.kv_caches_,
                                                      decoder_params);
+#if defined(USE_NPU)
+      validate_selected_token_idxes_stage("decode_forward");
+#endif
       hidden_states = model_output.hidden_states;
     }
 
@@ -936,14 +1043,74 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     RoundResult result;
     result.sampling_params = sampling_params;
     if (sampling_params.selected_token_idxes.defined()) {
-      result.logits = runtime_.model->logits(
-          hidden_states, sampling_params.selected_token_idxes);
+      torch::Tensor selected_token_idxes = selected_token_idxes_for_logits;
+#if defined(USE_NPU)
+      if (!skip_selected_token_cpu_check) {
+        auto selected_token_idxes_after_cpu =
+            sampling_params.selected_token_idxes
+                .to(torch::kCPU,
+                    /*non_blocking=*/false)
+                .to(torch::kInt64);
+        CHECK(torch::equal(selected_token_idxes_after_cpu,
+                           selected_token_idxes_before_cpu))
+            << "OneRec xattention selected_token_idxes changed during model "
+               "forward, before="
+            << selected_token_idxes_before_cpu
+            << ", after=" << selected_token_idxes_after_cpu
+            << ", rec_stage=" << static_cast<int32_t>(round_params->rec_stage)
+            << ", is_first_prefill=" << round_params->is_first_prefill;
+      }
+      if (selected_token_idxes.scalar_type() != torch::kInt64) {
+        selected_token_idxes = selected_token_idxes.to(torch::kInt64);
+      }
+      selected_token_idxes = selected_token_idxes.contiguous();
+      if (!skip_selected_token_cpu_check) {
+        CHECK_EQ(selected_token_idxes_before_cpu.dim(), 1)
+            << "OneRec xattention selected_token_idxes must be 1-D, got "
+            << selected_token_idxes_before_cpu.dim();
+        if (selected_token_idxes_before_cpu.numel() > 0) {
+          const int64_t hidden_rows =
+              hidden_states.dim() > 0 ? hidden_states.size(0) : 0;
+          const int64_t min_idx =
+              selected_token_idxes_before_cpu.min().item<int64_t>();
+          const int64_t max_idx =
+              selected_token_idxes_before_cpu.max().item<int64_t>();
+          CHECK_GE(min_idx, 0)
+              << "OneRec xattention selected_token_idxes contains negative "
+                 "index, min_idx="
+              << min_idx << ", max_idx=" << max_idx
+              << ", hidden_rows=" << hidden_rows
+              << ", rec_stage=" << static_cast<int32_t>(round_params->rec_stage)
+              << ", is_first_prefill=" << round_params->is_first_prefill;
+          CHECK_LT(max_idx, hidden_rows)
+              << "OneRec xattention selected_token_idxes out of range, "
+              << "min_idx=" << min_idx << ", max_idx=" << max_idx
+              << ", hidden_rows=" << hidden_rows
+              << ", rec_stage=" << static_cast<int32_t>(round_params->rec_stage)
+              << ", is_first_prefill=" << round_params->is_first_prefill;
+        }
+      }
+#endif
+      log_post_decoder_stage("before_logits", hidden_states);
+      if (skip_lm_head) {
+        const int64_t vocab_size = std::max<int64_t>(
+            runtime_.context->get_model_args().vocab_size(), 1);
+        result.logits = torch::zeros(
+            {std::max<int64_t>(selected_token_idxes.numel(), 1), vocab_size},
+            hidden_states.options());
+      } else {
+        result.logits =
+            runtime_.model->logits(hidden_states, selected_token_idxes);
+      }
+      log_post_decoder_stage("after_logits", hidden_states);
       torch::Tensor filter_mask;
       if (filter_mask_future.has_value()) {
         filter_mask = std::move(filter_mask_future.value()).get();
       }
+      log_post_decoder_stage("before_sampler", hidden_states);
       result.sample_output =
           rec_sampler_->forward(result.logits, sampling_params, filter_mask);
+      log_post_decoder_stage("after_sampler", hidden_states);
     }
     return result;
   };
@@ -1094,7 +1261,18 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     output.logprobs = result->sampling_params.logprobs;
     output.max_top_logprobs = result->sampling_params.max_top_logprobs;
 
-    runtime_.stream->synchronize();
+    if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+      LOG(INFO) << "OneRec xattention post-decoder stage=before_stream_sync"
+                << ", multi_round=0";
+    }
+    if (!util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_FINAL_STREAM_SYNC",
+                            false)) {
+      runtime_.stream->synchronize();
+    }
+    if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+      LOG(INFO) << "OneRec xattention post-decoder stage=after_stream_sync"
+                << ", multi_round=0";
+    }
     COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
     DeviceMonitor::get_instance().update_active_activation_memory(
         runtime_.worker.device_.index());
@@ -1140,26 +1318,38 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     }
 
 #if defined(USE_NPU)
+    if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+      LOG(INFO) << "OneRec xattention post-decoder stage=before_beam_search"
+                << ", round=" << round;
+    }
     if (round == 0) {
       top_tokens =
           result->sample_output.top_tokens.to(torch::kInt32).reshape({-1, 1});
       top_logprobs = result->sample_output.top_logprobs.reshape({-1, 1});
+      beam_tensors.out_token_ids.copy_(top_tokens);
+      beam_tensors.out_log_probs.copy_(top_logprobs);
+      beam_tensors.out_seqgroup.select(/*dim=*/2, /*index=*/0)
+          .copy_(top_tokens.reshape({-1}));
     } else {
       top_tokens = result->sample_output.top_tokens.to(torch::kInt32);
       top_logprobs = result->sample_output.top_logprobs;
+      xllm::kernel::npu::beam_search_rec(
+          /*logprobs=*/beam_tensors.acc_logprob,
+          /*top_tokens=*/top_tokens.to(torch::kInt32),
+          /*top_logprobs=*/top_logprobs,
+          /*sequence_group=*/beam_tensors.sequence_group,
+          /*current_step=*/static_cast<int64_t>(round),
+          /*out_token_ids=*/beam_tensors.out_token_ids,
+          /*out_token_index=*/beam_tensors.out_token_index,
+          /*out_log_probs=*/beam_tensors.out_log_probs,
+          /*out_beam_count_prefix_sums=*/
+          beam_tensors.out_beam_count_prefix_sums,
+          /*out_sequence=*/beam_tensors.out_seqgroup);
     }
-    xllm::kernel::npu::beam_search_rec(
-        /*logprobs=*/beam_tensors.acc_logprob,
-        /*top_tokens=*/top_tokens.to(torch::kInt32),
-        /*top_logprobs=*/top_logprobs,
-        /*sequence_group=*/beam_tensors.sequence_group,
-        /*current_step=*/static_cast<int64_t>(round),
-        /*out_token_ids=*/beam_tensors.out_token_ids,
-        /*out_token_index=*/beam_tensors.out_token_index,
-        /*out_log_probs=*/beam_tensors.out_log_probs,
-        /*out_beam_count_prefix_sums=*/
-        beam_tensors.out_beam_count_prefix_sums,
-        /*out_sequence=*/beam_tensors.out_seqgroup);
+    if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+      LOG(INFO) << "OneRec xattention post-decoder stage=after_beam_search"
+                << ", round=" << round;
+    }
 #else
     top_tokens = result->sample_output.top_tokens.to(torch::kInt32)
                      .reshape({-1, beam_width});
@@ -1193,6 +1383,11 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     }
 
     if (round == total_rounds - 1) {
+      if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+        LOG(INFO)
+            << "OneRec xattention post-decoder stage=before_final_output_assign"
+            << ", round=" << round;
+      }
       output.logits = result->logits;
       output.sample_output = result->sample_output;
       output.do_sample = result->sampling_params.do_sample;
@@ -1205,10 +1400,25 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       output.beam_search_output.out_logprobs =
           beam_tensors.acc_logprob.reshape({-1});
       output.beam_sequence_group = beam_tensors.sequence_group;
+      if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+        LOG(INFO)
+            << "OneRec xattention post-decoder stage=after_final_output_assign"
+            << ", round=" << round;
+      }
     }
   }
 
-  runtime_.stream->synchronize();
+  if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+    LOG(INFO) << "OneRec xattention post-decoder stage=before_stream_sync"
+              << ", multi_round=1";
+  }
+  if (!util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_FINAL_STREAM_SYNC", false)) {
+    runtime_.stream->synchronize();
+  }
+  if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
+    LOG(INFO) << "OneRec xattention post-decoder stage=after_stream_sync"
+              << ", multi_round=1";
+  }
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
       runtime_.worker.device_.index());
