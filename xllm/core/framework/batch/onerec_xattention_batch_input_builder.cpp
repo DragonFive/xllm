@@ -61,6 +61,7 @@ ForwardInput OneRecXAttentionBatchInputBuilder::build_rec_forward_input(
   std::vector<std::vector<int32_t>> decode_unique_token_counts_vec;
   std::vector<int32_t> decode_unique_token_lens_vec;
   std::vector<int32_t> decode_positions_vec;
+  int32_t decode_hidden_row_offset = 0;
 
   int32_t batch_size = 0;
   int32_t beam_width = 1;
@@ -101,15 +102,20 @@ ForwardInput OneRecXAttentionBatchInputBuilder::build_rec_forward_input(
           get_onerec_xattention_decode_position(*sequence_ptr));
       const int32_t sel_start =
           static_cast<int32_t>(decode_selected_token_idxes.size());
+      const int32_t decode_hidden_seq_len = std::max(total_seq_len, 1);
       for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
         const int32_t idx = sel_start + beam_idx;
+        const int32_t selected_row = decode_hidden_row_offset +
+                                     beam_idx * decode_hidden_seq_len +
+                                     (decode_hidden_seq_len - 1);
         decode_sampling_params.push_back(sampling_param);
-        decode_selected_token_idxes.push_back(idx);
+        decode_selected_token_idxes.push_back(selected_row);
         decode_sample_idxes.push_back(idx);
         decode_unique_token_ids_vec.emplace_back();
         decode_unique_token_counts_vec.emplace_back();
         decode_unique_token_lens_vec.push_back(0);
       }
+      decode_hidden_row_offset += beam_width * decode_hidden_seq_len;
     }
   }
 

@@ -669,7 +669,7 @@ NpuOneRecBlockLayerImpl::NpuOneRecBlockLayerImpl(const ModelContext& context,
   param_from_args(prefill_param_atb_, args, parallel_args, /*is_prefill=*/true);
   prefill_param_atb_.matmulBackend = atb_speed::common::OpBackend::ATB;
   param_from_args(decode_param_, args, parallel_args, /*is_prefill=*/false);
-  if (use_legacy_onerec_prefill_only_mode() && is_decoder_) {
+  if (use_legacy_onerec_prefill_only_contract() && is_decoder_) {
     param_from_args(decoder_prefill_only_decode_param_,
                     args,
                     parallel_args,
@@ -740,7 +740,7 @@ void NpuOneRecBlockLayerImpl::param_from_args(
   param.isDecoder = is_decoder_;
   param.isOneRecEncoder = !is_decoder_;
   param.use_xattn = is_decoder_ && is_onerec_xattention_mode();
-  param.enableOneRecPrefillOnly = use_legacy_onerec_prefill_only_mode();
+  param.enableOneRecPrefillOnly = use_legacy_onerec_prefill_only_contract();
   param.backend = FLAGS_communication_backend;
   param.matmulBackend = kEnableOneRecAclnnAttentionLinear
                             ? atb_speed::common::OpBackend::ACLNN
@@ -1218,7 +1218,7 @@ int64_t NpuOneRecBlockLayerImpl::init_layer() {
         init_node(prefill_node_atb_, prefill_param_atb_));
   }
   if (is_decoder_) {
-    if (use_legacy_onerec_prefill_only_mode()) {
+    if (use_legacy_onerec_prefill_only_contract()) {
       CHECK_OPERATION_STATUS_RETURN(
           init_node(decoder_prefill_only_decode_node_,
                     decoder_prefill_only_decode_param_));
@@ -1321,7 +1321,7 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
   if (is_prefill) {
     if (is_decoder_) {
       if (is_first_prefill && encoder_output != nullptr &&
-          (use_legacy_onerec_prefill_only_mode() ||
+          (use_legacy_onerec_prefill_only_contract() ||
            is_onerec_xattention_mode())) {
         const int64_t bs = encoder_output->size(0);
         const int64_t seq_len = encoder_output->size(1);
@@ -1335,7 +1335,7 @@ torch::Tensor NpuOneRecBlockLayerImpl::forward(
         cross_v_cache_ = torch::empty({bs, seq_len, kv_hidden_size}, options);
       }
 
-      if (use_legacy_onerec_prefill_only_mode()) {
+      if (use_legacy_onerec_prefill_only_contract()) {
         atb_speed::Model::Node& target_node =
             is_first_prefill
                 ? ((use_atb_small_tokens &&
@@ -1548,7 +1548,8 @@ void NpuOneRecBlockLayerImpl::build_decoder_moe_node_variant_pack(
       attn_mask,
       kv_cache,
       input_params,
-      (use_legacy_onerec_prefill_only_mode() && is_prefill && !is_first_prefill)
+      (use_legacy_onerec_prefill_only_contract() && is_prefill &&
+       !is_first_prefill)
           ? decoder_prefill_only_decode_param_
           : (is_prefill ? prefill_param_ : decode_param_),
       is_first_prefill,
@@ -1807,7 +1808,8 @@ void NpuOneRecBlockLayerImpl::build_decoder_node_variant_pack(
       attn_mask,
       kv_cache,
       input_params,
-      (use_legacy_onerec_prefill_only_mode() && is_prefill && !is_first_prefill)
+      (use_legacy_onerec_prefill_only_contract() && is_prefill &&
+       !is_first_prefill)
           ? decoder_prefill_only_decode_param_
           : (is_prefill ? prefill_param_ : decode_param_),
       is_first_prefill,

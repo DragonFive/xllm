@@ -39,6 +39,17 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+namespace {
+
+constexpr int64_t kMinimalOneRecMetadataKVBlocks = 2;
+
+bool use_minimal_onerec_metadata_kv_cache(RecModelKind rec_model_kind) {
+  return rec_model_kind == RecModelKind::kOneRec &&
+         (use_legacy_onerec_prefill_only_contract() ||
+          is_onerec_xattention_mode());
+}
+
+}  // namespace
 
 // ============================================================
 // RecEngine Implementation
@@ -133,6 +144,45 @@ KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
   const int64_t max_cache_size = options_.max_cache_size();
   const double max_memory_utilization = options_.max_memory_utilization();
 
+  // compute kv cache slot size
+  const int64_t dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
+  const int64_t slot_size = 2 * dtype_size * head_dim_ * n_local_kv_heads_;
+
+  KVCacheCapacity kv_cache_cap;
+  kv_cache_cap.slot_size() = slot_size;
+  kv_cache_cap.n_layers() = args_.n_layers();
+  kv_cache_cap.block_size() = options_.block_size();
+
+  const int64_t block_size = kv_cache_cap.block_size();
+  const int64_t block_size_in_bytes = block_size * slot_size;
+  const int64_t cache_block_size_in_bytes =
+      args_.n_layers() * block_size_in_bytes;
+  CHECK_GT(cache_block_size_in_bytes, 0)
+      << "cache block size must be positive.";
+
+  if (use_minimal_onerec_metadata_kv_cache(rec_model_kind_)) {
+    int64_t n_blocks = kMinimalOneRecMetadataKVBlocks;
+    if (max_cache_size > 0) {
+      const int64_t max_cache_blocks =
+          max_cache_size / cache_block_size_in_bytes;
+      CHECK_GE(max_cache_blocks, kMinimalOneRecMetadataKVBlocks)
+          << "max_cache_size is too small for OneRec metadata kv cache. It "
+             "must fit the legacy prefill-only metadata blocks, "
+             "max_cache_size="
+          << readable_size(max_cache_size)
+          << ", block_bytes=" << readable_size(cache_block_size_in_bytes);
+      n_blocks = std::min(n_blocks, max_cache_blocks);
+    }
+    kv_cache_cap.n_blocks() = n_blocks;
+    kv_cache_cap.cache_size_in_bytes() = n_blocks * cache_block_size_in_bytes;
+    LOG(INFO) << "OneRec uses minimal metadata kv cache, blocks: "
+              << kv_cache_cap.n_blocks() << ", bytes: "
+              << readable_size(kv_cache_cap.cache_size_in_bytes())
+              << ", max_memory_utilization: " << max_memory_utilization
+              << ", max_cache_size: " << readable_size(max_cache_size);
+    return kv_cache_cap;
+  }
+
   int64_t cache_size_in_bytes = pipeline_->estimate_min_available_memory();
 
   // apply memory cap from config
@@ -141,21 +191,11 @@ KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
     // The caps are applied in estimate_min_available_memory
   }
 
-  KVCacheCapacity kv_cache_cap;
   kv_cache_cap.cache_size_in_bytes() =
       std::max(cache_size_in_bytes, int64_t(0));
   CHECK_GT(kv_cache_cap.cache_size_in_bytes(), 0)
       << "Available kv cache size must be greater than 0";
 
-  // compute kv cache slot size
-  const int64_t dtype_size = torch::scalarTypeToTypeMeta(dtype_).itemsize();
-  const int64_t slot_size = 2 * dtype_size * head_dim_ * n_local_kv_heads_;
-  kv_cache_cap.slot_size() = slot_size;
-  kv_cache_cap.n_layers() = args_.n_layers();
-  kv_cache_cap.block_size() = options_.block_size();
-
-  const int64_t block_size = kv_cache_cap.block_size();
-  const int64_t block_size_in_bytes = block_size * slot_size;
   kv_cache_cap.n_blocks() = kv_cache_cap.cache_size_in_bytes() /
                             (args_.n_layers() * block_size_in_bytes);
   CHECK_GT(kv_cache_cap.n_blocks(), 0) << "no n_blocks for kv cache";
@@ -872,7 +912,7 @@ RecEngine::OneRecXAttentionEnginePipeline::estimate_min_available_memory() {
 }
 
 bool RecEngine::OneRecXAttentionEnginePipeline::allocate_kv_cache(
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+    const KVCacheShape& kv_cache_shape) {
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
@@ -927,6 +967,9 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
     const ForwardInput& model_inputs) {
   const bool trace_engine_output =
       util::get_bool_env("XLLM_DEBUG_ONEREC_ENGINE_TRACE", false);
+  const bool trace_stage_timing =
+      util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_STAGE_TIMING", false);
+  Timer engine_timer;
   auto log_engine_stage = [&](const char* stage_name,
                               const torch::Tensor& tensor = torch::Tensor()) {
     if (!trace_engine_output) {
@@ -936,12 +979,21 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
               << ", tensor_defined=" << tensor.defined() << ", tensor_shape="
               << (tensor.defined() ? tensor.sizes() : c10::IntArrayRef{});
   };
+  auto log_engine_timing = [&](const char* stage_name) {
+    if (!trace_stage_timing) {
+      return;
+    }
+    LOG(INFO) << "OneRec xattention engine timing, stage=" << stage_name
+              << ", elapsed_us=" << engine_timer.elapsed_microseconds();
+    engine_timer.reset();
+  };
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
     futures.emplace_back(worker->step_async(model_inputs));
   }
   auto results = folly::collectAll(futures).get();
+  log_engine_timing("worker_step_collect");
   log_engine_stage("after_collect_all");
 
   for (size_t i = 0; i < results.size(); ++i) {
@@ -958,8 +1010,10 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
 
   auto& output = forward_output.value();
   auto& sample_output = output.sample_output;
+  const bool has_beam_output = output.beam_sequence_group.defined() &&
+                               output.beam_sequence_group.numel() > 0;
 
-  if (sample_output.embeddings.defined()) {
+  if (!has_beam_output && sample_output.embeddings.defined()) {
     log_engine_stage("before_embeddings_to_cpu", sample_output.embeddings);
     sample_output.embeddings = safe_to(
         sample_output.embeddings,
@@ -968,7 +1022,7 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
     log_engine_stage("after_embeddings_to_cpu", sample_output.embeddings);
   }
 
-  if (sample_output.next_tokens.defined()) {
+  if (!has_beam_output && sample_output.next_tokens.defined()) {
     log_engine_stage("before_next_tokens_to_cpu", sample_output.next_tokens);
     sample_output.next_tokens =
         safe_to(sample_output.next_tokens, torch::kCPU, /*non_blocking=*/true);
@@ -993,8 +1047,7 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
       log_engine_stage("after_top_logprobs_to_cpu", sample_output.top_logprobs);
     }
   }
-  if (output.beam_sequence_group.defined() &&
-      output.beam_sequence_group.numel() > 0) {
+  if (has_beam_output) {
     log_engine_stage("before_beam_sequence_group_to_cpu",
                      output.beam_sequence_group);
     output.beam_sequence_group =
@@ -1011,8 +1064,10 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
     log_engine_stage("after_beam_out_logprobs_to_cpu",
                      output.beam_search_output.out_logprobs);
   }
+  log_engine_timing("output_d2h_submit");
   log_engine_stage("before_default_stream_sync");
   Device(engine_.workers_[0]->device()).synchronize_default_stream();
+  log_engine_timing("default_stream_sync");
   log_engine_stage("after_default_stream_sync");
 
   return output;

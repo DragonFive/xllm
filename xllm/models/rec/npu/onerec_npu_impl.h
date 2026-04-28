@@ -254,6 +254,8 @@ class OneRecStackImpl : public torch::nn::Module {
 #if defined(USE_NPU)
     auto validate_selected_token_idxes_stage = [&](const char* stage_name) {
       if (!is_decoder_ || onerec_xattn_params == nullptr ||
+          !util::get_bool_env("XLLM_DEBUG_ONEREC_SELECTED_TOKEN_CPU_CHECK",
+                              false) ||
           util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_SELECTED_TOKEN_CPU_CHECK",
                              false) ||
           !onerec_xattn_params->debug_selected_token_idxes.defined() ||
@@ -479,7 +481,7 @@ class OneRecStackImpl : public torch::nn::Module {
                                    ? layer_position_bias
                                    : layer_position_bias.contiguous();
 
-    if (is_decoder_ && use_legacy_onerec_prefill_only_mode()) {
+    if (is_decoder_ && use_legacy_onerec_prefill_only_contract()) {
       const float mask_value = -9984.0f;
       auto upper_tri_mask =
           torch::triu(torch::ones({query_length, query_length},

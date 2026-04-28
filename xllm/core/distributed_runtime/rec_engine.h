@@ -136,8 +136,7 @@ class RecEngine : public Engine {
     void process_group_test() override;
     bool init_model_workers(const std::string& model_path) override;
     int64_t estimate_min_available_memory() override;
-    bool allocate_kv_cache(
-        const std::vector<std::vector<int64_t>>& kv_cache_shape) override;
+    bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
     ForwardOutput step(std::vector<Batch>& batches) override;
     std::vector<int64_t> get_active_activation_memory() const override;
     size_t num_workers() const override;

@@ -18,7 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -73,6 +76,744 @@ int32_t get_onerec_current_round(const OneRecXAttentionParams& params) {
   return std::max<int32_t>(
       static_cast<int32_t>(params.generated_tokens.front().size()) - 1, 0);
 }
+
+#if defined(USE_NPU)
+bool enable_onerec_selected_token_cpu_check() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_SELECTED_TOKEN_CPU_CHECK",
+                            false) &&
+         !util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_SELECTED_TOKEN_CPU_CHECK",
+                             false);
+}
+
+bool enable_onerec_xattention_stage_timing() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_STAGE_TIMING", false);
+}
+
+struct BeamSearchDebugCandidate {
+  float score = 0.0f;
+  int32_t flat_index = 0;
+};
+
+struct BeamRoundDumpRow {
+  float score = 0.0f;
+  int32_t row = 0;
+};
+
+torch::Tensor to_cpu_tensor(const torch::Tensor& tensor,
+                            torch::ScalarType dtype) {
+  return tensor
+      .to(torch::TensorOptions().device(torch::kCPU).dtype(dtype),
+          /*non_blocking=*/false)
+      .contiguous();
+}
+
+std::string format_token_list(const std::vector<int32_t>& tokens) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << tokens[i];
+  }
+  oss << "]";
+  return oss.str();
+}
+
+std::vector<std::vector<int32_t>> parse_onerec_beam_watch_prefixes() {
+  const auto raw_env =
+      util::get_optional_string_env("XLLM_DEBUG_ONEREC_BEAM_WATCH_PREFIXES");
+  std::vector<std::vector<int32_t>> prefixes;
+  if (!raw_env.has_value()) {
+    return prefixes;
+  }
+
+  const std::string& raw = raw_env.value();
+  if (raw.empty()) {
+    return prefixes;
+  }
+
+  std::stringstream prefix_stream(raw);
+  std::string prefix_text;
+  while (std::getline(prefix_stream, prefix_text, ';')) {
+    std::vector<int32_t> tokens;
+    std::stringstream token_stream(prefix_text);
+    std::string token_text;
+    while (std::getline(token_stream, token_text, ',')) {
+      if (token_text.empty()) {
+        continue;
+      }
+      char* end = nullptr;
+      const long value = std::strtol(token_text.c_str(), &end, 10);
+      if (end == token_text.c_str() || *end != '\0') {
+        LOG(ERROR) << "Invalid OneRec beam watch token: " << token_text
+                   << ", raw=" << raw;
+        tokens.clear();
+        break;
+      }
+      tokens.emplace_back(static_cast<int32_t>(value));
+    }
+    if (!tokens.empty()) {
+      prefixes.emplace_back(std::move(tokens));
+    }
+  }
+  return prefixes;
+}
+
+void debug_dump_onerec_beam_round(int32_t round,
+                                  int32_t batch_size,
+                                  int32_t beam_width,
+                                  int32_t total_rounds,
+                                  const torch::Tensor& sequence_group,
+                                  const torch::Tensor& acc_logprob) {
+  if (!util::get_bool_env("XLLM_DEBUG_ONEREC_BEAM_ROUND_DUMP", false)) {
+    return;
+  }
+
+  if (round < 0 || round >= total_rounds || batch_size <= 0 ||
+      beam_width <= 0 || !sequence_group.defined() || !acc_logprob.defined()) {
+    LOG(ERROR) << "OneRec xattention beam round dump invalid metadata, "
+               << "round=" << round << ", batch_size=" << batch_size
+               << ", beam_width=" << beam_width
+               << ", total_rounds=" << total_rounds
+               << ", sequence_group_defined=" << sequence_group.defined()
+               << ", acc_logprob_defined=" << acc_logprob.defined();
+    return;
+  }
+
+  const int64_t dump_rows_env =
+      util::get_int_env("XLLM_DEBUG_ONEREC_BEAM_ROUND_DUMP_ROWS", beam_width);
+  const int32_t dump_rows = static_cast<int32_t>(
+      std::min<int64_t>(std::max<int64_t>(dump_rows_env, 0), beam_width));
+  if (dump_rows == 0) {
+    return;
+  }
+
+  const int64_t num_seq =
+      static_cast<int64_t>(batch_size) * static_cast<int64_t>(beam_width);
+  torch::Tensor sequence_cpu = to_cpu_tensor(sequence_group, torch::kInt32);
+  torch::Tensor score_cpu =
+      to_cpu_tensor(acc_logprob, torch::kFloat32).reshape({-1});
+  if (sequence_cpu.numel() != num_seq * static_cast<int64_t>(total_rounds) ||
+      score_cpu.numel() != num_seq) {
+    LOG(ERROR) << "OneRec xattention beam round dump shape mismatch, "
+               << "round=" << round
+               << ", sequence_group=" << sequence_cpu.sizes()
+               << ", acc_logprob=" << score_cpu.sizes()
+               << ", expected_num_seq=" << num_seq
+               << ", total_rounds=" << total_rounds;
+    return;
+  }
+
+  const int32_t* sequence_data = sequence_cpu.data_ptr<int32_t>();
+  const float* score_data = score_cpu.data_ptr<float>();
+  std::vector<BeamRoundDumpRow> rows;
+  rows.reserve(static_cast<size_t>(beam_width));
+
+  for (int32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    rows.clear();
+    for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+      const int64_t row =
+          static_cast<int64_t>(request_idx) * beam_width + beam_idx;
+      BeamRoundDumpRow dump_row;
+      dump_row.score = score_data[row];
+      dump_row.row = beam_idx;
+      rows.emplace_back(dump_row);
+    }
+
+    std::stable_sort(
+        rows.begin(),
+        rows.end(),
+        [](const BeamRoundDumpRow& left, const BeamRoundDumpRow& right) {
+          if (left.score == right.score) {
+            return left.row < right.row;
+          }
+          return left.score > right.score;
+        });
+
+    std::ostringstream oss;
+    oss << "OneRec xattention beam round dump, round=" << round
+        << ", request_idx=" << request_idx << ", batch_size=" << batch_size
+        << ", beam_width=" << beam_width << ", total_rounds=" << total_rounds
+        << ", rows=[";
+    for (int32_t rank = 0; rank < dump_rows; ++rank) {
+      if (rank > 0) {
+        oss << ", ";
+      }
+      const BeamRoundDumpRow& row = rows[static_cast<size_t>(rank)];
+      oss << "{rank=" << rank << ", row=" << row.row << ", score=" << row.score
+          << ", tokens=[";
+      for (int32_t step = 0; step <= round; ++step) {
+        if (step > 0) {
+          oss << ",";
+        }
+        const int64_t seq_offset =
+            (static_cast<int64_t>(request_idx) * beam_width + row.row) *
+                total_rounds +
+            step;
+        oss << sequence_data[seq_offset];
+      }
+      oss << "]}";
+    }
+    oss << "]";
+    LOG(INFO) << oss.str();
+  }
+}
+
+void debug_dump_onerec_beam_watch_candidates(
+    int32_t round,
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t total_rounds,
+    const torch::Tensor& logprobs,
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    const torch::Tensor& logits,
+    const torch::Tensor& sequence_group) {
+  const std::vector<std::vector<int32_t>> watch_prefixes =
+      parse_onerec_beam_watch_prefixes();
+  if (watch_prefixes.empty()) {
+    return;
+  }
+
+  const bool dump_logits =
+      util::get_bool_env("XLLM_DEBUG_ONEREC_BEAM_CANDIDATE_DUMP_LOGITS", false);
+  const int64_t num_seq =
+      static_cast<int64_t>(batch_size) * static_cast<int64_t>(beam_width);
+  if (round < 0 || round >= total_rounds || num_seq <= 0 ||
+      !logprobs.defined() || !top_tokens.defined() || !top_logprobs.defined() ||
+      !sequence_group.defined()) {
+    LOG(ERROR) << "OneRec xattention beam watch invalid metadata, round="
+               << round << ", batch_size=" << batch_size
+               << ", beam_width=" << beam_width
+               << ", total_rounds=" << total_rounds
+               << ", logprobs_defined=" << logprobs.defined()
+               << ", top_tokens_defined=" << top_tokens.defined()
+               << ", top_logprobs_defined=" << top_logprobs.defined()
+               << ", sequence_group_defined=" << sequence_group.defined();
+    return;
+  }
+
+  torch::Tensor logprobs_cpu = to_cpu_tensor(logprobs, torch::kFloat32);
+  torch::Tensor top_tokens_cpu = to_cpu_tensor(top_tokens, torch::kInt32);
+  torch::Tensor top_logprobs_cpu = to_cpu_tensor(top_logprobs, torch::kFloat32);
+  torch::Tensor sequence_cpu = to_cpu_tensor(sequence_group, torch::kInt32);
+  torch::Tensor logits_cpu = dump_logits && logits.defined()
+                                 ? to_cpu_tensor(logits, torch::kFloat32)
+                                 : torch::Tensor();
+  if (logprobs_cpu.numel() != num_seq ||
+      top_tokens_cpu.numel() % num_seq != 0 ||
+      top_logprobs_cpu.numel() != top_tokens_cpu.numel() ||
+      sequence_cpu.numel() != num_seq * static_cast<int64_t>(total_rounds) ||
+      (logits_cpu.defined() &&
+       (logits_cpu.dim() != 2 || logits_cpu.size(0) != num_seq))) {
+    LOG(ERROR) << "OneRec xattention beam watch shape mismatch, round=" << round
+               << ", logprobs=" << logprobs_cpu.sizes()
+               << ", top_tokens=" << top_tokens_cpu.sizes()
+               << ", top_logprobs=" << top_logprobs_cpu.sizes() << ", logits="
+               << (logits_cpu.defined() ? logits_cpu.sizes()
+                                        : c10::IntArrayRef{})
+               << ", sequence_group=" << sequence_cpu.sizes();
+    return;
+  }
+
+  const int64_t top_k = top_tokens_cpu.numel() / num_seq;
+  const float* logprobs_data = logprobs_cpu.data_ptr<float>();
+  const int32_t* top_tokens_data = top_tokens_cpu.data_ptr<int32_t>();
+  const float* top_logprobs_data = top_logprobs_cpu.data_ptr<float>();
+  const float* logits_data =
+      logits_cpu.defined() ? logits_cpu.data_ptr<float>() : nullptr;
+  const int64_t vocab_size = logits_cpu.defined() ? logits_cpu.size(1) : 0;
+  const int32_t* sequence_data = sequence_cpu.data_ptr<int32_t>();
+  std::vector<bool> found(watch_prefixes.size(), false);
+
+  for (int32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    std::fill(found.begin(), found.end(), false);
+    for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+      const int64_t row =
+          static_cast<int64_t>(request_idx) * beam_width + beam_idx;
+      for (int64_t top_idx = 0; top_idx < top_k; ++top_idx) {
+        const int64_t token_offset = row * top_k + top_idx;
+        const int32_t next_token = top_tokens_data[token_offset];
+        for (size_t watch_idx = 0; watch_idx < watch_prefixes.size();
+             ++watch_idx) {
+          const std::vector<int32_t>& prefix = watch_prefixes[watch_idx];
+          if (prefix.size() != static_cast<size_t>(round + 1) ||
+              prefix[static_cast<size_t>(round)] != next_token) {
+            continue;
+          }
+          bool matched = true;
+          for (int32_t step = 0; step < round; ++step) {
+            const int64_t seq_offset =
+                row * static_cast<int64_t>(total_rounds) + step;
+            if (sequence_data[seq_offset] !=
+                prefix[static_cast<size_t>(step)]) {
+              matched = false;
+              break;
+            }
+          }
+          if (!matched) {
+            continue;
+          }
+          found[watch_idx] = true;
+          const float token_score = top_logprobs_data[token_offset];
+          const float total_score = logprobs_data[row] + token_score;
+          std::ostringstream oss;
+          oss << "OneRec xattention beam watch candidate, round=" << round
+              << ", request_idx=" << request_idx
+              << ", prefix=" << format_token_list(prefix) << ", src_row=" << row
+              << ", top_idx=" << top_idx
+              << ", prev_score=" << logprobs_data[row]
+              << ", token_score=" << token_score
+              << ", total_score=" << total_score;
+          if (logits_data != nullptr && next_token >= 0 &&
+              next_token < vocab_size) {
+            oss << ", token_logit="
+                << logits_data[row * vocab_size + next_token];
+          }
+          LOG(INFO) << oss.str();
+        }
+      }
+    }
+
+    for (size_t watch_idx = 0; watch_idx < watch_prefixes.size(); ++watch_idx) {
+      const std::vector<int32_t>& prefix = watch_prefixes[watch_idx];
+      if (prefix.size() != static_cast<size_t>(round + 1) || found[watch_idx]) {
+        continue;
+      }
+      LOG(INFO) << "OneRec xattention beam watch missing, round=" << round
+                << ", request_idx=" << request_idx
+                << ", prefix=" << format_token_list(prefix);
+    }
+  }
+}
+
+void debug_dump_onerec_beam_candidate_boundary(
+    int32_t round,
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t total_rounds,
+    const torch::Tensor& logprobs,
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    const torch::Tensor& logits,
+    const torch::Tensor& sequence_group) {
+  if (!util::get_bool_env("XLLM_DEBUG_ONEREC_BEAM_CANDIDATE_DUMP", false)) {
+    return;
+  }
+
+  const int64_t dump_round =
+      util::get_int_env("XLLM_DEBUG_ONEREC_BEAM_CANDIDATE_DUMP_ROUND", -1);
+  if (dump_round >= 0 && dump_round != round) {
+    return;
+  }
+
+  const int64_t num_seq =
+      static_cast<int64_t>(batch_size) * static_cast<int64_t>(beam_width);
+  if (round < 0 || round >= total_rounds || num_seq <= 0 ||
+      !logprobs.defined() || !top_tokens.defined() || !top_logprobs.defined() ||
+      !sequence_group.defined()) {
+    LOG(ERROR) << "OneRec xattention beam candidate dump invalid metadata, "
+               << "round=" << round << ", batch_size=" << batch_size
+               << ", beam_width=" << beam_width
+               << ", total_rounds=" << total_rounds
+               << ", logprobs_defined=" << logprobs.defined()
+               << ", top_tokens_defined=" << top_tokens.defined()
+               << ", top_logprobs_defined=" << top_logprobs.defined()
+               << ", sequence_group_defined=" << sequence_group.defined();
+    return;
+  }
+
+  torch::Tensor logprobs_cpu = to_cpu_tensor(logprobs, torch::kFloat32);
+  torch::Tensor top_tokens_cpu = to_cpu_tensor(top_tokens, torch::kInt32);
+  torch::Tensor top_logprobs_cpu = to_cpu_tensor(top_logprobs, torch::kFloat32);
+  torch::Tensor sequence_cpu = to_cpu_tensor(sequence_group, torch::kInt32);
+  const bool dump_logits =
+      util::get_bool_env("XLLM_DEBUG_ONEREC_BEAM_CANDIDATE_DUMP_LOGITS", false);
+  torch::Tensor logits_cpu = dump_logits && logits.defined()
+                                 ? to_cpu_tensor(logits, torch::kFloat32)
+                                 : torch::Tensor();
+  if (logprobs_cpu.numel() != num_seq ||
+      top_tokens_cpu.numel() % num_seq != 0 ||
+      top_logprobs_cpu.numel() != top_tokens_cpu.numel() ||
+      sequence_cpu.numel() != num_seq * static_cast<int64_t>(total_rounds) ||
+      (logits_cpu.defined() &&
+       (logits_cpu.dim() != 2 || logits_cpu.size(0) != num_seq))) {
+    LOG(ERROR) << "OneRec xattention beam candidate dump shape mismatch, "
+               << "round=" << round << ", logprobs=" << logprobs_cpu.sizes()
+               << ", top_tokens=" << top_tokens_cpu.sizes()
+               << ", top_logprobs=" << top_logprobs_cpu.sizes() << ", logits="
+               << (logits_cpu.defined() ? logits_cpu.sizes()
+                                        : c10::IntArrayRef{})
+               << ", sequence_group=" << sequence_cpu.sizes();
+    return;
+  }
+
+  const int64_t top_k = top_tokens_cpu.numel() / num_seq;
+  const int64_t radius = std::max<int64_t>(
+      util::get_int_env("XLLM_DEBUG_ONEREC_BEAM_CANDIDATE_DUMP_RADIUS", 32), 0);
+  const float* logprobs_data = logprobs_cpu.data_ptr<float>();
+  const int32_t* top_tokens_data = top_tokens_cpu.data_ptr<int32_t>();
+  const float* top_logprobs_data = top_logprobs_cpu.data_ptr<float>();
+  const float* logits_data =
+      logits_cpu.defined() ? logits_cpu.data_ptr<float>() : nullptr;
+  const int64_t vocab_size = logits_cpu.defined() ? logits_cpu.size(1) : 0;
+  const int32_t* sequence_data = sequence_cpu.data_ptr<int32_t>();
+
+  std::vector<BeamSearchDebugCandidate> candidates;
+  candidates.reserve(static_cast<size_t>(beam_width * top_k));
+
+  for (int32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    candidates.clear();
+    for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+      const int64_t row =
+          static_cast<int64_t>(request_idx) * beam_width + beam_idx;
+      for (int64_t top_idx = 0; top_idx < top_k; ++top_idx) {
+        const int64_t token_offset = row * top_k + top_idx;
+        BeamSearchDebugCandidate candidate;
+        candidate.score = logprobs_data[row] + top_logprobs_data[token_offset];
+        candidate.flat_index = static_cast<int32_t>(beam_idx * top_k + top_idx);
+        candidates.emplace_back(candidate);
+      }
+    }
+
+    std::stable_sort(candidates.begin(),
+                     candidates.end(),
+                     [](const BeamSearchDebugCandidate& left,
+                        const BeamSearchDebugCandidate& right) {
+                       if (left.score == right.score) {
+                         return left.flat_index < right.flat_index;
+                       }
+                       return left.score > right.score;
+                     });
+
+    const int64_t cutoff = beam_width;
+    const int64_t start = std::max<int64_t>(cutoff - radius, 0);
+    const int64_t end = std::min<int64_t>(
+        cutoff + radius, static_cast<int64_t>(candidates.size()));
+
+    std::ostringstream oss;
+    oss << "OneRec xattention beam candidate boundary dump, round=" << round
+        << ", request_idx=" << request_idx << ", batch_size=" << batch_size
+        << ", beam_width=" << beam_width << ", top_k=" << top_k
+        << ", rank_range=[" << start << "," << end << "), candidates=[";
+    for (int64_t rank = start; rank < end; ++rank) {
+      if (rank > start) {
+        oss << ", ";
+      }
+      const BeamSearchDebugCandidate& candidate =
+          candidates[static_cast<size_t>(rank)];
+      const int64_t beam_idx = candidate.flat_index / top_k;
+      const int64_t top_idx = candidate.flat_index % top_k;
+      const int64_t row =
+          static_cast<int64_t>(request_idx) * beam_width + beam_idx;
+      const int64_t token_offset = row * top_k + top_idx;
+
+      oss << "{rank=" << rank << ", src_row=" << row
+          << ", src_beam=" << beam_idx << ", top_idx=" << top_idx
+          << ", prev_score=" << logprobs_data[row]
+          << ", token_score=" << top_logprobs_data[token_offset]
+          << ", total_score=" << candidate.score;
+      const int32_t next_token = top_tokens_data[token_offset];
+      if (logits_data != nullptr && next_token >= 0 &&
+          next_token < vocab_size) {
+        oss << ", token_logit=" << logits_data[row * vocab_size + next_token];
+      }
+      oss << ", tokens=[";
+      for (int32_t step = 0; step < round; ++step) {
+        if (step > 0) {
+          oss << ",";
+        }
+        const int64_t seq_offset =
+            row * static_cast<int64_t>(total_rounds) + step;
+        oss << sequence_data[seq_offset];
+      }
+      if (round > 0) {
+        oss << ",";
+      }
+      oss << next_token << "]}";
+    }
+    oss << "]";
+    LOG(INFO) << oss.str();
+  }
+}
+
+int64_t count_int_mismatches(const std::vector<int32_t>& expected,
+                             const torch::Tensor& actual,
+                             const char* name,
+                             std::ostringstream& detail) {
+  const int64_t actual_numel = actual.numel();
+  if (static_cast<int64_t>(expected.size()) != actual_numel) {
+    detail << " " << name << "_size expected=" << expected.size()
+           << " actual=" << actual_numel << ";";
+    return std::max<int64_t>(static_cast<int64_t>(expected.size()),
+                             actual_numel);
+  }
+
+  const int32_t* actual_data = actual.data_ptr<int32_t>();
+  int64_t mismatches = 0;
+  for (int64_t i = 0; i < actual_numel; ++i) {
+    if (expected[static_cast<size_t>(i)] == actual_data[i]) {
+      continue;
+    }
+    if (mismatches < 5) {
+      detail << " " << name << "[" << i
+             << "] expected=" << expected[static_cast<size_t>(i)]
+             << " actual=" << actual_data[i] << ";";
+    }
+    ++mismatches;
+  }
+  return mismatches;
+}
+
+int64_t count_float_mismatches(const std::vector<float>& expected,
+                               const torch::Tensor& actual,
+                               const char* name,
+                               float atol,
+                               std::ostringstream& detail) {
+  const int64_t actual_numel = actual.numel();
+  if (static_cast<int64_t>(expected.size()) != actual_numel) {
+    detail << " " << name << "_size expected=" << expected.size()
+           << " actual=" << actual_numel << ";";
+    return std::max<int64_t>(static_cast<int64_t>(expected.size()),
+                             actual_numel);
+  }
+
+  const float* actual_data = actual.data_ptr<float>();
+  int64_t mismatches = 0;
+  for (int64_t i = 0; i < actual_numel; ++i) {
+    const float expected_value = expected[static_cast<size_t>(i)];
+    const float actual_value = actual_data[i];
+    if (std::fabs(expected_value - actual_value) <= atol) {
+      continue;
+    }
+    if (mismatches < 5) {
+      detail << " " << name << "[" << i << "] expected=" << expected_value
+             << " actual=" << actual_value << ";";
+    }
+    ++mismatches;
+  }
+  return mismatches;
+}
+
+void debug_check_onerec_beam_search_cpu_reference(
+    int32_t round,
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t total_rounds,
+    const torch::Tensor& logprobs,
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    const torch::Tensor& sequence_group,
+    const torch::Tensor& out_token_ids,
+    const torch::Tensor& out_token_index,
+    const torch::Tensor& out_log_probs,
+    const torch::Tensor& out_beam_count_prefix_sums,
+    const torch::Tensor& out_sequence) {
+  if (!util::get_bool_env("XLLM_DEBUG_ONEREC_BEAM_CPU_CANARY", false)) {
+    return;
+  }
+
+  const int64_t num_seq =
+      static_cast<int64_t>(batch_size) * static_cast<int64_t>(beam_width);
+  if (num_seq <= 0 || beam_width <= 0 || total_rounds <= 0 || round < 0 ||
+      round >= total_rounds) {
+    LOG(ERROR) << "OneRec xattention beam CPU canary invalid shape metadata, "
+               << "round=" << round << ", batch_size=" << batch_size
+               << ", beam_width=" << beam_width
+               << ", total_rounds=" << total_rounds;
+    return;
+  }
+
+  torch::Tensor logprobs_cpu = to_cpu_tensor(logprobs, torch::kFloat32);
+  torch::Tensor top_tokens_cpu = to_cpu_tensor(top_tokens, torch::kInt32);
+  torch::Tensor top_logprobs_cpu = to_cpu_tensor(top_logprobs, torch::kFloat32);
+  torch::Tensor sequence_cpu = to_cpu_tensor(sequence_group, torch::kInt32);
+  torch::Tensor out_token_ids_cpu = to_cpu_tensor(out_token_ids, torch::kInt32);
+  torch::Tensor out_token_index_cpu =
+      to_cpu_tensor(out_token_index, torch::kInt32);
+  torch::Tensor out_log_probs_cpu =
+      to_cpu_tensor(out_log_probs, torch::kFloat32);
+  torch::Tensor out_beam_count_prefix_sums_cpu =
+      to_cpu_tensor(out_beam_count_prefix_sums, torch::kInt32);
+  torch::Tensor out_sequence_cpu = to_cpu_tensor(out_sequence, torch::kInt32);
+
+  if (logprobs_cpu.numel() != num_seq ||
+      top_tokens_cpu.numel() % num_seq != 0 ||
+      top_logprobs_cpu.numel() != top_tokens_cpu.numel() ||
+      sequence_cpu.numel() != num_seq * total_rounds) {
+    LOG(ERROR) << "OneRec xattention beam CPU canary input tensor shape "
+                  "mismatch, round="
+               << round << ", logprobs=" << logprobs_cpu.sizes()
+               << ", top_tokens=" << top_tokens_cpu.sizes()
+               << ", top_logprobs=" << top_logprobs_cpu.sizes()
+               << ", sequence_group=" << sequence_cpu.sizes();
+    return;
+  }
+
+  const int64_t top_k = top_tokens_cpu.numel() / num_seq;
+  if (top_k <= 0) {
+    LOG(ERROR) << "OneRec xattention beam CPU canary invalid top_k=" << top_k;
+    return;
+  }
+
+  const float* logprobs_data = logprobs_cpu.data_ptr<float>();
+  const int32_t* top_tokens_data = top_tokens_cpu.data_ptr<int32_t>();
+  const float* top_logprobs_data = top_logprobs_cpu.data_ptr<float>();
+  const int32_t* sequence_data = sequence_cpu.data_ptr<int32_t>();
+
+  std::vector<int32_t> expected_token_ids(static_cast<size_t>(num_seq), 0);
+  std::vector<int32_t> expected_token_index(static_cast<size_t>(num_seq), 0);
+  std::vector<int32_t> expected_prefix(static_cast<size_t>(num_seq), 0);
+  std::vector<float> expected_log_probs(
+      static_cast<size_t>(num_seq), -std::numeric_limits<float>::infinity());
+  std::vector<int32_t> expected_sequence(
+      static_cast<size_t>(num_seq * total_rounds), 0);
+  for (int64_t i = 0; i < num_seq * total_rounds; ++i) {
+    expected_sequence[static_cast<size_t>(i)] = sequence_data[i];
+  }
+
+  std::vector<BeamSearchDebugCandidate> candidates;
+  candidates.reserve(static_cast<size_t>(beam_width * top_k));
+  std::vector<int32_t> selected_beams(static_cast<size_t>(beam_width), 0);
+  std::vector<int32_t> selected_remainders(static_cast<size_t>(beam_width), 0);
+  std::vector<float> selected_scores(static_cast<size_t>(beam_width), 0.0f);
+  std::vector<int32_t> beam_counts(static_cast<size_t>(beam_width), 0);
+  std::vector<int32_t> beam_write_pos(static_cast<size_t>(beam_width), 0);
+
+  for (int32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    candidates.clear();
+    std::fill(beam_counts.begin(), beam_counts.end(), 0);
+    std::fill(beam_write_pos.begin(), beam_write_pos.end(), 0);
+
+    for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+      const int64_t row =
+          static_cast<int64_t>(request_idx) * beam_width + beam_idx;
+      for (int64_t top_idx = 0; top_idx < top_k; ++top_idx) {
+        BeamSearchDebugCandidate candidate;
+        candidate.score =
+            logprobs_data[row] + top_logprobs_data[row * top_k + top_idx];
+        candidate.flat_index = static_cast<int32_t>(beam_idx * top_k + top_idx);
+        candidates.emplace_back(candidate);
+      }
+    }
+
+    std::stable_sort(candidates.begin(),
+                     candidates.end(),
+                     [](const BeamSearchDebugCandidate& left,
+                        const BeamSearchDebugCandidate& right) {
+                       if (left.score == right.score) {
+                         return left.flat_index < right.flat_index;
+                       }
+                       return left.score > right.score;
+                     });
+
+    for (int32_t output_idx = 0; output_idx < beam_width; ++output_idx) {
+      const BeamSearchDebugCandidate& candidate =
+          candidates[static_cast<size_t>(output_idx)];
+      const int32_t beam_id =
+          static_cast<int32_t>(candidate.flat_index / top_k);
+      const int32_t remainder =
+          static_cast<int32_t>(candidate.flat_index % top_k);
+      selected_beams[static_cast<size_t>(output_idx)] = beam_id;
+      selected_remainders[static_cast<size_t>(output_idx)] = remainder;
+      selected_scores[static_cast<size_t>(output_idx)] = candidate.score;
+      ++beam_counts[static_cast<size_t>(beam_id)];
+    }
+
+    int32_t running = 0;
+    for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+      const int32_t count = beam_counts[static_cast<size_t>(beam_idx)];
+      beam_write_pos[static_cast<size_t>(beam_idx)] = running;
+      running += count;
+      expected_prefix[static_cast<size_t>(request_idx * beam_width +
+                                          beam_idx)] =
+          running + request_idx * beam_width;
+    }
+
+    std::vector<int32_t> cursor = beam_write_pos;
+    for (int32_t output_idx = 0; output_idx < beam_width; ++output_idx) {
+      const int32_t beam_id = selected_beams[static_cast<size_t>(output_idx)];
+      const int32_t write_pos = cursor[static_cast<size_t>(beam_id)]++;
+      if (write_pos >= beam_width) {
+        LOG(ERROR) << "OneRec xattention beam CPU canary write_pos overflow, "
+                   << "round=" << round << ", request_idx=" << request_idx
+                   << ", write_pos=" << write_pos
+                   << ", beam_width=" << beam_width;
+        return;
+      }
+
+      const int64_t dst_row =
+          static_cast<int64_t>(request_idx) * beam_width + write_pos;
+      const int64_t src_row =
+          static_cast<int64_t>(request_idx) * beam_width + beam_id;
+      const int64_t token_offset =
+          src_row * top_k +
+          selected_remainders[static_cast<size_t>(output_idx)];
+
+      expected_token_ids[static_cast<size_t>(dst_row)] =
+          top_tokens_data[token_offset];
+      expected_log_probs[static_cast<size_t>(dst_row)] =
+          selected_scores[static_cast<size_t>(output_idx)];
+      expected_token_index[static_cast<size_t>(dst_row)] =
+          static_cast<int32_t>(src_row);
+    }
+  }
+
+  for (int64_t dst_row = 0; dst_row < num_seq; ++dst_row) {
+    const int32_t src_row = expected_token_index[static_cast<size_t>(dst_row)];
+    if (src_row < 0 || src_row >= num_seq) {
+      LOG(ERROR) << "OneRec xattention beam CPU canary invalid src_row="
+                 << src_row << ", dst_row=" << dst_row;
+      return;
+    }
+    for (int32_t step = 0; step < round; ++step) {
+      expected_sequence[static_cast<size_t>(dst_row * total_rounds + step)] =
+          sequence_data[static_cast<int64_t>(src_row) * total_rounds + step];
+    }
+    expected_sequence[static_cast<size_t>(dst_row * total_rounds + round)] =
+        expected_token_ids[static_cast<size_t>(dst_row)];
+  }
+
+  std::ostringstream detail;
+  const int64_t token_mismatches = count_int_mismatches(
+      expected_token_ids, out_token_ids_cpu.reshape({-1}), "token", detail);
+  const int64_t index_mismatches = count_int_mismatches(
+      expected_token_index, out_token_index_cpu.reshape({-1}), "index", detail);
+  const int64_t prefix_mismatches =
+      count_int_mismatches(expected_prefix,
+                           out_beam_count_prefix_sums_cpu.reshape({-1}),
+                           "prefix",
+                           detail);
+  const int64_t sequence_mismatches = count_int_mismatches(
+      expected_sequence, out_sequence_cpu.reshape({-1}), "sequence", detail);
+  const int64_t logprob_mismatches =
+      count_float_mismatches(expected_log_probs,
+                             out_log_probs_cpu.reshape({-1}),
+                             "logprob",
+                             1e-4f,
+                             detail);
+  const int64_t total_mismatches = token_mismatches + index_mismatches +
+                                   prefix_mismatches + sequence_mismatches +
+                                   logprob_mismatches;
+
+  if (total_mismatches == 0) {
+    LOG(INFO) << "OneRec xattention beam CPU canary passed, round=" << round
+              << ", batch_size=" << batch_size << ", beam_width=" << beam_width
+              << ", top_k=" << top_k;
+    return;
+  }
+
+  LOG(ERROR) << "OneRec xattention beam CPU canary mismatch, round=" << round
+             << ", batch_size=" << batch_size << ", beam_width=" << beam_width
+             << ", top_k=" << top_k << ", token_mismatches=" << token_mismatches
+             << ", index_mismatches=" << index_mismatches
+             << ", prefix_mismatches=" << prefix_mismatches
+             << ", sequence_mismatches=" << sequence_mismatches
+             << ", logprob_mismatches=" << logprob_mismatches
+             << ", detail=" << detail.str();
+}
+#endif
 
 }  // namespace
 
@@ -581,15 +1322,15 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::
     cached_unshared_k_caches_[layer_id] =
         torch::zeros({static_cast<int64_t>(max_seqs_per_batch_),
                       static_cast<int64_t>(beam_width_),
-                      static_cast<int64_t>(max_decode_step_),
                       local_kv_heads,
+                      static_cast<int64_t>(max_decode_step_),
                       head_dim},
                      cache_options);
     cached_unshared_v_caches_[layer_id] =
         torch::zeros({static_cast<int64_t>(max_seqs_per_batch_),
                       static_cast<int64_t>(beam_width_),
-                      static_cast<int64_t>(max_decode_step_),
                       local_kv_heads,
+                      static_cast<int64_t>(max_decode_step_),
                       head_dim},
                      cache_options);
   }
@@ -636,6 +1377,10 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::execute_cache_select(
       onerec_params.unshared_v_caches.empty()) {
     return;
   }
+  LOG_FIRST_N(INFO, 1)
+      << "OneRec xattention skip cache_select because the current dense FAS "
+         "decoder graph does not consume unshared KV cache.";
+  return;
 
 #if defined(USE_NPU)
   auto device = runtime_.worker.device();
@@ -701,31 +1446,46 @@ ForwardInput RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_inputs(
 void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
     const ForwardInput& inputs,
     ForwardInput& processed_inputs) {
+  const bool trace_stage_timing = enable_onerec_xattention_stage_timing();
+  Timer prepare_timer;
+  auto log_prepare_timing = [&](const char* stage_name) {
+    if (!trace_stage_timing) {
+      return;
+    }
+    runtime_.stream->synchronize();
+    LOG(INFO) << "OneRec xattention prepare timing, stage=" << stage_name
+              << ", elapsed_us=" << prepare_timer.elapsed_microseconds();
+    prepare_timer.reset();
+  };
   RecWorkPipeline::prepare_work_before_execute(inputs, processed_inputs);
+  log_prepare_timing("base_to_device");
 
 #if defined(USE_NPU)
-  auto validate_selected_token_idxes_roundtrip =
-      [](const torch::Tensor& host_tensor,
-         const torch::Tensor& device_tensor,
-         const char* tensor_name) {
-        if (!host_tensor.defined() || !device_tensor.defined()) {
-          return;
-        }
-        auto host_cpu = host_tensor.to(torch::kCPU, /*non_blocking=*/false);
-        auto device_cpu = device_tensor.to(torch::kCPU, /*non_blocking=*/false);
-        CHECK(torch::equal(host_cpu, device_cpu))
-            << "OneRec xattention " << tensor_name
-            << " changed during H2D round-trip, host=" << host_cpu
-            << ", device_roundtrip=" << device_cpu;
-      };
-  validate_selected_token_idxes_roundtrip(
-      inputs.sampling_params.selected_token_idxes,
-      processed_inputs.sampling_params.selected_token_idxes,
-      "sampling_params.selected_token_idxes");
-  validate_selected_token_idxes_roundtrip(
-      inputs.decoder_sampling_params.selected_token_idxes,
-      processed_inputs.decoder_sampling_params.selected_token_idxes,
-      "decoder_sampling_params.selected_token_idxes");
+  if (enable_onerec_selected_token_cpu_check()) {
+    auto validate_selected_token_idxes_roundtrip =
+        [](const torch::Tensor& host_tensor,
+           const torch::Tensor& device_tensor,
+           const char* tensor_name) {
+          if (!host_tensor.defined() || !device_tensor.defined()) {
+            return;
+          }
+          auto host_cpu = host_tensor.to(torch::kCPU, /*non_blocking=*/false);
+          auto device_cpu =
+              device_tensor.to(torch::kCPU, /*non_blocking=*/false);
+          CHECK(torch::equal(host_cpu, device_cpu))
+              << "OneRec xattention " << tensor_name
+              << " changed during H2D round-trip, host=" << host_cpu
+              << ", device_roundtrip=" << device_cpu;
+        };
+    validate_selected_token_idxes_roundtrip(
+        inputs.sampling_params.selected_token_idxes,
+        processed_inputs.sampling_params.selected_token_idxes,
+        "sampling_params.selected_token_idxes");
+    validate_selected_token_idxes_roundtrip(
+        inputs.decoder_sampling_params.selected_token_idxes,
+        processed_inputs.decoder_sampling_params.selected_token_idxes,
+        "decoder_sampling_params.selected_token_idxes");
+  }
 #endif
 
   auto& onerec_params =
@@ -737,14 +1497,24 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   const int64_t local_kv_heads =
       decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
   const int64_t head_dim = args.decoder_head_dim();
-  const int64_t cross_kv_hidden_size =
-      std::max<int64_t>(local_kv_heads, 1) * std::max<int64_t>(head_dim, 1);
   const int64_t batch_size = std::max<int64_t>(
       onerec_params.bs > 0 ? onerec_params.bs
                            : inputs.input_params.num_sequences,
       1);
-  const int64_t encoder_max_seq_len =
-      std::max<int64_t>(onerec_params.encoder_max_seq_len, 1);
+  int64_t shared_kv_tokens = 0;
+  if (onerec_params.decoder_context_embedding.defined()) {
+    const int64_t hidden_size =
+        std::max<int64_t>(onerec_params.decoder_context_embedding.size(-1), 1);
+    shared_kv_tokens =
+        onerec_params.decoder_context_embedding.numel() / hidden_size;
+  } else if (processed_inputs.token_ids.defined()) {
+    shared_kv_tokens = processed_inputs.token_ids.numel();
+  }
+  if (shared_kv_tokens <= 0) {
+    shared_kv_tokens =
+        batch_size *
+        std::max<int64_t>(processed_inputs.input_params.q_max_seq_len, 1);
+  }
   const int32_t decoder_layers = static_cast<int32_t>(args.n_layers());
   auto fp_options = torch::TensorOptions()
                         .dtype(runtime_.worker.dtype())
@@ -755,12 +1525,19 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   onerec_params.shared_k_caches.reserve(decoder_layers);
   onerec_params.shared_v_caches.reserve(decoder_layers);
   for (int32_t layer_id = 0; layer_id < decoder_layers; ++layer_id) {
-    onerec_params.shared_k_caches.emplace_back(torch::zeros(
-        {batch_size, encoder_max_seq_len, cross_kv_hidden_size}, fp_options));
-    onerec_params.shared_v_caches.emplace_back(torch::zeros(
-        {batch_size, encoder_max_seq_len, cross_kv_hidden_size}, fp_options));
+    onerec_params.shared_k_caches.emplace_back(
+        torch::zeros({shared_kv_tokens,
+                      std::max<int64_t>(local_kv_heads, 1),
+                      std::max<int64_t>(head_dim, 1)},
+                     fp_options));
+    onerec_params.shared_v_caches.emplace_back(
+        torch::zeros({shared_kv_tokens,
+                      std::max<int64_t>(local_kv_heads, 1),
+                      std::max<int64_t>(head_dim, 1)},
+                     fp_options));
   }
   prepare_unshared_kv_caches_for_input(inputs, onerec_params);
+  log_prepare_timing("cache_prepare");
 
   const int32_t beam_width =
       inputs.step_meta() != nullptr
@@ -772,7 +1549,8 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   onerec_params.beam_width_tensor = torch::tensor({beam_width}, int_options);
   onerec_params.current_round_tensor =
       torch::tensor({get_onerec_current_round(onerec_params)}, int_options);
-  if (processed_inputs.sampling_params.selected_token_idxes.defined()) {
+  if (enable_onerec_selected_token_cpu_check() &&
+      processed_inputs.sampling_params.selected_token_idxes.defined()) {
     onerec_params.debug_selected_token_idxes =
         processed_inputs.sampling_params.selected_token_idxes;
     auto selected_cpu = inputs.sampling_params.selected_token_idxes.to(
@@ -787,16 +1565,19 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   }
 
   if (!onerec_params.decoder_context_embedding.defined()) {
+    log_prepare_timing("metadata_prepare");
     return;
   }
 
   if (onerec_params.decoder_context_embedding.scalar_type() ==
       runtime_.worker.dtype()) {
+    log_prepare_timing("metadata_prepare");
     return;
   }
 
   onerec_params.decoder_context_embedding =
       onerec_params.decoder_context_embedding.to(runtime_.worker.dtype());
+  log_prepare_timing("metadata_prepare");
 }
 
 folly::SemiFuture<torch::Tensor>
@@ -843,6 +1624,18 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     const ForwardInput& input) {
   Timer timer;
   runtime_.worker.device_.set_device();
+  const bool trace_stage_timing = enable_onerec_xattention_stage_timing();
+  auto log_stage_timing =
+      [&](const char* stage_name, int32_t round, Timer& stage_timer) {
+        if (!trace_stage_timing) {
+          return;
+        }
+        runtime_.stream->synchronize();
+        LOG(INFO) << "OneRec xattention stage timing, stage=" << stage_name
+                  << ", round=" << round
+                  << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+        stage_timer.reset();
+      };
 
   ForwardInput mutable_input = input;
   CHECK(mutable_input.input_params.onerec_xattention_params() != nullptr)
@@ -864,12 +1657,18 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         round_params->decoder_context_embedding.defined();
     const bool has_encoder_context =
         round_params->has_encoder_output || has_decoder_context;
-    const bool skip_selected_token_cpu_check = util::get_bool_env(
-        "XLLM_DEBUG_ONEREC_SKIP_SELECTED_TOKEN_CPU_CHECK", false);
+    const bool selected_token_cpu_check =
+        enable_onerec_selected_token_cpu_check();
     const bool trace_post_decoder =
         util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false);
     const bool skip_lm_head =
         util::get_bool_env("XLLM_DEBUG_ONEREC_SKIP_LM_HEAD", false);
+    const bool trace_logits =
+        util::get_bool_env("XLLM_DEBUG_ONEREC_LOGITS_TRACE", false);
+    const bool logits_fp32_before_sampler = util::get_bool_env(
+        "XLLM_DEBUG_ONEREC_LOGITS_FP32_BEFORE_SAMPLER", false);
+    const int32_t stage_round = get_onerec_current_round(*round_params);
+    Timer stage_timer;
     auto log_post_decoder_stage =
         [&](const char* stage_name, const torch::Tensor& stage_hidden_states) {
           if (!trace_post_decoder) {
@@ -900,7 +1699,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 #if defined(USE_NPU)
       selected_token_idxes_for_logits =
           sampling_params.selected_token_idxes.to(torch::kInt64).contiguous();
-      if (!skip_selected_token_cpu_check) {
+      if (selected_token_cpu_check) {
         selected_token_idxes_before_cpu = selected_token_idxes_for_logits.to(
             torch::kCPU, /*non_blocking=*/false);
         if (selected_token_idxes_before_cpu.numel() > 0) {
@@ -923,7 +1722,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 
 #if defined(USE_NPU)
     auto validate_selected_token_idxes_stage = [&](const char* stage_name) {
-      if (skip_selected_token_cpu_check ||
+      if (!selected_token_cpu_check ||
           !sampling_params.selected_token_idxes.defined()) {
         return;
       }
@@ -1036,6 +1835,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       hidden_states = model_output.hidden_states;
     }
 
+    log_stage_timing("forward", stage_round, stage_timer);
     if (!hidden_states.defined()) {
       return std::nullopt;
     }
@@ -1045,7 +1845,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     if (sampling_params.selected_token_idxes.defined()) {
       torch::Tensor selected_token_idxes = selected_token_idxes_for_logits;
 #if defined(USE_NPU)
-      if (!skip_selected_token_cpu_check) {
+      if (selected_token_cpu_check) {
         auto selected_token_idxes_after_cpu =
             sampling_params.selected_token_idxes
                 .to(torch::kCPU,
@@ -1064,7 +1864,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         selected_token_idxes = selected_token_idxes.to(torch::kInt64);
       }
       selected_token_idxes = selected_token_idxes.contiguous();
-      if (!skip_selected_token_cpu_check) {
+      if (selected_token_cpu_check) {
         CHECK_EQ(selected_token_idxes_before_cpu.dim(), 1)
             << "OneRec xattention selected_token_idxes must be 1-D, got "
             << selected_token_idxes_before_cpu.dim();
@@ -1102,6 +1902,25 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         result.logits =
             runtime_.model->logits(hidden_states, selected_token_idxes);
       }
+      log_stage_timing("logits", stage_round, stage_timer);
+      if (trace_logits && result.logits.defined()) {
+        LOG(INFO) << "OneRec xattention logits trace, round="
+                  << get_onerec_current_round(*round_params) << ", rec_stage="
+                  << static_cast<int32_t>(round_params->rec_stage)
+                  << ", is_first_prefill=" << round_params->is_first_prefill
+                  << ", hidden_dtype=" << hidden_states.scalar_type()
+                  << ", hidden_shape=" << hidden_states.sizes()
+                  << ", selected_idxes_shape=" << selected_token_idxes.sizes()
+                  << ", logits_dtype=" << result.logits.scalar_type()
+                  << ", logits_shape=" << result.logits.sizes();
+      }
+      if (logits_fp32_before_sampler && result.logits.defined() &&
+          result.logits.scalar_type() != torch::kFloat32) {
+        result.logits = result.logits.to(torch::kFloat32);
+        LOG(INFO) << "OneRec xattention cast logits to float32 before "
+                     "sampler, round="
+                  << get_onerec_current_round(*round_params);
+      }
       log_post_decoder_stage("after_logits", hidden_states);
       torch::Tensor filter_mask;
       if (filter_mask_future.has_value()) {
@@ -1110,6 +1929,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       log_post_decoder_stage("before_sampler", hidden_states);
       result.sample_output =
           rec_sampler_->forward(result.logits, sampling_params, filter_mask);
+      log_stage_timing("sampler", stage_round, stage_timer);
       log_post_decoder_stage("after_sampler", hidden_states);
     }
     return result;
@@ -1120,11 +1940,11 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           int32_t batch_size,
           int32_t beam_width,
           const std::vector<int32_t>& decode_positions_vec,
-          const torch::Tensor& top_tokens,
-          const torch::Tensor& out_token_ids) {
+          const torch::Tensor& sequence_group,
+          const torch::Tensor& base_decoder_context_embedding) {
         auto& round_params =
             mutable_input.input_params.mutable_onerec_xattention_params();
-        const int32_t decode_step = std::max(round - 1, 0);
+        const int32_t decode_token_count = std::max(round, 1);
 
         round_params.rec_stage = OneRecModelInputParams::RecStage::DECODE;
         round_params.is_first_prefill = false;
@@ -1136,68 +1956,96 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           round_params.beam_width_tensor.fill_(beam_width);
         }
 
-        if (round == 1) {
-          if (top_tokens.defined()) {
-            mutable_input.token_ids = top_tokens.reshape({-1});
-          }
-        } else {
-          mutable_input.token_ids = out_token_ids.reshape({-1});
+        if (sequence_group.defined()) {
+          mutable_input.token_ids =
+              sequence_group.slice(/*dim=*/2, /*start=*/0, round)
+                  .contiguous()
+                  .reshape({-1});
         }
 
-        if (round_params.decoder_context_embedding.defined()) {
-          auto& decoder_context = round_params.decoder_context_embedding;
+        int32_t dense_context_len = 1;
+        if (base_decoder_context_embedding.defined()) {
+          torch::Tensor decoder_context = base_decoder_context_embedding;
           if (decoder_context.dim() == 2) {
             decoder_context = decoder_context.unsqueeze(0).unsqueeze(0);
           } else if (decoder_context.dim() == 3) {
             decoder_context = decoder_context.unsqueeze(1);
           }
+          CHECK_EQ(decoder_context.dim(), 4)
+              << "OneRec xattention decoder_context_embedding must be 4-D "
+                 "after normalization, got "
+              << decoder_context.sizes();
+
+          const int64_t base_context_len = decoder_context.size(2);
+          dense_context_len = static_cast<int32_t>(
+              base_context_len + std::max<int32_t>(decode_token_count - 1, 0));
+          // Current OneRec xattn decode uses the dense FAS graph rather than
+          // reading unshared self-cache, so later rounds must materialize the
+          // selected beam prefix in the dense decoder context explicitly.
           if (decoder_context.dim() == 4 && decoder_context.size(1) == 1 &&
               beam_width > 1) {
-            decoder_context = decoder_context
-                                  .expand({decoder_context.size(0),
-                                           beam_width,
-                                           decoder_context.size(2),
-                                           decoder_context.size(3)})
-                                  .contiguous();
+            decoder_context = decoder_context.expand({decoder_context.size(0),
+                                                      beam_width,
+                                                      decoder_context.size(2),
+                                                      decoder_context.size(3)});
           }
+          if (dense_context_len > decoder_context.size(2)) {
+            auto expanded_context = torch::empty({decoder_context.size(0),
+                                                  decoder_context.size(1),
+                                                  dense_context_len,
+                                                  decoder_context.size(3)},
+                                                 decoder_context.options());
+            expanded_context
+                .narrow(/*dim=*/2,
+                        /*start=*/0,
+                        decoder_context.size(2))
+                .copy_(decoder_context);
+            decoder_context = std::move(expanded_context);
+          }
+          round_params.decoder_context_embedding = decoder_context;
         }
         round_params.bs = batch_size;
         round_params.group_width = beam_width;
+        round_params.seq_len = decode_token_count;
 
         std::vector<int32_t> positions_host;
-        positions_host.reserve(static_cast<size_t>(batch_size * beam_width));
-        std::vector<int32_t> kv_seq_lens_host;
-        kv_seq_lens_host.reserve(static_cast<size_t>(batch_size * beam_width));
+        positions_host.reserve(
+            static_cast<size_t>(batch_size * beam_width * decode_token_count));
+        std::vector<int32_t> seq_lens_host(
+            static_cast<size_t>(batch_size * beam_width), dense_context_len);
+        std::vector<int32_t> selected_token_idxes;
+        selected_token_idxes.reserve(
+            static_cast<size_t>(batch_size * beam_width));
         for (int32_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-          const int32_t decode_position =
-              decode_positions_vec.at(static_cast<size_t>(seq_idx)) +
-              decode_step;
-          const int32_t kv_seq_len = std::max(1, decode_position);
           for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
-            positions_host.push_back(decode_position);
-            kv_seq_lens_host.push_back(kv_seq_len);
+            for (int32_t token_idx = 0; token_idx < decode_token_count;
+                 ++token_idx) {
+              positions_host.push_back(
+                  decode_positions_vec.at(static_cast<size_t>(seq_idx)) +
+                  token_idx);
+            }
+            selected_token_idxes.push_back((seq_idx * beam_width + beam_idx) *
+                                               dense_context_len +
+                                           (dense_context_len - 1));
           }
         }
-        std::vector<int32_t> q_seq_lens_host(batch_size * beam_width, 1);
         auto int_options = torch::TensorOptions()
                                .dtype(torch::kInt32)
                                .device(runtime_.worker.device());
         mutable_input.positions = torch::tensor(positions_host, int_options);
+        mutable_input.decoder_sampling_params.selected_token_idxes =
+            torch::tensor(selected_token_idxes, int_options);
         mutable_input.input_params.batch_forward_type =
             BatchForwardType::DECODE;
         mutable_input.input_params.num_sequences = batch_size * beam_width;
-        mutable_input.input_params.kv_max_seq_len =
-            kv_seq_lens_host.empty()
-                ? 0
-                : *std::max_element(kv_seq_lens_host.begin(),
-                                    kv_seq_lens_host.end());
-        mutable_input.input_params.q_max_seq_len = 1;
-        mutable_input.input_params.kv_seq_lens_vec = kv_seq_lens_host;
-        mutable_input.input_params.q_seq_lens_vec = q_seq_lens_host;
+        mutable_input.input_params.kv_max_seq_len = dense_context_len;
+        mutable_input.input_params.q_max_seq_len = dense_context_len;
+        mutable_input.input_params.kv_seq_lens_vec = seq_lens_host;
+        mutable_input.input_params.q_seq_lens_vec = seq_lens_host;
         mutable_input.input_params.kv_seq_lens =
-            torch::tensor(kv_seq_lens_host, int_options);
+            torch::tensor(seq_lens_host, int_options);
         mutable_input.input_params.q_seq_lens =
-            torch::tensor(q_seq_lens_host, int_options);
+            torch::tensor(seq_lens_host, int_options);
         mutable_input.input_params.input_embedding = torch::Tensor();
         mutable_input.input_params.attn_metadata = nullptr;
       };
@@ -1288,15 +2136,26 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
   ForwardOutput output;
   torch::Tensor top_tokens;
   torch::Tensor top_logprobs;
+  torch::Tensor base_decoder_context_embedding;
+  if (const auto* onerec_params =
+          mutable_input.input_params.onerec_xattention_params()) {
+    base_decoder_context_embedding =
+        onerec_params->decoder_context_embedding.defined()
+            ? onerec_params->decoder_context_embedding
+            : torch::Tensor();
+  }
 
   for (int32_t round = 0; round < total_rounds; ++round) {
     if (round > 0) {
+      Timer prepare_round_timer;
       prepare_decode_round_input(round,
                                  batch_size,
                                  beam_width,
                                  step_meta->decode_positions_vec,
-                                 top_tokens,
-                                 beam_tensors.out_token_ids);
+                                 beam_tensors.sequence_group,
+                                 base_decoder_context_embedding);
+      log_stage_timing(
+          "prepare_decode_round_input", round, prepare_round_timer);
     }
 
     const auto& sampling_params = round == 0
@@ -1309,8 +2168,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 
     if (!result->sample_output.top_tokens.defined() ||
         !result->sample_output.top_logprobs.defined()) {
-      output.logits = result->logits;
-      output.sample_output = result->sample_output;
       output.do_sample = result->sampling_params.do_sample;
       output.logprobs = result->sampling_params.logprobs;
       output.max_top_logprobs = result->sampling_params.max_top_logprobs;
@@ -1322,10 +2179,29 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       LOG(INFO) << "OneRec xattention post-decoder stage=before_beam_search"
                 << ", round=" << round;
     }
+    Timer beam_timer;
     if (round == 0) {
       top_tokens =
           result->sample_output.top_tokens.to(torch::kInt32).reshape({-1, 1});
       top_logprobs = result->sample_output.top_logprobs.reshape({-1, 1});
+      debug_dump_onerec_beam_watch_candidates(round,
+                                              batch_size,
+                                              beam_width,
+                                              total_rounds,
+                                              beam_tensors.acc_logprob,
+                                              top_tokens,
+                                              top_logprobs,
+                                              result->logits,
+                                              beam_tensors.sequence_group);
+      debug_dump_onerec_beam_candidate_boundary(round,
+                                                batch_size,
+                                                beam_width,
+                                                total_rounds,
+                                                beam_tensors.acc_logprob,
+                                                top_tokens,
+                                                top_logprobs,
+                                                result->logits,
+                                                beam_tensors.sequence_group);
       beam_tensors.out_token_ids.copy_(top_tokens);
       beam_tensors.out_log_probs.copy_(top_logprobs);
       beam_tensors.out_seqgroup.select(/*dim=*/2, /*index=*/0)
@@ -1333,9 +2209,27 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     } else {
       top_tokens = result->sample_output.top_tokens.to(torch::kInt32);
       top_logprobs = result->sample_output.top_logprobs;
+      debug_dump_onerec_beam_watch_candidates(round,
+                                              batch_size,
+                                              beam_width,
+                                              total_rounds,
+                                              beam_tensors.acc_logprob,
+                                              top_tokens,
+                                              top_logprobs,
+                                              result->logits,
+                                              beam_tensors.sequence_group);
+      debug_dump_onerec_beam_candidate_boundary(round,
+                                                batch_size,
+                                                beam_width,
+                                                total_rounds,
+                                                beam_tensors.acc_logprob,
+                                                top_tokens,
+                                                top_logprobs,
+                                                result->logits,
+                                                beam_tensors.sequence_group);
       xllm::kernel::npu::beam_search_rec(
           /*logprobs=*/beam_tensors.acc_logprob,
-          /*top_tokens=*/top_tokens.to(torch::kInt32),
+          /*top_tokens=*/top_tokens,
           /*top_logprobs=*/top_logprobs,
           /*sequence_group=*/beam_tensors.sequence_group,
           /*current_step=*/static_cast<int64_t>(round),
@@ -1345,7 +2239,22 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           /*out_beam_count_prefix_sums=*/
           beam_tensors.out_beam_count_prefix_sums,
           /*out_sequence=*/beam_tensors.out_seqgroup);
+      debug_check_onerec_beam_search_cpu_reference(
+          round,
+          batch_size,
+          beam_width,
+          total_rounds,
+          beam_tensors.acc_logprob,
+          top_tokens,
+          top_logprobs,
+          beam_tensors.sequence_group,
+          beam_tensors.out_token_ids,
+          beam_tensors.out_token_index,
+          beam_tensors.out_log_probs,
+          beam_tensors.out_beam_count_prefix_sums,
+          beam_tensors.out_seqgroup);
     }
+    log_stage_timing("beam_search", round, beam_timer);
     if (util::get_bool_env("XLLM_DEBUG_ONEREC_POST_DECODER_TRACE", false)) {
       LOG(INFO) << "OneRec xattention post-decoder stage=after_beam_search"
                 << ", round=" << round;
@@ -1368,6 +2277,14 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 #endif
     std::swap(beam_tensors.sequence_group, beam_tensors.out_seqgroup);
     std::swap(beam_tensors.acc_logprob, beam_tensors.out_log_probs);
+#if defined(USE_NPU)
+    debug_dump_onerec_beam_round(round,
+                                 batch_size,
+                                 beam_width,
+                                 total_rounds,
+                                 beam_tensors.sequence_group,
+                                 beam_tensors.acc_logprob);
+#endif
 
     if (round > 0 && round < total_rounds - 1) {
       auto& round_params =
@@ -1388,8 +2305,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
             << "OneRec xattention post-decoder stage=before_final_output_assign"
             << ", round=" << round;
       }
-      output.logits = result->logits;
-      output.sample_output = result->sample_output;
       output.do_sample = result->sampling_params.do_sample;
       output.logprobs = result->sampling_params.logprobs;
       output.max_top_logprobs = result->sampling_params.max_top_logprobs;
