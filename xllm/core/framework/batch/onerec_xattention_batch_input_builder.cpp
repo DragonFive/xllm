@@ -136,8 +136,8 @@ ForwardInput OneRecXAttentionBatchInputBuilder::build_rec_forward_input(
   step_meta.decode_positions_vec = std::move(decode_positions_vec);
 
   if (args_ != nullptr) {
-    const int64_t n_kv_heads =
-        args_->decoder_n_kv_heads().value_or(args_->decoder_n_heads());
+    const int64_t n_kv_heads = args_->decoder_n_kv_heads().value_or(
+        args_->n_kv_heads().value_or(args_->decoder_n_heads()));
     const int64_t head_dim = args_->decoder_head_dim();
     step_meta.full_kv_shape = {
         FLAGS_max_tokens_per_batch + FLAGS_max_seqs_per_batch * beam_width *

@@ -1307,8 +1307,8 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::
   const auto& args = runtime_.context->get_model_args();
   const auto& parallel_args = runtime_.context->get_parallel_args();
   const int32_t num_layers = static_cast<int32_t>(args.n_layers());
-  const int64_t decoder_kv_heads =
-      args.decoder_n_kv_heads().value_or(args.decoder_n_heads());
+  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
+      args.n_kv_heads().value_or(args.decoder_n_heads()));
   const int64_t local_kv_heads =
       decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
   const int64_t head_dim = args.decoder_head_dim();
@@ -1340,6 +1340,18 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::
     prepare_unshared_kv_caches_for_input(
         const ForwardInput& inputs,
         OneRecXAttentionParams& onerec_params) {
+  const int32_t request_beam_width =
+      inputs.step_meta() != nullptr
+          ? std::max<int32_t>(1, inputs.step_meta()->beam_width)
+          : std::max<int32_t>(1,
+                              onerec_params.group_width > 0
+                                  ? onerec_params.group_width
+                                  : runtime_.worker.options_.beam_width());
+  if (request_beam_width > beam_width_ || cached_unshared_k_caches_.empty() ||
+      cached_unshared_v_caches_.empty()) {
+    beam_width_ = request_beam_width;
+    allocate_unshared_kv_caches();
+  }
   if (cached_unshared_k_caches_.empty() || cached_unshared_v_caches_.empty()) {
     return;
   }
@@ -1354,10 +1366,12 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::
   onerec_params.unshared_v_caches.reserve(cached_unshared_v_caches_.size());
   for (size_t layer_id = 0; layer_id < cached_unshared_k_caches_.size();
        ++layer_id) {
-    auto unshared_k =
-        cached_unshared_k_caches_[layer_id].slice(0, 0, batch_size);
-    auto unshared_v =
-        cached_unshared_v_caches_[layer_id].slice(0, 0, batch_size);
+    auto unshared_k = cached_unshared_k_caches_[layer_id]
+                          .slice(0, 0, batch_size)
+                          .slice(1, 0, request_beam_width);
+    auto unshared_v = cached_unshared_v_caches_[layer_id]
+                          .slice(0, 0, batch_size)
+                          .slice(1, 0, request_beam_width);
     unshared_k.zero_();
     unshared_v.zero_();
     onerec_params.unshared_k_caches.push_back(std::move(unshared_k));
@@ -1377,11 +1391,6 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::execute_cache_select(
       onerec_params.unshared_v_caches.empty()) {
     return;
   }
-  LOG_FIRST_N(INFO, 1)
-      << "OneRec xattention skip cache_select because the current dense FAS "
-         "decoder graph does not consume unshared KV cache.";
-  return;
-
 #if defined(USE_NPU)
   auto device = runtime_.worker.device();
   auto int32_options =
@@ -1492,8 +1501,8 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
       processed_inputs.input_params.mutable_onerec_xattention_params();
   const auto& args = runtime_.context->get_model_args();
   const auto& parallel_args = runtime_.context->get_parallel_args();
-  const int64_t decoder_kv_heads =
-      args.decoder_n_kv_heads().value_or(args.decoder_n_heads());
+  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
+      args.n_kv_heads().value_or(args.decoder_n_heads()));
   const int64_t local_kv_heads =
       decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
   const int64_t head_dim = args.decoder_head_dim();
@@ -1537,6 +1546,11 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
                      fp_options));
   }
   prepare_unshared_kv_caches_for_input(inputs, onerec_params);
+  processed_inputs.input_params.block_tables =
+      torch::arange(batch_size,
+                    torch::TensorOptions()
+                        .dtype(torch::kInt32)
+                        .device(runtime_.worker.device()));
   log_prepare_timing("cache_prepare");
 
   const int32_t beam_width =
@@ -1940,11 +1954,10 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           int32_t batch_size,
           int32_t beam_width,
           const std::vector<int32_t>& decode_positions_vec,
-          const torch::Tensor& sequence_group,
-          const torch::Tensor& base_decoder_context_embedding) {
+          const torch::Tensor& sequence_group) {
         auto& round_params =
             mutable_input.input_params.mutable_onerec_xattention_params();
-        const int32_t decode_token_count = std::max(round, 1);
+        const int32_t decode_step = std::max(round - 1, 0);
 
         round_params.rec_stage = OneRecModelInputParams::RecStage::DECODE;
         round_params.is_first_prefill = false;
@@ -1958,75 +1971,27 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 
         if (sequence_group.defined()) {
           mutable_input.token_ids =
-              sequence_group.slice(/*dim=*/2, /*start=*/0, round)
+              sequence_group.select(/*dim=*/2, /*index=*/decode_step)
                   .contiguous()
                   .reshape({-1});
         }
 
-        int32_t dense_context_len = 1;
-        if (base_decoder_context_embedding.defined()) {
-          torch::Tensor decoder_context = base_decoder_context_embedding;
-          if (decoder_context.dim() == 2) {
-            decoder_context = decoder_context.unsqueeze(0).unsqueeze(0);
-          } else if (decoder_context.dim() == 3) {
-            decoder_context = decoder_context.unsqueeze(1);
-          }
-          CHECK_EQ(decoder_context.dim(), 4)
-              << "OneRec xattention decoder_context_embedding must be 4-D "
-                 "after normalization, got "
-              << decoder_context.sizes();
-
-          const int64_t base_context_len = decoder_context.size(2);
-          dense_context_len = static_cast<int32_t>(
-              base_context_len + std::max<int32_t>(decode_token_count - 1, 0));
-          // Current OneRec xattn decode uses the dense FAS graph rather than
-          // reading unshared self-cache, so later rounds must materialize the
-          // selected beam prefix in the dense decoder context explicitly.
-          if (decoder_context.dim() == 4 && decoder_context.size(1) == 1 &&
-              beam_width > 1) {
-            decoder_context = decoder_context.expand({decoder_context.size(0),
-                                                      beam_width,
-                                                      decoder_context.size(2),
-                                                      decoder_context.size(3)});
-          }
-          if (dense_context_len > decoder_context.size(2)) {
-            auto expanded_context = torch::empty({decoder_context.size(0),
-                                                  decoder_context.size(1),
-                                                  dense_context_len,
-                                                  decoder_context.size(3)},
-                                                 decoder_context.options());
-            expanded_context
-                .narrow(/*dim=*/2,
-                        /*start=*/0,
-                        decoder_context.size(2))
-                .copy_(decoder_context);
-            decoder_context = std::move(expanded_context);
-          }
-          round_params.decoder_context_embedding = decoder_context;
-        }
+        round_params.decoder_context_embedding = torch::Tensor();
         round_params.bs = batch_size;
         round_params.group_width = beam_width;
-        round_params.seq_len = decode_token_count;
+        round_params.seq_len = 1;
 
         std::vector<int32_t> positions_host;
-        positions_host.reserve(
-            static_cast<size_t>(batch_size * beam_width * decode_token_count));
-        std::vector<int32_t> seq_lens_host(
-            static_cast<size_t>(batch_size * beam_width), dense_context_len);
+        positions_host.reserve(static_cast<size_t>(batch_size * beam_width));
         std::vector<int32_t> selected_token_idxes;
         selected_token_idxes.reserve(
             static_cast<size_t>(batch_size * beam_width));
         for (int32_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
           for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
-            for (int32_t token_idx = 0; token_idx < decode_token_count;
-                 ++token_idx) {
-              positions_host.push_back(
-                  decode_positions_vec.at(static_cast<size_t>(seq_idx)) +
-                  token_idx);
-            }
-            selected_token_idxes.push_back((seq_idx * beam_width + beam_idx) *
-                                               dense_context_len +
-                                           (dense_context_len - 1));
+            positions_host.push_back(
+                decode_positions_vec.at(static_cast<size_t>(seq_idx)) +
+                decode_step);
+            selected_token_idxes.push_back(seq_idx * beam_width + beam_idx);
           }
         }
         auto int_options = torch::TensorOptions()
@@ -2038,14 +2003,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         mutable_input.input_params.batch_forward_type =
             BatchForwardType::DECODE;
         mutable_input.input_params.num_sequences = batch_size * beam_width;
-        mutable_input.input_params.kv_max_seq_len = dense_context_len;
-        mutable_input.input_params.q_max_seq_len = dense_context_len;
-        mutable_input.input_params.kv_seq_lens_vec = seq_lens_host;
-        mutable_input.input_params.q_seq_lens_vec = seq_lens_host;
-        mutable_input.input_params.kv_seq_lens =
-            torch::tensor(seq_lens_host, int_options);
-        mutable_input.input_params.q_seq_lens =
-            torch::tensor(seq_lens_host, int_options);
         mutable_input.input_params.input_embedding = torch::Tensor();
         mutable_input.input_params.attn_metadata = nullptr;
       };
@@ -2136,14 +2093,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
   ForwardOutput output;
   torch::Tensor top_tokens;
   torch::Tensor top_logprobs;
-  torch::Tensor base_decoder_context_embedding;
-  if (const auto* onerec_params =
-          mutable_input.input_params.onerec_xattention_params()) {
-    base_decoder_context_embedding =
-        onerec_params->decoder_context_embedding.defined()
-            ? onerec_params->decoder_context_embedding
-            : torch::Tensor();
-  }
 
   for (int32_t round = 0; round < total_rounds; ++round) {
     if (round > 0) {
@@ -2152,8 +2101,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                  batch_size,
                                  beam_width,
                                  step_meta->decode_positions_vec,
-                                 beam_tensors.sequence_group,
-                                 base_decoder_context_embedding);
+                                 beam_tensors.sequence_group);
       log_stage_timing(
           "prepare_decode_round_input", round, prepare_round_timer);
     }
