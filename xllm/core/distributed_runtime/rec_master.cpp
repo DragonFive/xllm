@@ -425,12 +425,14 @@ RecMaster::LlmRecWithMmDataMasterPipeline::generate_request(
 }
 
 // ============================================================
-// OneRecMasterPipeline implementation (OneRec with input_tensors)
+// OneRecPrefillOnlyMasterPipeline implementation (OneRec with input_tensors)
 // ============================================================
-RecMaster::OneRecMasterPipeline::OneRecMasterPipeline(RecMaster& master)
+RecMaster::OneRecPrefillOnlyMasterPipeline::OneRecPrefillOnlyMasterPipeline(
+    RecMaster& master)
     : RecMasterPipeline(master) {}
 
-std::shared_ptr<Request> RecMaster::OneRecMasterPipeline::generate_request(
+std::shared_ptr<Request>
+RecMaster::OneRecPrefillOnlyMasterPipeline::generate_request(
     std::string prompt,
     std::optional<std::vector<int>> prompt_tokens,
     std::optional<std::vector<proto::InferInputTensor>> input_tensors,
@@ -502,7 +504,7 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
     case RecPipelineType::kLlmRecWithMmData:
       return std::make_unique<LlmRecWithMmDataMasterPipeline>(master);
     case RecPipelineType::kOneRecDefault:
-      return std::make_unique<OneRecMasterPipeline>(master);
+      return std::make_unique<OneRecPrefillOnlyMasterPipeline>(master);
     case RecPipelineType::kOneRecXAttentionPipeline:
       return std::make_unique<OneRecXAttentionMasterPipeline>(master);
     default:

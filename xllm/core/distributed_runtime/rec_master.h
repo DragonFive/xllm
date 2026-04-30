@@ -120,10 +120,10 @@ class RecMaster : public Master {
         OutputCallback callback) override;
   };
 
-  // OneRecMasterPipeline - OneRec (prompt-based with input_tensors)
-  class OneRecMasterPipeline : public RecMasterPipeline {
+  // OneRecPrefillOnlyMasterPipeline - legacy OneRec without stop checker.
+  class OneRecPrefillOnlyMasterPipeline final : public RecMasterPipeline {
    public:
-    explicit OneRecMasterPipeline(RecMaster& master);
+    explicit OneRecPrefillOnlyMasterPipeline(RecMaster& master);
     std::shared_ptr<Request> generate_request(
         std::string prompt,
         std::optional<std::vector<int>> prompt_tokens,
@@ -132,8 +132,8 @@ class RecMaster : public Master {
         OutputCallback callback) override;
   };
 
-  // OneRecXAttentionMasterPipeline - OneRec xattention (prompt-based with
-  // input_tensors, isolated from legacy prefill-only path)
+  // OneRecXAttentionMasterPipeline - OneRec xattention with stop checker for
+  // device-side multi-round decode.
   class OneRecXAttentionMasterPipeline final : public RecMasterPipeline {
    public:
     explicit OneRecXAttentionMasterPipeline(RecMaster& master)

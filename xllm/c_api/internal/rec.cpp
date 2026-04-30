@@ -41,7 +41,7 @@ const char* get_rec_pipeline_name(xllm::RecPipelineType pipeline_type) {
     case xllm::RecPipelineType::kLlmRecMultiRoundPipeline:
       return "RecMultiRoundEnginePipeline";
     case xllm::RecPipelineType::kOneRecDefault:
-      return "OneRecEnginePipeline";
+      return "OneRecPrefillOnlyEnginePipeline";
     case xllm::RecPipelineType::kOneRecXAttentionPipeline:
       return "OneRecXAttentionEnginePipeline";
     default:

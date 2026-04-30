@@ -83,7 +83,7 @@ ForwardInput OneRecXAttentionBatchInputBuilder::build_rec_forward_input(
       std::vector<int32_t> block_ids;
       block_ids.reserve(blocks.size());
       for (const auto& block : blocks) {
-        block_ids.push_back(block.id());
+        block_ids.emplace_back(block.id());
       }
       block_tables_vec.emplace_back(std::move(block_ids));
       if (total_seq_len > n_kv_cache_tokens) {
@@ -98,7 +98,7 @@ ForwardInput OneRecXAttentionBatchInputBuilder::build_rec_forward_input(
         continue;
       }
       beam_width = std::max<int32_t>(beam_width, sampling_param->beam_width);
-      decode_positions_vec.push_back(
+      decode_positions_vec.emplace_back(
           get_onerec_xattention_decode_position(*sequence_ptr));
       const int32_t sel_start =
           static_cast<int32_t>(decode_selected_token_idxes.size());
@@ -108,12 +108,12 @@ ForwardInput OneRecXAttentionBatchInputBuilder::build_rec_forward_input(
         const int32_t selected_row = decode_hidden_row_offset +
                                      beam_idx * decode_hidden_seq_len +
                                      (decode_hidden_seq_len - 1);
-        decode_sampling_params.push_back(sampling_param);
-        decode_selected_token_idxes.push_back(selected_row);
-        decode_sample_idxes.push_back(idx);
+        decode_sampling_params.emplace_back(sampling_param);
+        decode_selected_token_idxes.emplace_back(selected_row);
+        decode_sample_idxes.emplace_back(idx);
         decode_unique_token_ids_vec.emplace_back();
         decode_unique_token_counts_vec.emplace_back();
-        decode_unique_token_lens_vec.push_back(0);
+        decode_unique_token_lens_vec.emplace_back(0);
       }
       decode_hidden_row_offset += beam_width * decode_hidden_seq_len;
     }

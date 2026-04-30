@@ -69,6 +69,7 @@ class RecEngine : public Engine {
     // KV Cache
     virtual int64_t estimate_min_available_memory() = 0;
     virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) = 0;
+    virtual int64_t minimal_kv_cache_blocks() const { return 0; }
 
     // Execution
     virtual ForwardOutput step(std::vector<Batch>& batches) = 0;
@@ -105,17 +106,18 @@ class RecEngine : public Engine {
   };
 
   // ============================================================
-  // OneRecEnginePipeline: kOneRec via local Worker
+  // OneRecPrefillOnlyEnginePipeline: legacy kOneRec via local Worker
   // ============================================================
-  class OneRecEnginePipeline : public RecEnginePipeline {
+  class OneRecPrefillOnlyEnginePipeline final : public RecEnginePipeline {
    public:
-    explicit OneRecEnginePipeline(RecEngine& engine);
+    explicit OneRecPrefillOnlyEnginePipeline(RecEngine& engine);
 
     void setup_workers() override;
     void process_group_test() override;
     bool init_model_workers(const std::string& model_path) override;
     int64_t estimate_min_available_memory() override;
     bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
+    int64_t minimal_kv_cache_blocks() const override;
     ForwardOutput step(std::vector<Batch>& batches) override;
     std::vector<int64_t> get_active_activation_memory() const override;
     size_t num_workers() const override;
@@ -137,6 +139,7 @@ class RecEngine : public Engine {
     bool init_model_workers(const std::string& model_path) override;
     int64_t estimate_min_available_memory() override;
     bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
+    int64_t minimal_kv_cache_blocks() const override;
     ForwardOutput step(std::vector<Batch>& batches) override;
     std::vector<int64_t> get_active_activation_memory() const override;
     size_t num_workers() const override;
@@ -199,7 +202,7 @@ class RecEngine : public Engine {
   int32_t dp_size_ = 1;
   int32_t dp_local_tp_size_ = 1;
 
-  // OneRec specific (managed by OneRecEnginePipeline)
+  // OneRec specific (managed by prefill-only/xattention local pipelines)
   std::vector<std::unique_ptr<ProcessGroup>> process_groups_;
   std::vector<std::unique_ptr<Worker>> workers_;
 

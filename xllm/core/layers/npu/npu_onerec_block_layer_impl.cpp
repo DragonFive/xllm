@@ -756,7 +756,9 @@ void NpuOneRecBlockLayerImpl::param_from_args(
       is_decoder_ ? args.decoder_head_dim() : args.head_dim();
   param.numAttentionHeadsPerRank = args_n_heads / param.worldSize;
   param.hiddenSizePerAttentionHead = args_head_dim;
-  param.useAttentionScaling = args.use_attention_scaling();
+  // Existing OneRec configs use moe_use_shared_experts to identify the path
+  // that needs attention scaling; do not add a generic ModelArgs field for it.
+  param.useAttentionScaling = args.moe_use_shared_experts();
 
   const auto general_kv_heads = args.n_kv_heads();
   const auto decoder_kv_heads = args.decoder_n_kv_heads().has_value()
@@ -1693,8 +1695,8 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
         onerec_params->cross_attn_kv_cu_seq_lens.defined()) {
       node.variantPack.inTensors.at(idx) = atb_speed::Utils::AtTensor2Tensor(
           onerec_params->cross_attn_kv_cu_seq_lens);
-      node.variantPack.inTensors.at(idx).hostData =
-          const_cast<int*>(onerec_params->cross_attn_kv_cu_seq_lens_vec.data());
+      node.variantPack.inTensors.at(idx).hostData = const_cast<int32_t*>(
+          onerec_params->cross_attn_kv_cu_seq_lens_vec.data());
     } else {
       node.variantPack.inTensors.at(idx) = placeholder_;
       node.variantPack.inTensors.at(idx).hostData = placeholder_vec_.data();
@@ -1858,12 +1860,13 @@ void NpuOneRecBlockLayerImpl::process_expert_weights(
                    << ": " << fused_weight.sizes();
       return;
     }
-    auto reshaped = fused_weight.contiguous().view(
+    torch::Tensor reshaped = fused_weight.contiguous().view(
         {num_experts_per_partition_, fused_weight.size(0), -1});
     CHECK_EQ(reshaped.size(2) % 2, 0)
         << "OneRec fused expert weight1 last dim must be even for " << name
         << ", got shape " << fused_weight.sizes();
-    auto gate_up_chunks = reshaped.chunk(2, -1);
+    std::vector<torch::Tensor> gate_up_chunks =
+        reshaped.chunk(/*chunks=*/2, /*dim=*/-1);
     for (int32_t i = 0; i < num_experts_per_partition_; ++i) {
       experts_weights_["gate_proj.weight"][i] =
           gate_up_chunks[0][i].transpose(0, 1).contiguous();
@@ -2019,7 +2022,7 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
   valid.reserve(experts.size());
   for (auto& t : experts) {
     if (t.defined()) {
-      valid.push_back(t.to(device_));
+      valid.emplace_back(t.to(device_));
     }
   }
   if (valid.empty()) {
@@ -2080,40 +2083,49 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
         experts_weights_.count("up_proj.weight_offset") > 0) {
       std::vector<torch::Tensor> gate_offset_1d;
       std::vector<torch::Tensor> up_offset_1d;
+      gate_offset_1d.reserve(
+          experts_weights_["gate_proj.weight_offset"].size());
+      up_offset_1d.reserve(experts_weights_["up_proj.weight_offset"].size());
       for (const auto& tensor : experts_weights_["gate_proj.weight_offset"]) {
         if (tensor.defined()) {
-          gate_offset_1d.push_back(tensor);
+          gate_offset_1d.emplace_back(tensor);
         }
       }
       for (const auto& tensor : experts_weights_["up_proj.weight_offset"]) {
         if (tensor.defined()) {
-          up_offset_1d.push_back(tensor);
+          up_offset_1d.emplace_back(tensor);
         }
       }
       if (!gate_offset_1d.empty() &&
           gate_offset_1d.size() == up_offset_1d.size()) {
         at_weight_tensors_[kInMlpGateUpOffsetExpert] =
-            merge_experts_weights(gate_offset_1d, up_offset_1d, false);
+            merge_experts_weights(gate_offset_1d,
+                                  up_offset_1d,
+                                  /*transpose=*/false);
       }
     }
     if (experts_weights_.count("gate_proj.weight_scale") > 0 &&
         experts_weights_.count("up_proj.weight_scale") > 0) {
       std::vector<torch::Tensor> gate_scale_1d;
       std::vector<torch::Tensor> up_scale_1d;
+      gate_scale_1d.reserve(experts_weights_["gate_proj.weight_scale"].size());
+      up_scale_1d.reserve(experts_weights_["up_proj.weight_scale"].size());
       for (const auto& tensor : experts_weights_["gate_proj.weight_scale"]) {
         if (tensor.defined()) {
-          gate_scale_1d.push_back(tensor);
+          gate_scale_1d.emplace_back(tensor);
         }
       }
       for (const auto& tensor : experts_weights_["up_proj.weight_scale"]) {
         if (tensor.defined()) {
-          up_scale_1d.push_back(tensor);
+          up_scale_1d.emplace_back(tensor);
         }
       }
       if (!gate_scale_1d.empty() &&
           gate_scale_1d.size() == up_scale_1d.size()) {
         at_weight_tensors_[kInMlpGateUpScaleExpert] =
-            merge_experts_weights(gate_scale_1d, up_scale_1d, false);
+            merge_experts_weights(gate_scale_1d,
+                                  up_scale_1d,
+                                  /*transpose=*/false);
       }
     }
   }
@@ -2127,26 +2139,29 @@ void NpuOneRecBlockLayerImpl::merge_experts_weights() {
   if (quantize_type_ == "w8a8_dynamic") {
     if (experts_weights_.count("down_proj.weight_offset") > 0) {
       std::vector<torch::Tensor> down_offset_1d;
+      down_offset_1d.reserve(
+          experts_weights_["down_proj.weight_offset"].size());
       for (const auto& tensor : experts_weights_["down_proj.weight_offset"]) {
         if (tensor.defined()) {
-          down_offset_1d.push_back(tensor);
+          down_offset_1d.emplace_back(tensor);
         }
       }
       if (!down_offset_1d.empty()) {
         at_weight_tensors_[kInMlpDownOffsetExpert] =
-            merge_experts_weights(down_offset_1d, false);
+            merge_experts_weights(down_offset_1d, /*transpose=*/false);
       }
     }
     if (experts_weights_.count("down_proj.weight_scale") > 0) {
       std::vector<torch::Tensor> down_scale_1d;
+      down_scale_1d.reserve(experts_weights_["down_proj.weight_scale"].size());
       for (const auto& tensor : experts_weights_["down_proj.weight_scale"]) {
         if (tensor.defined()) {
-          down_scale_1d.push_back(tensor);
+          down_scale_1d.emplace_back(tensor);
         }
       }
       if (!down_scale_1d.empty()) {
         at_weight_tensors_[kInMlpDownScaleExpert] =
-            merge_experts_weights(down_scale_1d, false);
+            merge_experts_weights(down_scale_1d, /*transpose=*/false);
       }
     }
   }

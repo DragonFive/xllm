@@ -174,16 +174,16 @@ struct OneRecXAttentionParams : public OneRecModelInputParams {
     result.shared_k_caches.reserve(shared_k_caches.size());
     result.shared_v_caches.reserve(shared_v_caches.size());
     for (const auto& t : unshared_k_caches) {
-      result.unshared_k_caches.push_back(safe_to(t, device));
+      result.unshared_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : unshared_v_caches) {
-      result.unshared_v_caches.push_back(safe_to(t, device));
+      result.unshared_v_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : shared_k_caches) {
-      result.shared_k_caches.push_back(safe_to(t, device));
+      result.shared_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : shared_v_caches) {
-      result.shared_v_caches.push_back(safe_to(t, device));
+      result.shared_v_caches.emplace_back(safe_to(t, device));
     }
     if (beam_width_tensor.defined()) {
       result.beam_width_tensor = safe_to(beam_width_tensor, device, true);
@@ -251,10 +251,10 @@ struct LlmRecMultiRoundParams {
     result.full_k_caches.reserve(full_k_caches.size());
     result.full_v_caches.reserve(full_v_caches.size());
     for (const auto& t : full_k_caches) {
-      result.full_k_caches.push_back(safe_to(t, device));
+      result.full_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : full_v_caches) {
-      result.full_v_caches.push_back(safe_to(t, device));
+      result.full_v_caches.emplace_back(safe_to(t, device));
     }
     result.unshared_k_caches.clear();
     result.unshared_v_caches.clear();
@@ -265,16 +265,16 @@ struct LlmRecMultiRoundParams {
     result.shared_k_caches.reserve(shared_k_caches.size());
     result.shared_v_caches.reserve(shared_v_caches.size());
     for (const auto& t : unshared_k_caches) {
-      result.unshared_k_caches.push_back(safe_to(t, device));
+      result.unshared_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : unshared_v_caches) {
-      result.unshared_v_caches.push_back(safe_to(t, device));
+      result.unshared_v_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : shared_k_caches) {
-      result.shared_k_caches.push_back(safe_to(t, device));
+      result.shared_k_caches.emplace_back(safe_to(t, device));
     }
     for (const auto& t : shared_v_caches) {
-      result.shared_v_caches.push_back(safe_to(t, device));
+      result.shared_v_caches.emplace_back(safe_to(t, device));
     }
 
     if (beam_width_tensor.defined()) {
@@ -317,7 +317,7 @@ struct LlmRecMultiRoundParams {
     result.decode_positions_tensor_list.reserve(
         decode_positions_tensor_list.size());
     for (const auto& t : decode_positions_tensor_list) {
-      result.decode_positions_tensor_list.push_back(safe_to(t, device));
+      result.decode_positions_tensor_list.emplace_back(safe_to(t, device));
     }
 
     return result;

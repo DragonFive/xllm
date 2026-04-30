@@ -246,7 +246,6 @@ REGISTER_MODEL_ARGS(onerec, [&] {
   LOAD_ARG_OR(use_absolute_position_embedding,
               "use_absolute_position_embedding",
               false);
-  LOAD_ARG_OR(use_attention_scaling, "use_attention_scaling", false);
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", true);
 
   LOAD_ARG_OR(use_moe, "use_moe", false);
