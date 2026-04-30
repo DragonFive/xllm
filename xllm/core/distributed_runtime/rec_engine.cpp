@@ -774,16 +774,6 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::get_model_output(
           safe_to(sample_output.top_logprobs, torch::kCPU, true);
     }
   }
-  if (output.beam_sequence_group.defined() &&
-      output.beam_sequence_group.numel() > 0) {
-    output.beam_sequence_group =
-        safe_to(output.beam_sequence_group, torch::kCPU, true);
-  }
-  if (output.beam_search_output.out_logprobs.defined() &&
-      output.beam_search_output.out_logprobs.numel() > 0) {
-    output.beam_search_output.out_logprobs =
-        safe_to(output.beam_search_output.out_logprobs, torch::kCPU, true);
-  }
   Device(engine_.workers_[0]->device()).synchronize_default_stream();
 
   return output;

@@ -1581,9 +1581,17 @@ int32_t NpuOneRecBlockLayerImpl::setup_common_decoder_tensors(
   int32_t idx = start_tensor_idx;
   node.variantPack.inTensors.at(idx++) = internal_tensors_;
   if (attn_mask.defined()) {
-    auto mask_dtype = (!param.isPrefill && param.isDecoder)
-                          ? torch::kBool
-                          : (param.isBF16 ? torch::kBFloat16 : torch::kFloat16);
+    const bool keep_legacy_prefill_mask =
+        use_legacy_onerec_prefill_only_contract() && param.isPrefill &&
+        param.isDecoder &&
+        (attn_mask.scalar_type() == torch::kUInt8 ||
+         attn_mask.scalar_type() == torch::kBool);
+    torch::Dtype mask_dtype =
+        keep_legacy_prefill_mask
+            ? attn_mask.scalar_type()
+            : ((!param.isPrefill && param.isDecoder)
+                   ? torch::kBool
+                   : (param.isBF16 ? torch::kBFloat16 : torch::kFloat16));
     prefill_attn_mask_ =
         PrepareOneRecAttentionMask(attn_mask, device_, mask_dtype);
     if (!param.isPrefill && param.isDecoder) {
