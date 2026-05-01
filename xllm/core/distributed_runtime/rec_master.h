@@ -94,6 +94,14 @@ class RecMaster : public Master {
         OutputCallback callback);
 
    protected:
+    std::shared_ptr<Request> generate_onerec_request_common(
+        std::string prompt,
+        std::optional<std::vector<int>> prompt_tokens,
+        std::optional<std::vector<proto::InferInputTensor>> input_tensors,
+        const RequestParams& sp,
+        OutputCallback callback,
+        bool build_stop_checker);
+
     RecMaster& master_;
   };
 
