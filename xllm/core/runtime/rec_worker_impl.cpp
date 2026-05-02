@@ -72,7 +72,6 @@ int32_t get_onerec_decode_round(const OneRecXAttentionParams& params) {
       static_cast<int32_t>(params.generated_tokens.front().size()) - 1, 0);
 }
 
-#if defined(USE_NPU)
 bool enable_onerec_selected_token_cpu_check() {
   return util::get_bool_env("XLLM_DEBUG_ONEREC_SELECTED_TOKEN_CPU_CHECK",
                             false) &&
@@ -83,8 +82,6 @@ bool enable_onerec_selected_token_cpu_check() {
 bool enable_onerec_xattention_stage_timing() {
   return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_STAGE_TIMING", false);
 }
-
-#endif
 
 }  // namespace
 
