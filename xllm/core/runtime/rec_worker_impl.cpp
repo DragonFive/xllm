@@ -1353,7 +1353,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           /*out_sequence=*/beam_tensors.out_seqgroup);
     }
     log_stage_timing("beam_search", round, beam_timer);
-#else
+#elif defined(USE_CUDA)
     top_tokens = result->sample_output.top_tokens.to(torch::kInt32)
                      .reshape({-1, beam_width});
     top_logprobs = result->sample_output.top_logprobs.reshape({-1, beam_width});
@@ -1368,6 +1368,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                     beam_tensors.out_seqgroup,
                                     batch_size,
                                     round);
+#else
+    LOG(FATAL) << "OneRec xattention beam search requires NPU or CUDA.";
 #endif
     std::swap(beam_tensors.sequence_group, beam_tensors.out_seqgroup);
     std::swap(beam_tensors.acc_logprob, beam_tensors.out_log_probs);
