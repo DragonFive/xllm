@@ -37,12 +37,18 @@ limitations under the License.
 #include "framework/request/rec_type.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
+#include "util/env_var.h"
 #include "util/rec_model_utils.h"
 #include "util/scope_guard.h"
+#include "util/timer.h"
 
 namespace xllm {
 
 namespace {
+
+bool enable_onerec_xattention_lock_timing() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_LOCK_TIMING", false);
+}
 
 void fail_step_requests(const std::vector<std::shared_ptr<Request>>& requests,
                         KVCacheManager* kv_cache_manager,
@@ -466,7 +472,13 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
     };
 
     if (options_.rec_worker_max_concurrency() > 1) {
+      Timer semaphore_wait_timer;
       step_semaphore_.acquire();
+      if (enable_onerec_xattention_lock_timing()) {
+        LOG(INFO)
+            << "OneRec xattention host timing, stage=scheduler_semaphore_wait"
+            << ", elapsed_us=" << semaphore_wait_timer.elapsed_microseconds();
+      }
       in_flight_steps_.fetch_add(1, std::memory_order_acq_rel);
       step_threadpool_->schedule(function);
     } else {

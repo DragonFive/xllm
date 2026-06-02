@@ -22,6 +22,7 @@ limitations under the License.
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -97,6 +98,14 @@ bool enable_onerec_xattention_stage_timing() {
   return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_STAGE_TIMING", false);
 }
 
+bool enable_onerec_xattention_lock_timing() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_LOCK_TIMING", false);
+}
+
+bool enable_rec_pipeline_concurrency_debug() {
+  return util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false);
+}
+
 bool serialize_onerec_xattention_host_stages() {
   static const bool serialize_host_stages =
       util::get_bool_env(kOnerecXAttentionSerializeHostStagesEnv, true);
@@ -115,6 +124,43 @@ bool serialize_onerec_xattention_model_forward() {
       util::get_bool_env(kOnerecXAttentionSerializeModelForwardEnv,
                          serialize_onerec_xattention_host_stages());
   return serialize_model_forward;
+}
+
+void move_onerec_xattention_output_to_cpu(ForwardOutput& output) {
+  auto& sample_output = output.sample_output;
+  const bool has_beam_output = output.beam_sequence_group.defined() &&
+                               output.beam_sequence_group.numel() > 0;
+  if (!has_beam_output && sample_output.embeddings.defined()) {
+    sample_output.embeddings = safe_to(
+        sample_output.embeddings,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*non_blocking=*/true);
+  }
+  if (!has_beam_output && sample_output.next_tokens.defined()) {
+    sample_output.next_tokens =
+        safe_to(sample_output.next_tokens, torch::kCPU, /*non_blocking=*/true);
+    if (sample_output.logprobs.defined()) {
+      sample_output.logprobs =
+          safe_to(sample_output.logprobs, torch::kCPU, true);
+    }
+    if (sample_output.top_tokens.defined()) {
+      sample_output.top_tokens =
+          safe_to(sample_output.top_tokens, torch::kCPU, true);
+    }
+    if (sample_output.top_logprobs.defined()) {
+      sample_output.top_logprobs =
+          safe_to(sample_output.top_logprobs, torch::kCPU, true);
+    }
+  }
+  if (has_beam_output) {
+    output.beam_sequence_group =
+        safe_to(output.beam_sequence_group, torch::kCPU, true);
+  }
+  if (output.beam_search_output.out_logprobs.defined() &&
+      output.beam_search_output.out_logprobs.numel() > 0) {
+    output.beam_search_output.out_logprobs =
+        safe_to(output.beam_search_output.out_logprobs, torch::kCPU, true);
+  }
 }
 
 #if defined(USE_NPU)
@@ -1144,12 +1190,20 @@ ForwardInput RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_inputs(
 void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
     const ForwardInput& inputs,
     ForwardInput& processed_inputs) {
+  const bool trace_lock_timing = enable_onerec_xattention_lock_timing();
   std::unique_lock<std::mutex> prepare_lock(
       runtime_.worker.onerec_xattention_prepare_mutex_, std::defer_lock);
-  if (should_serialize_onerec_xattention_prepare(
-          runtime_.worker.options_.rec_worker_max_concurrency())) {
+  const bool need_prepare_lock = should_serialize_onerec_xattention_prepare(
+      runtime_.worker.options_.rec_worker_max_concurrency());
+  if (need_prepare_lock) {
+    Timer lock_wait_timer;
     prepare_lock.lock();
+    if (trace_lock_timing) {
+      LOG(INFO) << "OneRec xattention host timing, stage=prepare_lock_wait"
+                << ", elapsed_us=" << lock_wait_timer.elapsed_microseconds();
+    }
   }
+  Timer prepare_host_timer;
 
   const bool trace_stage_timing = enable_onerec_xattention_stage_timing();
   Timer prepare_timer;
@@ -1196,12 +1250,6 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   auto& onerec_params =
       processed_inputs.input_params.mutable_onerec_xattention_params();
   const auto& args = runtime_.context->get_model_args();
-  const auto& parallel_args = runtime_.context->get_parallel_args();
-  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
-      args.n_kv_heads().value_or(args.decoder_n_heads()));
-  const int64_t local_kv_heads =
-      decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
-  const int64_t head_dim = args.decoder_head_dim();
   const int64_t batch_size = std::max<int64_t>(
       onerec_params.bs > 0 ? onerec_params.bs
                            : inputs.input_params.num_sequences,
@@ -1220,6 +1268,12 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
         batch_size *
         std::max<int64_t>(processed_inputs.input_params.q_max_seq_len, 1);
   }
+  const auto& parallel_args = runtime_.context->get_parallel_args();
+  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
+      args.n_kv_heads().value_or(args.decoder_n_heads()));
+  const int64_t local_kv_heads =
+      decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
+  const int64_t head_dim = args.decoder_head_dim();
   const int32_t decoder_layers = static_cast<int32_t>(args.n_layers());
   auto fp_options = torch::TensorOptions()
                         .dtype(runtime_.worker.dtype())
@@ -1248,7 +1302,6 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
                         .dtype(torch::kInt32)
                         .device(runtime_.worker.device()));
   log_prepare_timing("cache_prepare");
-
   const int32_t beam_width =
       inputs.step_meta() != nullptr
           ? std::max<int32_t>(1, inputs.step_meta()->beam_width)
@@ -1288,6 +1341,10 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   onerec_params.decoder_context_embedding =
       onerec_params.decoder_context_embedding.to(runtime_.worker.dtype());
   log_prepare_timing("metadata_prepare");
+  if (trace_lock_timing && need_prepare_lock) {
+    LOG(INFO) << "OneRec xattention host timing, stage=prepare_lock_hold"
+              << ", elapsed_us=" << prepare_host_timer.elapsed_microseconds();
+  }
 }
 
 folly::SemiFuture<torch::Tensor>
@@ -1473,15 +1530,31 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     auto forward_model = [&](const torch::Tensor& tokens,
                              const torch::Tensor& positions,
                              const ModelInputParams& params) {
+      const bool trace_lock_timing = enable_onerec_xattention_lock_timing();
       std::unique_lock<std::mutex> forward_lock(
           runtime_.worker.onerec_xattention_model_forward_mutex_,
           std::defer_lock);
-      if (should_serialize_onerec_xattention_model_forward(
-              runtime_.worker.options_.rec_worker_max_concurrency())) {
+      const bool need_forward_lock =
+          should_serialize_onerec_xattention_model_forward(
+              runtime_.worker.options_.rec_worker_max_concurrency());
+      if (need_forward_lock) {
+        Timer lock_wait_timer;
         forward_lock.lock();
+        if (trace_lock_timing) {
+          LOG(INFO)
+              << "OneRec xattention host timing, stage=model_forward_lock_wait"
+              << ", elapsed_us=" << lock_wait_timer.elapsed_microseconds();
+        }
       }
-      return runtime_.executor->forward(
+      Timer forward_host_timer;
+      auto output = runtime_.executor->forward(
           tokens, positions, runtime_.worker.kv_caches_, params);
+      if (trace_lock_timing && need_forward_lock) {
+        LOG(INFO)
+            << "OneRec xattention host timing, stage=model_forward_lock_hold"
+            << ", elapsed_us=" << forward_host_timer.elapsed_microseconds();
+      }
+      return output;
     };
 
     torch::Tensor hidden_states;
@@ -1976,6 +2049,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     }
   }
 
+  move_onerec_xattention_output_to_cpu(output);
   runtime_.stream->synchronize();
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
@@ -3104,6 +3178,19 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
                                    runtime.worker.device(),
                                    runtime.worker.options_);
 
+    if (enable_rec_pipeline_concurrency_debug()) {
+      LOG(INFO) << "REC pipeline init, pipeline=" << i
+                << ", stream=" << *runtime.stream;
+#if defined(USE_NPU)
+      const auto current_npu_stream =
+          c10_npu::getCurrentNPUStream(device_.index());
+      LOG(INFO) << "REC pipeline init NPU stream, pipeline=" << i
+                << ", current_stream_id=" << current_npu_stream.id()
+                << ", current_stream="
+                << static_cast<const void*>(current_npu_stream.stream());
+#endif
+    }
+
     if (FLAGS_enable_eplb) {
       runtime.eplb_executor = std::make_unique<EplbExecutor>(
           runtime.model.get(), runtime.worker.device());
@@ -3228,8 +3315,17 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
     const ForwardInput& input) {
   folly::Promise<std::optional<ForwardOutput>> promise;
 
+  const bool trace_lock_timing =
+      enable_onerec_xattention_lock_timing() &&
+      pipeline_type_ == RecPipelineType::kOneRecXAttentionPipeline;
+  Timer lease_wait_timer;
   size_t index;
   index_queue_.wait_dequeue(index);
+  if (trace_lock_timing) {
+    LOG(INFO) << "OneRec xattention host timing, stage=pipeline_lease_wait"
+              << ", leased_index=" << index
+              << ", elapsed_us=" << lease_wait_timer.elapsed_microseconds();
+  }
   auto future = promise.getSemiFuture();
   // Copy the input because the scheduled task may run after step_async returns.
   ForwardInput input_copy = input;
@@ -3249,6 +3345,15 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
 #if defined(USE_NPU)
           aclrtStream current_stream =
               c10_npu::getCurrentNPUStream(device_.index()).stream();
+          if (enable_rec_pipeline_concurrency_debug()) {
+            const auto current_npu_stream =
+                c10_npu::getCurrentNPUStream(device_.index());
+            LOG(INFO) << "REC pipeline execute NPU stream, pipeline=" << index
+                      << ", thread_id=" << std::this_thread::get_id()
+                      << ", current_stream_id=" << current_npu_stream.id()
+                      << ", current_stream="
+                      << static_cast<const void*>(current_stream);
+          }
           atb::Context* atb_context = const_cast<atb::Context*>(
               work_pipelines_[index]->runtime().context->get_atb_context());
           CHECK(atb_context != nullptr)
