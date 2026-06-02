@@ -32,6 +32,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "framework/request/rec_type.h"
 #include "master.h"  // For MasterStatus::WAKEUP constant
+#include "runtime/forward_output_ready_event.h"
 #include "util/env_var.h"
 #include "util/net.h"
 #include "util/pretty_print.h"
@@ -43,10 +44,18 @@ namespace xllm {
 namespace {
 
 constexpr int64_t kMinimalOneRecMetadataKVBlocks = 2;
+constexpr const char* kOnerecXAttentionAsyncOutputReadyEnv =
+    "XLLM_ONEREC_XATTN_ASYNC_OUTPUT_READY";
 
 }  // namespace
 
 namespace {
+
+bool enable_onerec_xattention_async_output_ready() {
+  static const bool async_output_ready =
+      util::get_bool_env(kOnerecXAttentionAsyncOutputReadyEnv, false);
+  return async_output_ready;
+}
 
 void rethrow_worker_exception(
     size_t worker_index,
@@ -930,6 +939,7 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
               timer.elapsed_microseconds());
 
   timer.reset();
+  output.wait_ready();
   if (output.beam_sequence_group.defined() &&
       output.beam_sequence_group.numel() > 0) {
     batches[0].process_beam_sequence_group(output);
@@ -1046,10 +1056,17 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
                        output.beam_search_output.out_logprobs);
     }
     log_engine_timing("output_d2h_submit");
-    log_engine_stage("before_default_stream_sync");
-    Device(engine_.workers_[0]->device()).synchronize_default_stream();
-    log_engine_timing("default_stream_sync");
-    log_engine_stage("after_default_stream_sync");
+    if (enable_onerec_xattention_async_output_ready()) {
+      auto current_stream =
+          Device(engine_.workers_[0]->device()).current_stream();
+      output.ready_event = record_forward_output_ready_event(*current_stream);
+      log_engine_stage("after_output_ready_event_record");
+    } else {
+      log_engine_stage("before_default_stream_sync");
+      Device(engine_.workers_[0]->device()).synchronize_default_stream();
+      log_engine_timing("default_stream_sync");
+      log_engine_stage("after_default_stream_sync");
+    }
   }
 
   return output;

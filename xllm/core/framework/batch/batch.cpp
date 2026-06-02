@@ -558,6 +558,7 @@ void Batch::process_sample_output(const RawForwardOutput& raw_output,
 }
 
 void Batch::process_beam_sequence_group(const ForwardOutput& output) {
+  output.wait_ready();
   if (!output.beam_sequence_group.defined() ||
       output.beam_sequence_group.numel() == 0) {
     return;

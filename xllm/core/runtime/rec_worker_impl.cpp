@@ -53,6 +53,7 @@ limitations under the License.
 #include "framework/sampling/rec_sampler.h"
 #include "framework/state_dict/rec_vocab_dict.h"
 #include "models/model_registry.h"
+#include "runtime/forward_output_ready_event.h"
 #include "runtime/rec_beam_utils.h"
 #include "util/env_var.h"
 #include "util/scope_guard.h"
@@ -68,6 +69,8 @@ constexpr const char* kOnerecXAttentionSerializePrepareEnv =
     "XLLM_ONEREC_XATTN_SERIALIZE_PREPARE";
 constexpr const char* kOnerecXAttentionSerializeModelForwardEnv =
     "XLLM_ONEREC_XATTN_SERIALIZE_MODEL_FORWARD";
+constexpr const char* kOnerecXAttentionAsyncOutputReadyEnv =
+    "XLLM_ONEREC_XATTN_ASYNC_OUTPUT_READY";
 
 RecVocabDict* get_onerec_vocab_dict(const std::string& model_weights_path) {
   if (model_weights_path.empty()) {
@@ -124,6 +127,12 @@ bool serialize_onerec_xattention_model_forward() {
       util::get_bool_env(kOnerecXAttentionSerializeModelForwardEnv,
                          serialize_onerec_xattention_host_stages());
   return serialize_model_forward;
+}
+
+bool enable_onerec_xattention_async_output_ready() {
+  static const bool async_output_ready =
+      util::get_bool_env(kOnerecXAttentionAsyncOutputReadyEnv, false);
+  return async_output_ready;
 }
 
 void move_onerec_xattention_output_to_cpu(ForwardOutput& output) {
@@ -2050,7 +2059,11 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
   }
 
   move_onerec_xattention_output_to_cpu(output);
-  runtime_.stream->synchronize();
+  if (enable_onerec_xattention_async_output_ready()) {
+    output.ready_event = record_forward_output_ready_event(*runtime_.stream);
+  } else {
+    runtime_.stream->synchronize();
+  }
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
       runtime_.worker.device_.index());
