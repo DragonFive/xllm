@@ -140,6 +140,7 @@ struct ForwardInput {
     inputs.acc_logprob = safe_to(acc_logprob, device, true);
     inputs.step_decode = step_decode;
     inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
+    inputs.rec_tp_step_id = rec_tp_step_id;
     inputs.device_input_buffer = device_input_buffer;
     return inputs;
   }
@@ -174,6 +175,9 @@ struct ForwardInput {
   std::optional<StepDecodeMeta> step_decode;
   // If true, skip sampler forward and only keep logits.
   bool skip_sampling_for_logits_only = false;
+  // REC local TP experiment: engine-scoped id used to share rank0 multi-round
+  // control tensors with non-driver ranks.
+  uint64_t rec_tp_step_id = 0;
 
   // kv info for disaggregated prefill/decode
   std::vector<TransferKVInfo> transfer_kv_infos;

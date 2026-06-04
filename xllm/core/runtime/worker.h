@@ -124,6 +124,15 @@ class Worker {
   // the future returns a successfull status with no meaningful value
   folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs);
+  folly::SemiFuture<std::optional<ForwardOutput>>
+  rec_step_async_with_pipeline_index(const ForwardInput& inputs,
+                                     size_t pipeline_index);
+  folly::SemiFuture<std::optional<ForwardOutput>>
+  rec_step_async_with_pipeline_index(const ForwardInput& inputs,
+                                     size_t pipeline_index,
+                                     uint64_t rec_tp_step_id);
+  void set_rec_pipeline_control_group(size_t pipeline_index,
+                                      ProcessGroup* group);
 
   folly::SemiFuture<folly::Unit> process_group_test_async();
 

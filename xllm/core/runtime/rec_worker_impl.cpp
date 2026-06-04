@@ -18,10 +18,12 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -59,6 +61,29 @@ namespace xllm {
 
 namespace {
 
+constexpr const char* kRecMultiRoundDebugDeviceSyncEnv =
+    "XLLM_DEBUG_REC_MULTIROUND_DEVICE_SYNC";
+constexpr const char* kRecMultiRoundStageTimingEnv =
+    "XLLM_DEBUG_REC_MULTIROUND_STAGE_TIMING";
+constexpr const char* kRecMultiRoundSyncLogitsAfterLmHeadEnv =
+    "XLLM_REC_MULTIROUND_SYNC_LOGITS_AFTER_LMHEAD";
+constexpr const char* kRecMultiRoundSyncLogitsPolicyEnv =
+    "XLLM_REC_MULTIROUND_SYNC_LOGITS_POLICY";
+constexpr const char* kRecMultiRoundTpPerPipelineAtbCommEnv =
+    "XLLM_REC_MULTIROUND_TP_PER_PIPELINE_ATB_COMM";
+constexpr const char* kRecMultiRoundTpRank0ControlEnv =
+    "XLLM_REC_MULTIROUND_TP_RANK0_CONTROL";
+constexpr const char* kRecMultiRoundTpPackedRank0ControlEnv =
+    "XLLM_REC_MULTIROUND_TP_PACKED_RANK0_CONTROL";
+constexpr const char* kRecMultiRoundTpHostSharedControlEnv =
+    "XLLM_REC_MULTIROUND_TP_HOST_SHARED_CONTROL";
+constexpr const char* kRecMultiRoundTpNpuIntermediateBeamEnv =
+    "XLLM_REC_MULTIROUND_TP_NPU_INTERMEDIATE_BEAM";
+constexpr const char* kRecMultiRoundTpSerializeCacheSelectEnv =
+    "XLLM_REC_MULTIROUND_TP_SERIALIZE_CACHE_SELECT";
+constexpr const char* kRecMultiRoundTpSingleModelPipelineEnv =
+    "XLLM_REC_MULTIROUND_TP_SINGLE_MODEL_PIPELINE";
+
 RecVocabDict* get_onerec_vocab_dict(const std::string& model_weights_path) {
   if (model_weights_path.empty()) {
     return nullptr;
@@ -86,6 +111,176 @@ bool enable_onerec_selected_token_cpu_check() {
 
 bool enable_onerec_xattention_stage_timing() {
   return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_STAGE_TIMING", false);
+}
+
+bool enable_rec_pipeline_concurrency_debug() {
+  return util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false);
+}
+
+bool enable_rec_multiround_debug_device_sync() {
+  return util::get_bool_env(kRecMultiRoundDebugDeviceSyncEnv, false);
+}
+
+bool enable_rec_multiround_stage_timing() {
+  return util::get_bool_env(kRecMultiRoundStageTimingEnv, false);
+}
+
+bool sync_rec_multiround_logits_after_lmhead() {
+  return util::get_bool_env(kRecMultiRoundSyncLogitsAfterLmHeadEnv, true);
+}
+
+enum class RecMultiRoundLogitsSyncPolicy {
+  kAll,
+  kRank0Only,
+  kNonDriverOnly,
+  kFinalOnly,
+  kNonFinalOnly,
+  kNone,
+};
+
+RecMultiRoundLogitsSyncPolicy rec_multiround_logits_sync_policy() {
+  if (!sync_rec_multiround_logits_after_lmhead()) {
+    return RecMultiRoundLogitsSyncPolicy::kNone;
+  }
+  const char* policy_env = std::getenv(kRecMultiRoundSyncLogitsPolicyEnv);
+  if (policy_env == nullptr || std::string(policy_env).empty() ||
+      std::string(policy_env) == "all") {
+    return RecMultiRoundLogitsSyncPolicy::kAll;
+  }
+  const std::string policy(policy_env);
+  if (policy == "rank0_only") {
+    return RecMultiRoundLogitsSyncPolicy::kRank0Only;
+  }
+  if (policy == "non_driver_only") {
+    return RecMultiRoundLogitsSyncPolicy::kNonDriverOnly;
+  }
+  if (policy == "final_only") {
+    return RecMultiRoundLogitsSyncPolicy::kFinalOnly;
+  }
+  if (policy == "non_final_only") {
+    return RecMultiRoundLogitsSyncPolicy::kNonFinalOnly;
+  }
+  if (policy == "none") {
+    return RecMultiRoundLogitsSyncPolicy::kNone;
+  }
+  LOG(FATAL) << "Unsupported " << kRecMultiRoundSyncLogitsPolicyEnv << "="
+             << policy
+             << ". Expected one of all, rank0_only, non_driver_only, "
+                "final_only, non_final_only, none.";
+  return RecMultiRoundLogitsSyncPolicy::kAll;
+}
+
+bool enable_rec_multiround_tp_per_pipeline_atb_comm() {
+  return util::get_bool_env(kRecMultiRoundTpPerPipelineAtbCommEnv, false);
+}
+
+bool enable_rec_multiround_tp_rank0_control() {
+  return util::get_bool_env(kRecMultiRoundTpRank0ControlEnv, false);
+}
+
+bool enable_rec_multiround_tp_packed_rank0_control() {
+  return util::get_bool_env(kRecMultiRoundTpPackedRank0ControlEnv, false);
+}
+
+bool enable_rec_multiround_tp_host_shared_control() {
+  return util::get_bool_env(kRecMultiRoundTpHostSharedControlEnv, false);
+}
+
+bool enable_rec_multiround_tp_npu_intermediate_beam() {
+  return util::get_bool_env(kRecMultiRoundTpNpuIntermediateBeamEnv, false);
+}
+
+bool serialize_rec_multiround_tp_cache_select() {
+  return util::get_bool_env(kRecMultiRoundTpSerializeCacheSelectEnv, true);
+}
+
+bool enable_rec_multiround_tp_single_model_pipeline() {
+  return util::get_bool_env(kRecMultiRoundTpSingleModelPipelineEnv, false);
+}
+
+std::mutex& rec_multiround_tp_cache_select_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+uint64_t rec_multiround_control_key(uint64_t rec_tp_step_id, int32_t round) {
+  CHECK_GT(rec_tp_step_id, 0);
+  CHECK_GE(round, 0);
+  constexpr uint64_t kMaxRecMultiRoundControlRounds = 1024;
+  CHECK_LT(static_cast<uint64_t>(round), kMaxRecMultiRoundControlRounds);
+  return rec_tp_step_id * kMaxRecMultiRoundControlRounds +
+         static_cast<uint64_t>(round);
+}
+
+void log_rec_multiround_stage_timing(int32_t rank,
+                                     int32_t round,
+                                     const char* stage,
+                                     const Timer& timer) {
+  if (!enable_rec_multiround_stage_timing()) {
+    return;
+  }
+  LOG(INFO) << "REC multi-round host timing, rank=" << rank
+            << ", round=" << round << ", stage=" << stage
+            << ", elapsed_ms=" << timer.elapsed_milliseconds();
+}
+
+#if defined(USE_NPU)
+bool should_sync_rec_multiround_tp_stage(int32_t world_size,
+                                         const torch::Device& device,
+                                         bool is_driver,
+                                         bool final_round) {
+  if (world_size <= 1 || device.type() != torch::kPrivateUse1) {
+    return false;
+  }
+  switch (rec_multiround_logits_sync_policy()) {
+    case RecMultiRoundLogitsSyncPolicy::kAll:
+      return true;
+    case RecMultiRoundLogitsSyncPolicy::kRank0Only:
+      return is_driver;
+    case RecMultiRoundLogitsSyncPolicy::kNonDriverOnly:
+      return !is_driver;
+    case RecMultiRoundLogitsSyncPolicy::kFinalOnly:
+      return final_round;
+    case RecMultiRoundLogitsSyncPolicy::kNonFinalOnly:
+      return !final_round;
+    case RecMultiRoundLogitsSyncPolicy::kNone:
+      return false;
+  }
+  return true;
+}
+
+void debug_sync_rec_multiround_device(const torch::Device& device,
+                                      int32_t rank,
+                                      int32_t round,
+                                      const char* stage) {
+  if (!enable_rec_multiround_debug_device_sync()) {
+    return;
+  }
+  Device device_guard(device);
+  device_guard.set_device();
+  const auto ret = aclrtSynchronizeDevice();
+  LOG(INFO) << "REC multi-round debug device sync, rank=" << rank
+            << ", round=" << round << ", stage=" << stage
+            << ", device=" << device << ", ret=" << ret;
+  CHECK_EQ(ret, ACL_SUCCESS) << "REC multi-round debug device sync failed"
+                             << ", rank=" << rank << ", round=" << round
+                             << ", stage=" << stage << ", device=" << device;
+}
+#endif
+
+std::string tensor_debug_shape(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "<undefined>";
+  }
+  std::string shape = "[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      shape += ",";
+    }
+    shape += std::to_string(tensor.size(i));
+  }
+  shape += "]";
+  return shape;
 }
 
 #if defined(USE_NPU)
@@ -316,6 +511,158 @@ void select_final_onerec_beam_results(
   output_tensors.out_seqgroup
       .slice(/*dim=*/2, /*start=*/current_step, /*end=*/current_step + 1)
       .copy_(new_tokens.unsqueeze(2));
+}
+
+void select_intermediate_onerec_beam_results(
+    const torch::Tensor& acc_logprob,
+    const torch::Tensor& sequence_group,
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    int32_t batch_size,
+    int32_t beam_width,
+    int32_t current_step,
+    torch::Tensor& out_token_ids,
+    torch::Tensor& out_token_index,
+    torch::Tensor& out_log_probs,
+    torch::Tensor& out_beam_count_prefix_sums,
+    torch::Tensor& out_sequence) {
+#if defined(USE_NPU)
+  if (top_tokens.device().is_privateuseone()) {
+    auto acc_logprob_cpu = acc_logprob.to(torch::kCPU);
+    auto sequence_group_cpu = sequence_group.to(torch::kCPU);
+    auto top_tokens_cpu = top_tokens.to(torch::kCPU);
+    auto top_logprobs_cpu = top_logprobs.to(torch::kCPU);
+    auto out_token_ids_cpu = torch::empty_like(out_token_ids, torch::kCPU);
+    auto out_token_index_cpu = torch::empty_like(out_token_index, torch::kCPU);
+    auto out_log_probs_cpu = torch::empty_like(out_log_probs, torch::kCPU);
+    auto out_beam_count_prefix_sums_cpu =
+        torch::empty_like(out_beam_count_prefix_sums, torch::kCPU);
+    auto out_sequence_cpu = torch::empty_like(out_sequence, torch::kCPU);
+
+    select_intermediate_onerec_beam_results(acc_logprob_cpu,
+                                            sequence_group_cpu,
+                                            top_tokens_cpu,
+                                            top_logprobs_cpu,
+                                            batch_size,
+                                            beam_width,
+                                            current_step,
+                                            out_token_ids_cpu,
+                                            out_token_index_cpu,
+                                            out_log_probs_cpu,
+                                            out_beam_count_prefix_sums_cpu,
+                                            out_sequence_cpu);
+
+    out_token_ids.copy_(out_token_ids_cpu.to(top_tokens.device()));
+    out_token_index.copy_(out_token_index_cpu.to(top_tokens.device()));
+    out_log_probs.copy_(out_log_probs_cpu.to(top_tokens.device()));
+    out_beam_count_prefix_sums.copy_(
+        out_beam_count_prefix_sums_cpu.to(top_tokens.device()));
+    out_sequence.copy_(out_sequence_cpu.to(top_tokens.device()));
+    return;
+  }
+#endif
+
+  CHECK_EQ(acc_logprob.dim(), 2) << "acc_logprob must be [batch * beam, 1]";
+  CHECK_EQ(sequence_group.dim(), 3)
+      << "sequence_group must be [batch, beam, total_rounds]";
+  CHECK_EQ(top_tokens.dim(), 2) << "top_tokens must be [batch * beam, top_k]";
+  CHECK_EQ(top_logprobs.dim(), 2)
+      << "top_logprobs must be [batch * beam, top_k]";
+  CHECK_EQ(top_tokens.sizes(), top_logprobs.sizes())
+      << "top_tokens/top_logprobs shape mismatch";
+  CHECK_EQ(top_tokens.size(0), static_cast<int64_t>(batch_size) * beam_width)
+      << "top_tokens rows must equal batch * beam";
+  CHECK_EQ(out_sequence.dim(), 3)
+      << "out_sequence must be [batch, beam, total_rounds]";
+
+  const int64_t candidate_top_k = top_tokens.size(1);
+  CHECK_GT(candidate_top_k, 0);
+
+  const torch::Device device = top_tokens.device();
+  const torch::Tensor top_tokens_view =
+      top_tokens.view({batch_size, beam_width, candidate_top_k});
+  const torch::Tensor top_logprobs_view =
+      top_logprobs.view({batch_size, beam_width, candidate_top_k});
+  const torch::Tensor acc_logprob_view =
+      acc_logprob.view({batch_size, beam_width, 1});
+  const torch::Tensor combined_probs =
+      (acc_logprob_view + top_logprobs_view)
+          .view({batch_size, beam_width * candidate_top_k});
+
+  torch::Tensor new_probs;
+  torch::Tensor new_indices;
+  std::tie(new_probs, new_indices) = combined_probs.topk(beam_width,
+                                                         /*dim=*/-1,
+                                                         /*largest=*/true,
+                                                         /*sorted=*/true);
+
+  const torch::Tensor parent_beam =
+      torch::floor_divide(new_indices, candidate_top_k);
+  const torch::Tensor token_in_beam =
+      torch::remainder(new_indices, candidate_top_k);
+  const torch::Tensor batch_idx =
+      torch::arange(batch_size,
+                    torch::TensorOptions().dtype(torch::kLong).device(device))
+          .unsqueeze(1)
+          .expand_as(parent_beam);
+
+  using torch::indexing::Slice;
+  using torch::indexing::TensorIndex;
+  const torch::Tensor new_tokens =
+      top_tokens_view.index({TensorIndex(batch_idx),
+                             TensorIndex(parent_beam),
+                             TensorIndex(token_in_beam)});
+
+  const torch::Tensor beam_range = torch::arange(
+      beam_width, torch::TensorOptions().dtype(torch::kLong).device(device));
+  const torch::Tensor parent_one_hot =
+      parent_beam.unsqueeze(-1).eq(beam_range).to(torch::kLong);
+  const torch::Tensor parent_counts = parent_one_hot.sum(/*dim=*/1);
+  const torch::Tensor parent_prefix = parent_counts.cumsum(/*dim=*/1);
+  const torch::Tensor parent_starts = parent_prefix - parent_counts;
+  const torch::Tensor rank_in_parent =
+      parent_one_hot.cumsum(/*dim=*/1)
+          .gather(/*dim=*/2, parent_beam.unsqueeze(-1))
+          .squeeze(-1) -
+      1;
+  const torch::Tensor output_pos =
+      parent_starts.gather(/*dim=*/1, parent_beam) + rank_in_parent;
+
+  torch::Tensor sorted_tokens =
+      torch::empty({batch_size, beam_width}, top_tokens.options());
+  torch::Tensor sorted_probs =
+      torch::empty({batch_size, beam_width}, top_logprobs.options());
+  torch::Tensor sorted_parent =
+      torch::empty({batch_size, beam_width},
+                   torch::TensorOptions().dtype(torch::kLong).device(device));
+  sorted_tokens.scatter_(/*dim=*/1, output_pos, new_tokens);
+  sorted_probs.scatter_(/*dim=*/1, output_pos, new_probs);
+  sorted_parent.scatter_(/*dim=*/1, output_pos, parent_beam);
+
+  const torch::Tensor batch_offsets =
+      torch::arange(batch_size,
+                    torch::TensorOptions().dtype(torch::kLong).device(device))
+          .unsqueeze(1) *
+      beam_width;
+  out_token_ids.view({batch_size, beam_width}).copy_(sorted_tokens);
+  out_token_index.view({batch_size, beam_width})
+      .copy_((sorted_parent + batch_offsets).to(torch::kInt32));
+  out_log_probs.view({batch_size, beam_width}).copy_(sorted_probs);
+  out_beam_count_prefix_sums.view({batch_size, beam_width})
+      .copy_((parent_prefix + batch_offsets).to(torch::kInt32));
+
+  const torch::Tensor batch_range =
+      torch::arange(batch_size,
+                    torch::TensorOptions().dtype(torch::kLong).device(device))
+          .unsqueeze(1)
+          .expand({batch_size, beam_width});
+  out_sequence.slice(/*dim=*/2, /*start=*/0, current_step)
+      .copy_(sequence_group.index({TensorIndex(batch_range),
+                                   TensorIndex(sorted_parent),
+                                   Slice(0, current_step)}));
+  out_sequence
+      .slice(/*dim=*/2, /*start=*/current_step, /*end=*/current_step + 1)
+      .copy_(sorted_tokens.unsqueeze(2));
 }
 
 }  // namespace
@@ -1942,6 +2289,9 @@ RecWorkerImpl::LlmRecMultiRoundPipeline::LlmRecMultiRoundPipeline(
 
   full_kv_cache_offsets_ = std::make_unique<FullKvCacheOffsets>(this);
   allocate_kv_caches_related();
+
+  static auto shared_control_state = std::make_shared<SharedControlState>();
+  shared_control_state_ = shared_control_state;
 }
 
 ForwardInput RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_inputs(
@@ -2202,6 +2552,14 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
   int32_t beam_width = step_meta->beam_width;
   int32_t num_layers =
       static_cast<int32_t>(runtime_.context->get_model_args().n_layers());
+  const int32_t rank = runtime_.context->get_parallel_args().rank();
+  const bool use_rank0_control =
+      enable_rec_multiround_tp_rank0_control() &&
+      runtime_.context->get_parallel_args().world_size() > 1 &&
+      input.rec_tp_step_id > 0;
+  const bool use_host_shared_control =
+      use_rank0_control && enable_rec_multiround_tp_host_shared_control();
+  const bool is_driver = runtime_.worker.is_driver();
 
   CHECK_GT(runtime_.worker.kv_caches_.size(), 0)
       << "KV caches are not initialized.";
@@ -2217,7 +2575,9 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
   std::optional<folly::SemiFuture<NextRoundInputResults>>
       next_round_async_result;
 
+  const bool trace_pipeline_debug = enable_rec_pipeline_concurrency_debug();
   for (int32_t round = 0; round < total_rounds; ++round) {
+    Timer stage_timer;
     const auto& sampling_params = round > 0
                                       ? mutable_input.decoder_sampling_params
                                       : mutable_input.sampling_params;
@@ -2227,6 +2587,22 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
         get_requested_beam_result_width(round_sampling_params, beam_width);
     const bool output_logprobs = sampling_params.logprobs;
     const int64_t output_max_top_logprobs = sampling_params.max_top_logprobs;
+    if (trace_pipeline_debug) {
+      LOG(INFO) << "REC multi-round stage, rank="
+                << runtime_.context->get_parallel_args().rank()
+                << ", round=" << round << ", stage=round_begin"
+                << ", total_rounds=" << total_rounds
+                << ", final_round=" << final_round
+                << ", requested_result_width=" << requested_result_width
+                << ", beam_width=" << beam_width << ", token_ids="
+                << (mutable_input.token_ids.defined()
+                        ? tensor_debug_shape(mutable_input.token_ids)
+                        : "<undefined>")
+                << ", positions="
+                << (mutable_input.positions.defined()
+                        ? tensor_debug_shape(mutable_input.positions)
+                        : "<undefined>");
+    }
     if (final_round && requested_result_width != beam_width) {
       round_sampling_params.max_top_logprobs = std::max<int64_t>(
           round_sampling_params.max_top_logprobs, requested_result_width);
@@ -2247,24 +2623,154 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
                                           beam_tensors,
                                           next_round_async_result);
 #endif
+    log_rec_multiround_stage_timing(
+        rank, round, "prepare_round_input", stage_timer);
+    stage_timer.reset();
+    if (trace_pipeline_debug) {
+      LOG(INFO) << "REC multi-round stage, rank="
+                << runtime_.context->get_parallel_args().rank()
+                << ", round=" << round << ", stage=prepare_done"
+                << ", token_ids="
+                << (mutable_input.token_ids.defined()
+                        ? tensor_debug_shape(mutable_input.token_ids)
+                        : "<undefined>")
+                << ", positions="
+                << (mutable_input.positions.defined()
+                        ? tensor_debug_shape(mutable_input.positions)
+                        : "<undefined>");
+    }
 
     auto model_output = runtime_.executor->forward(mutable_input.token_ids,
                                                    mutable_input.positions,
                                                    runtime_.worker.kv_caches_,
                                                    mutable_input.input_params);
+    log_rec_multiround_stage_timing(
+        rank, round, "executor_forward", stage_timer);
+    stage_timer.reset();
+    if (trace_pipeline_debug) {
+      LOG(INFO) << "REC multi-round stage, rank="
+                << runtime_.context->get_parallel_args().rank()
+                << ", round=" << round << ", stage=forward_done"
+                << ", hidden_states="
+                << (model_output.hidden_states.defined()
+                        ? tensor_debug_shape(model_output.hidden_states)
+                        : "<undefined>");
+    }
     if (!model_output.hidden_states.defined()) {
       return std::nullopt;
     }
+#if defined(USE_NPU)
+    debug_sync_rec_multiround_device(device, rank, round, "forward_done");
+#endif
     torch::Tensor hidden_states = model_output.hidden_states;
 
     if (sampling_params.selected_token_idxes.defined()) {
+      if (trace_pipeline_debug) {
+        LOG(INFO) << "REC multi-round stage, rank="
+                  << runtime_.context->get_parallel_args().rank()
+                  << ", round=" << round << ", stage=logits_begin"
+                  << ", selected_token_idxes="
+                  << tensor_debug_shape(sampling_params.selected_token_idxes);
+      }
       logits = runtime_.model->logits(hidden_states,
                                       sampling_params.selected_token_idxes);
-      sample_output = rec_sampler_->forward(logits, round_sampling_params);
+      if (trace_pipeline_debug) {
+        LOG(INFO) << "REC multi-round stage, rank="
+                  << runtime_.context->get_parallel_args().rank()
+                  << ", round=" << round << ", stage=logits_done"
+                  << ", logits="
+                  << (logits.defined() ? tensor_debug_shape(logits)
+                                       : "<undefined>");
+      }
+#if defined(USE_NPU)
+      if (should_sync_rec_multiround_tp_stage(
+              runtime_.context->get_parallel_args().world_size(),
+              runtime_.worker.device(),
+              is_driver,
+              final_round)) {
+        const int sync_ret = runtime_.stream->synchronize();
+        CHECK_EQ(sync_ret, 0)
+            << "REC multi-round TP logits stream sync failed"
+            << ", rank=" << rank << ", round=" << round << ", ret=" << sync_ret;
+      }
+      debug_sync_rec_multiround_device(device, rank, round, "logits_done");
+#endif
+      log_rec_multiround_stage_timing(
+          rank, round, "logits_and_sync", stage_timer);
+      stage_timer.reset();
     }
 
-    if (sample_output.top_tokens.defined() &&
-        sample_output.top_logprobs.defined()) {
+    if (sampling_params.selected_token_idxes.defined() &&
+        !(use_rank0_control && !is_driver)) {
+      sample_output = rec_sampler_->forward(logits, round_sampling_params);
+      log_rec_multiround_stage_timing(
+          rank, round, "sampler_forward", stage_timer);
+      stage_timer.reset();
+      if (trace_pipeline_debug) {
+        LOG(INFO) << "REC multi-round stage, rank="
+                  << runtime_.context->get_parallel_args().rank()
+                  << ", round=" << round << ", stage=sampler_done"
+                  << ", top_tokens="
+                  << (sample_output.top_tokens.defined()
+                          ? tensor_debug_shape(sample_output.top_tokens)
+                          : "<undefined>")
+                  << ", top_logprobs="
+                  << (sample_output.top_logprobs.defined()
+                          ? tensor_debug_shape(sample_output.top_logprobs)
+                          : "<undefined>");
+      }
+#if defined(USE_NPU)
+      debug_sync_rec_multiround_device(device, rank, round, "sampler_done");
+#endif
+    } else if (use_rank0_control && !is_driver) {
+      Timer sync_control_timer;
+      if (use_host_shared_control) {
+        if (!final_round) {
+          const SharedControlTensors control =
+              wait_rank0_control(input.rec_tp_step_id, round);
+          apply_shared_control(
+              control, round, beam_tensors, top_tokens, top_logprobs);
+        }
+      } else {
+        const int64_t top_count =
+            std::max<int64_t>(1, round_sampling_params.max_top_logprobs);
+        synchronize_rank0_control_with_allreduce(round,
+                                                 final_round,
+                                                 batch_size,
+                                                 beam_width,
+                                                 requested_result_width,
+                                                 total_rounds,
+                                                 top_count,
+                                                 beam_tensors,
+                                                 top_tokens,
+                                                 top_logprobs);
+      }
+      log_rec_multiround_stage_timing(
+          rank, round, "sync_rank0_control", sync_control_timer);
+      if (trace_pipeline_debug) {
+        LOG(INFO) << "REC multi-round stage, rank="
+                  << runtime_.context->get_parallel_args().rank()
+                  << ", round=" << round << ", stage=rank0_control_applied"
+                  << ", top_tokens="
+                  << (top_tokens.defined() ? tensor_debug_shape(top_tokens)
+                                           : "<undefined>")
+                  << ", sequence_group="
+                  << (beam_tensors.sequence_group.defined()
+                          ? tensor_debug_shape(beam_tensors.sequence_group)
+                          : "<undefined>");
+      }
+    }
+
+    if (use_rank0_control && !is_driver) {
+      if (!final_round && round > 0 && round < total_rounds - 1) {
+        execute_cache_select(
+            beam_tensors, mutable_input, round, beam_width, num_layers);
+        log_rec_multiround_stage_timing(
+            rank, round, "cache_select_from_rank0_control", stage_timer);
+        stage_timer.reset();
+      }
+    } else if (sample_output.top_tokens.defined() &&
+               sample_output.top_logprobs.defined()) {
       int64_t top_tokens_numel = sample_output.top_tokens.numel();
       int64_t top_logprobs_numel = sample_output.top_logprobs.numel();
       CHECK_EQ(top_tokens_numel % beam_width, 0)
@@ -2302,10 +2808,68 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
                             requested_result_width,
                             total_rounds);
       }
+      log_rec_multiround_stage_timing(rank, round, "beam_search", stage_timer);
+      stage_timer.reset();
+      if (use_rank0_control) {
+        Timer sync_control_timer;
+        if (use_host_shared_control) {
+          if (!final_round) {
+            publish_rank0_control(input.rec_tp_step_id,
+                                  round,
+                                  final_round,
+                                  top_tokens,
+                                  top_logprobs,
+                                  beam_tensors);
+          }
+        } else {
+          const int64_t top_count =
+              std::max<int64_t>(1, round_sampling_params.max_top_logprobs);
+          synchronize_rank0_control_with_allreduce(round,
+                                                   final_round,
+                                                   batch_size,
+                                                   beam_width,
+                                                   requested_result_width,
+                                                   total_rounds,
+                                                   top_count,
+                                                   beam_tensors,
+                                                   top_tokens,
+                                                   top_logprobs);
+        }
+        log_rec_multiround_stage_timing(
+            rank, round, "sync_rank0_control", sync_control_timer);
+      }
+      if (trace_pipeline_debug) {
+        LOG(INFO) << "REC multi-round stage, rank="
+                  << runtime_.context->get_parallel_args().rank()
+                  << ", round=" << round << ", stage=beam_search_done"
+                  << ", out_token_ids="
+                  << (beam_tensors.out_token_ids.defined()
+                          ? tensor_debug_shape(beam_tensors.out_token_ids)
+                          : "<undefined>")
+                  << ", sequence_group="
+                  << (beam_tensors.sequence_group.defined()
+                          ? tensor_debug_shape(beam_tensors.sequence_group)
+                          : "<undefined>");
+      }
+#if defined(USE_NPU)
+      debug_sync_rec_multiround_device(device, rank, round, "beam_search_done");
+#endif
 
       if (round > 0 && round < total_rounds - 1) {
         execute_cache_select(
             beam_tensors, mutable_input, round, beam_width, num_layers);
+        log_rec_multiround_stage_timing(
+            rank, round, "cache_select", stage_timer);
+        stage_timer.reset();
+        if (trace_pipeline_debug) {
+          LOG(INFO) << "REC multi-round stage, rank="
+                    << runtime_.context->get_parallel_args().rank()
+                    << ", round=" << round << ", stage=cache_select_done";
+        }
+#if defined(USE_NPU)
+        debug_sync_rec_multiround_device(
+            device, rank, round, "cache_select_done");
+#endif
       }
 
       if (final_round) {
@@ -2313,14 +2877,46 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
             logits, sample_output, sampling_params, beam_tensors, output);
         output.logprobs = output_logprobs;
         output.max_top_logprobs = output_max_top_logprobs;
+        log_rec_multiround_stage_timing(
+            rank, round, "build_final_output", stage_timer);
+        stage_timer.reset();
+        if (trace_pipeline_debug) {
+          LOG(INFO) << "REC multi-round stage, rank="
+                    << runtime_.context->get_parallel_args().rank()
+                    << ", round=" << round << ", stage=final_output_done"
+                    << ", beam_sequence_group="
+                    << (output.beam_sequence_group.defined()
+                            ? tensor_debug_shape(output.beam_sequence_group)
+                            : "<undefined>");
+        }
+#if defined(USE_NPU)
+        debug_sync_rec_multiround_device(
+            device, rank, round, "final_output_done");
+#endif
       }
     }
   }
 
+  if (trace_pipeline_debug) {
+    LOG(INFO) << "REC multi-round stage, rank="
+              << runtime_.context->get_parallel_args().rank()
+              << ", stage=stream_synchronize_begin";
+  }
+  Timer final_sync_timer;
   runtime_.stream->synchronize();
+  log_rec_multiround_stage_timing(
+      rank, total_rounds, "final_stream_sync", final_sync_timer);
+  if (trace_pipeline_debug) {
+    LOG(INFO) << "REC multi-round stage, rank="
+              << runtime_.context->get_parallel_args().rank()
+              << ", stage=stream_synchronize_done";
+  }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(device.index());
+  if (use_rank0_control && !is_driver) {
+    return std::nullopt;
+  }
   return output;
 }
 
@@ -2365,6 +2961,23 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_beam_search(
         beam_tensors.out_token_ids,
         beam_tensors.out_log_probs,
         beam_tensors.out_seqgroup);
+  } else if (runtime_.context->get_parallel_args().world_size() > 1 &&
+             !enable_rec_multiround_tp_npu_intermediate_beam()) {
+    select_intermediate_onerec_beam_results(
+        /*acc_logprob=*/beam_tensors.acc_logprob,
+        /*sequence_group=*/beam_tensors.sequence_group,
+        /*top_tokens=*/top_tokens,
+        /*top_logprobs=*/top_logprobs,
+        /*batch_size=*/batch_size,
+        /*beam_width=*/
+        static_cast<int32_t>(beam_tensors.sequence_group.size(1)),
+        /*current_step=*/round,
+        /*out_token_ids=*/beam_tensors.out_token_ids,
+        /*out_token_index=*/beam_tensors.out_token_index,
+        /*out_log_probs=*/beam_tensors.out_log_probs,
+        /*out_beam_count_prefix_sums=*/
+        beam_tensors.out_beam_count_prefix_sums,
+        /*out_sequence=*/beam_tensors.out_seqgroup);
   } else {
     xllm::kernel::npu::beam_search_rec(
         /*logprobs=*/beam_tensors.acc_logprob,
@@ -2414,7 +3027,8 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_final_beam_search(
           runtime_.worker.device());
 
 #if defined(USE_NPU)
-  if (can_use_beam_search_rec_final_select(
+  if (runtime_.context->get_parallel_args().world_size() == 1 &&
+      can_use_beam_search_rec_final_select(
           batch_size, top_tokens, requested_result_width)) {
     xllm::kernel::npu::beam_search_rec(
         /*logprobs=*/beam_tensors.acc_logprob,
@@ -2497,15 +3111,24 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_cache_select(
   const auto& unshared_v_caches =
       input.input_params.mutable_llmrec_params().unshared_v_caches;
 
-  xllm::kernel::npu::select_unshared_kv(
-      /*beam_index=*/beam_index_local.reshape({-1}),
-      /*x_key_block=*/unshared_k_caches,
-      /*x_value_block=*/unshared_v_caches,
-      /*block_table=*/block_table,
-      /*group_offset=*/group_prefix_local.reshape({-1}),
-      /*decode_step=*/static_cast<int64_t>(round),
-      /*beam_size=*/beam_width,
-      /*layer_num=*/num_layers);
+  auto run_cache_select = [&]() {
+    xllm::kernel::npu::select_unshared_kv(
+        /*beam_index=*/beam_index_local.reshape({-1}),
+        /*x_key_block=*/unshared_k_caches,
+        /*x_value_block=*/unshared_v_caches,
+        /*block_table=*/block_table,
+        /*group_offset=*/group_prefix_local.reshape({-1}),
+        /*decode_step=*/static_cast<int64_t>(round),
+        /*beam_size=*/beam_width,
+        /*layer_num=*/num_layers);
+  };
+  if (runtime_.context->get_parallel_args().world_size() > 1 &&
+      serialize_rec_multiround_tp_cache_select()) {
+    std::lock_guard<std::mutex> lock(rec_multiround_tp_cache_select_mutex());
+    run_cache_select();
+  } else {
+    run_cache_select();
+  }
 #elif defined(USE_CUDA)
   xllm::kernel::cuda::cache_select(
       beam_tensors.out_token_index,
@@ -2516,6 +3139,302 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_cache_select(
       beam_width,
       num_layers);
 #endif
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::publish_rank0_control(
+    uint64_t rec_tp_step_id,
+    int32_t round,
+    bool final_round,
+    const torch::Tensor& top_tokens,
+    const torch::Tensor& top_logprobs,
+    const BeamSearchTensors& beam_tensors) {
+  if (rec_tp_step_id == 0 || shared_control_state_ == nullptr) {
+    return;
+  }
+
+  SharedControlTensors control;
+  control.top_tokens_cpu =
+      top_tokens.defined() ? top_tokens.to(torch::kCPU) : torch::Tensor();
+  control.top_logprobs_cpu =
+      top_logprobs.defined() ? top_logprobs.to(torch::kCPU) : torch::Tensor();
+  control.sequence_group_cpu = beam_tensors.sequence_group.defined()
+                                   ? beam_tensors.sequence_group.to(torch::kCPU)
+                                   : torch::Tensor();
+  control.acc_logprob_cpu = beam_tensors.acc_logprob.defined()
+                                ? beam_tensors.acc_logprob.to(torch::kCPU)
+                                : torch::Tensor();
+  control.out_token_ids_cpu = beam_tensors.out_token_ids.defined()
+                                  ? beam_tensors.out_token_ids.to(torch::kCPU)
+                                  : torch::Tensor();
+  control.out_token_index_cpu =
+      beam_tensors.out_token_index.defined()
+          ? beam_tensors.out_token_index.to(torch::kCPU)
+          : torch::Tensor();
+  control.out_beam_count_prefix_sums_cpu =
+      beam_tensors.out_beam_count_prefix_sums.defined()
+          ? beam_tensors.out_beam_count_prefix_sums.to(torch::kCPU)
+          : torch::Tensor();
+  control.final_round = final_round;
+
+  const uint64_t key = rec_multiround_control_key(rec_tp_step_id, round);
+  std::shared_ptr<SharedControlSlot> slot;
+  {
+    std::lock_guard<std::mutex> state_lock(shared_control_state_->slots_mutex);
+    auto& slot_ref = shared_control_state_->slots[key];
+    if (slot_ref == nullptr) {
+      slot_ref = std::make_shared<SharedControlSlot>();
+    }
+    slot = slot_ref;
+  }
+
+  {
+    std::lock_guard<std::mutex> slot_lock(slot->mutex);
+    slot->tensors = std::move(control);
+  }
+  slot->cv.notify_all();
+}
+
+RecWorkerImpl::LlmRecMultiRoundPipeline::SharedControlTensors
+RecWorkerImpl::LlmRecMultiRoundPipeline::wait_rank0_control(
+    uint64_t rec_tp_step_id,
+    int32_t round) {
+  CHECK_GT(rec_tp_step_id, 0);
+  CHECK(shared_control_state_ != nullptr);
+  const uint64_t key = rec_multiround_control_key(rec_tp_step_id, round);
+
+  std::shared_ptr<SharedControlSlot> slot;
+  {
+    std::lock_guard<std::mutex> state_lock(shared_control_state_->slots_mutex);
+    auto& slot_ref = shared_control_state_->slots[key];
+    if (slot_ref == nullptr) {
+      slot_ref = std::make_shared<SharedControlSlot>();
+    }
+    slot = slot_ref;
+  }
+
+  std::unique_lock<std::mutex> slot_lock(slot->mutex);
+  const bool ready =
+      slot->cv.wait_for(slot_lock, std::chrono::seconds(60), [&] {
+        return slot->tensors.has_value();
+      });
+  CHECK(ready) << "Timed out waiting for rank0 REC multi-round TP control, "
+               << "step_id=" << rec_tp_step_id << ", round=" << round;
+  return slot->tensors.value();
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::erase_rank0_control(
+    uint64_t rec_tp_step_id) {
+  if (rec_tp_step_id == 0 || shared_control_state_ == nullptr ||
+      !runtime_.worker.is_driver()) {
+    return;
+  }
+  std::lock_guard<std::mutex> state_lock(shared_control_state_->slots_mutex);
+  const uint64_t first_key = rec_multiround_control_key(rec_tp_step_id, 0);
+  const uint64_t last_key = rec_multiround_control_key(rec_tp_step_id + 1, 0);
+  auto it = shared_control_state_->slots.lower_bound(first_key);
+  while (it != shared_control_state_->slots.end() && it->first < last_key) {
+    it = shared_control_state_->slots.erase(it);
+  }
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::apply_shared_control(
+    const SharedControlTensors& control,
+    int32_t round,
+    BeamSearchTensors& beam_tensors,
+    torch::Tensor& top_tokens,
+    torch::Tensor& top_logprobs) {
+  auto device = runtime_.worker.device();
+  if (control.top_tokens_cpu.defined()) {
+    top_tokens = control.top_tokens_cpu.to(device, /*non_blocking=*/false);
+  }
+  if (control.top_logprobs_cpu.defined()) {
+    top_logprobs = control.top_logprobs_cpu.to(device, /*non_blocking=*/false);
+  }
+  if (control.sequence_group_cpu.defined()) {
+    beam_tensors.sequence_group =
+        control.sequence_group_cpu.to(device, /*non_blocking=*/false);
+  }
+  if (control.acc_logprob_cpu.defined()) {
+    beam_tensors.acc_logprob =
+        control.acc_logprob_cpu.to(device, /*non_blocking=*/false);
+  }
+  if (!control.final_round && round > 0) {
+    if (control.out_token_ids_cpu.defined()) {
+      beam_tensors.out_token_ids =
+          control.out_token_ids_cpu.to(device, /*non_blocking=*/false);
+    }
+    if (control.out_token_index_cpu.defined()) {
+      beam_tensors.out_token_index =
+          control.out_token_index_cpu.to(device, /*non_blocking=*/false);
+    }
+    if (control.out_beam_count_prefix_sums_cpu.defined()) {
+      beam_tensors.out_beam_count_prefix_sums =
+          control.out_beam_count_prefix_sums_cpu.to(device,
+                                                    /*non_blocking=*/false);
+    }
+  }
+}
+
+void RecWorkerImpl::LlmRecMultiRoundPipeline::
+    synchronize_rank0_control_with_allreduce(int32_t round,
+                                             bool final_round,
+                                             int32_t batch_size,
+                                             int32_t beam_width,
+                                             int32_t requested_result_width,
+                                             int32_t total_rounds,
+                                             int64_t top_count,
+                                             BeamSearchTensors& beam_tensors,
+                                             torch::Tensor& top_tokens,
+                                             torch::Tensor& top_logprobs) {
+  const ParallelArgs& parallel_args = runtime_.context->get_parallel_args();
+  ProcessGroup* tp_group = runtime_.rec_tp_control_group != nullptr
+                               ? runtime_.rec_tp_control_group
+                               : parallel_args.tp_group_;
+  CHECK(tp_group != nullptr)
+      << "REC multi-round rank0-control requires a TP process group.";
+  CHECK_GT(tp_group->world_size(), 1)
+      << "REC multi-round rank0-control should only run for TP world_size > 1.";
+  CHECK_EQ(tp_group->rank(), parallel_args.rank())
+      << "TP group rank must match worker rank for rank0-control.";
+  CHECK_GT(batch_size, 0);
+  CHECK_GT(beam_width, 0);
+  CHECK_GT(total_rounds, 0);
+  CHECK_GT(top_count, 0);
+
+  const torch::Device device = runtime_.worker.device();
+  const bool is_driver = runtime_.worker.is_driver();
+  const int64_t top_rows = round == 0
+                               ? static_cast<int64_t>(batch_size)
+                               : static_cast<int64_t>(batch_size) * beam_width;
+  const int32_t output_width =
+      final_round && requested_result_width != beam_width
+          ? requested_result_width
+          : beam_width;
+  CHECK_GT(output_width, 0);
+  const int64_t output_rows = static_cast<int64_t>(batch_size) * output_width;
+
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto fp32_options =
+      torch::TensorOptions().dtype(torch::kFloat32).device(device);
+
+  struct ControlTensorPlan {
+    torch::Tensor* tensor;
+    std::vector<int64_t> shape;
+    const char* name;
+  };
+
+  auto shape_numel = [](const std::vector<int64_t>& shape) {
+    int64_t numel = 1;
+    for (int64_t dim : shape) {
+      CHECK_GT(dim, 0);
+      numel *= dim;
+    }
+    return numel;
+  };
+
+  auto check_driver_tensor = [&](torch::Tensor& tensor,
+                                 const std::vector<int64_t>& shape,
+                                 const char* name) {
+    CHECK(tensor.defined()) << "rank0 control tensor is undefined: " << name;
+    CHECK_EQ(tensor.sizes(), torch::IntArrayRef(shape))
+        << "rank0 control tensor shape mismatch for " << name
+        << ", expected=" << torch::IntArrayRef(shape)
+        << ", actual=" << tensor.sizes();
+  };
+
+  std::vector<ControlTensorPlan> int_plans = {
+      {&top_tokens, {top_rows, top_count}, "top_tokens"},
+      {&beam_tensors.sequence_group,
+       {batch_size, output_width, total_rounds},
+       "sequence_group"},
+      {&beam_tensors.out_token_ids, {output_rows, 1}, "out_token_ids"},
+      {&beam_tensors.out_token_index, {output_rows, 1}, "out_token_index"},
+      {&beam_tensors.out_beam_count_prefix_sums,
+       {output_rows, 1},
+       "out_beam_count_prefix_sums"},
+  };
+  std::vector<ControlTensorPlan> fp32_plans = {
+      {&top_logprobs, {top_rows, top_count}, "top_logprobs"},
+      {&beam_tensors.acc_logprob, {output_rows, 1}, "acc_logprob"},
+  };
+
+  if (enable_rec_multiround_tp_packed_rank0_control()) {
+    auto pack_allreduce_unpack = [&](std::vector<ControlTensorPlan>& plans,
+                                     const torch::TensorOptions& options,
+                                     torch::Dtype dtype) {
+      int64_t total_numel = 0;
+      for (const auto& plan : plans) {
+        total_numel += shape_numel(plan.shape);
+      }
+      torch::Tensor buffer = torch::zeros({total_numel}, options);
+
+      int64_t offset = 0;
+      for (auto& plan : plans) {
+        const int64_t numel = shape_numel(plan.shape);
+        if (is_driver) {
+          check_driver_tensor(*plan.tensor, plan.shape, plan.name);
+          buffer.narrow(/*dim=*/0, offset, numel)
+              .copy_(plan.tensor->to(dtype).contiguous().view({numel}));
+        }
+        offset += numel;
+      }
+
+      tp_group->allreduce(buffer);
+
+      offset = 0;
+      for (auto& plan : plans) {
+        const int64_t numel = shape_numel(plan.shape);
+        *plan.tensor = buffer.narrow(/*dim=*/0, offset, numel).view(plan.shape);
+        offset += numel;
+      }
+    };
+
+    // Preserve identical collective order across TP ranks while reducing the
+    // rank0-control fan-out from seven small HCCL allreduces to two.
+    pack_allreduce_unpack(int_plans, int_options, torch::kInt32);
+    pack_allreduce_unpack(fp32_plans, fp32_options, torch::kFloat32);
+    return;
+  }
+
+  auto prepare_int_tensor =
+      [&](torch::Tensor& tensor, std::vector<int64_t> shape, const char* name) {
+        if (is_driver) {
+          check_driver_tensor(tensor, shape, name);
+          tensor = tensor.to(torch::kInt32).contiguous();
+        } else {
+          tensor = torch::zeros(shape, int_options);
+        }
+        tp_group->allreduce(tensor);
+      };
+
+  auto prepare_fp32_tensor =
+      [&](torch::Tensor& tensor, std::vector<int64_t> shape, const char* name) {
+        if (is_driver) {
+          check_driver_tensor(tensor, shape, name);
+          tensor = tensor.to(torch::kFloat32).contiguous();
+        } else {
+          tensor = torch::zeros(shape, fp32_options);
+        }
+        tp_group->allreduce(tensor);
+      };
+
+  // All ranks must issue HCCL collectives in the same order with identical
+  // shape/dtype. Rank0 contributes real control tensors; other ranks
+  // contribute zeros and receive rank0's values via SUM allreduce.
+  prepare_int_tensor(top_tokens, {top_rows, top_count}, "top_tokens");
+  prepare_fp32_tensor(top_logprobs, {top_rows, top_count}, "top_logprobs");
+  prepare_int_tensor(beam_tensors.sequence_group,
+                     {batch_size, output_width, total_rounds},
+                     "sequence_group");
+  prepare_fp32_tensor(
+      beam_tensors.acc_logprob, {output_rows, 1}, "acc_logprob");
+  prepare_int_tensor(
+      beam_tensors.out_token_ids, {output_rows, 1}, "out_token_ids");
+  prepare_int_tensor(
+      beam_tensors.out_token_index, {output_rows, 1}, "out_token_index");
+  prepare_int_tensor(beam_tensors.out_beam_count_prefix_sums,
+                     {output_rows, 1},
+                     "out_beam_count_prefix_sums");
 }
 
 void RecWorkerImpl::LlmRecMultiRoundPipeline::build_final_output(
@@ -2954,10 +3873,6 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
     : LLMWorkerImpl(parallel_args, device, options) {
   initialize_xattention_workspace();
 
-  if (!is_driver()) {
-    return;
-  }
-
   step_threadpool_ = std::make_unique<ThreadPool>(
       options_.rec_worker_max_concurrency(), [this]() mutable {
         device_.set_device();
@@ -2968,12 +3883,17 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
 #endif
       });
 
-  LOG(INFO) << "RecWorkerImpl constructor: "
+  LOG(INFO) << "RecWorkerImpl constructor, rank=" << parallel_args.rank()
+            << ", world_size=" << parallel_args.world_size()
+            << ", device=" << device << ", is_driver=" << is_driver()
+            << ", rec_worker_max_concurrency="
             << options_.rec_worker_max_concurrency();
-  const int64_t num_threads = std::max<int64_t>(
-      1, util::get_int_env("XLLM_REC_INPUT_BUILDER_THREADS", 16));
-  input_builder_thread_pool_ =
-      std::make_shared<MPMCThreadPool>(static_cast<size_t>(num_threads));
+  if (is_driver()) {
+    const int64_t num_threads = std::max<int64_t>(
+        1, util::get_int_env("XLLM_REC_INPUT_BUILDER_THREADS", 16));
+    input_builder_thread_pool_ =
+        std::make_shared<MPMCThreadPool>(static_cast<size_t>(num_threads));
+  }
 }
 
 RecWorkerImpl::~RecWorkerImpl() {
@@ -3018,16 +3938,45 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
   // Create concurrent pipeline (not base class pipeline)
   auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
 
+  size_t pipeline_count =
+      static_cast<size_t>(options_.rec_worker_max_concurrency());
+  if (pipeline_type == RecPipelineType::kLlmRecMultiRoundPipeline &&
+      parallel_args_.world_size() > 1 &&
+      enable_rec_multiround_tp_single_model_pipeline()) {
+    pipeline_count = 1;
+    LOG(INFO) << "REC multi-round local TP uses single model pipeline per rank"
+              << ", rank=" << parallel_args_.rank()
+              << ", world_size=" << parallel_args_.world_size()
+              << ", configured_rec_worker_max_concurrency="
+              << options_.rec_worker_max_concurrency()
+              << ", effective_pipeline_count=" << pipeline_count;
+  }
+
   // Reserve space for model instances
-  work_pipelines_.reserve(options_.rec_worker_max_concurrency());
-  for (size_t i = 0; i < options_.rec_worker_max_concurrency(); ++i) {
+  work_pipelines_.reserve(pipeline_count);
+  for (size_t i = 0; i < pipeline_count; ++i) {
     RecPipelineRuntime runtime(*this);
+    runtime.pipeline_index = i;
     auto stream = device_.get_stream_from_pool();
     runtime.stream = std::move(stream);
     auto stream_guard = runtime.stream->set_stream_guard();
 
+    ParallelArgs pipeline_parallel_args = context.get_parallel_args();
+#if defined(USE_NPU)
+    if (enable_rec_multiround_tp_per_pipeline_atb_comm() &&
+        pipeline_type == RecPipelineType::kLlmRecMultiRoundPipeline &&
+        pipeline_parallel_args.world_size() > 1) {
+      pipeline_parallel_args.atb_tp_comm_domain(std::to_string(i));
+      LOG(INFO) << "REC pipeline uses experimental ATB TP comm domain"
+                << ", rank=" << pipeline_parallel_args.rank()
+                << ", world_size=" << pipeline_parallel_args.world_size()
+                << ", pipeline=" << i << ", comm_domain="
+                << pipeline_parallel_args.atb_tp_comm_domain();
+    }
+#endif
+
     runtime.context =
-        std::make_unique<ModelContext>(context.get_parallel_args(),
+        std::make_unique<ModelContext>(pipeline_parallel_args,
                                        context.get_model_args(),
                                        context.get_quant_args(),
                                        context.get_tensor_options());
@@ -3165,12 +4114,15 @@ std::optional<ForwardOutput> RecWorkerImpl::step(const ForwardInput& input) {
   return std::nullopt;
 }
 
-folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
-    const ForwardInput& input) {
+folly::SemiFuture<std::optional<ForwardOutput>>
+RecWorkerImpl::schedule_step_async(const ForwardInput& input,
+                                   size_t index,
+                                   bool return_pipeline_index) {
   folly::Promise<std::optional<ForwardOutput>> promise;
 
-  size_t index;
-  index_queue_.wait_dequeue(index);
+  CHECK_LT(index, work_pipelines_.size())
+      << "REC pipeline index out of range, index=" << index
+      << ", pipelines=" << work_pipelines_.size();
   auto future = promise.getSemiFuture();
   // Copy the input because the scheduled task may run after step_async returns.
   ForwardInput input_copy = input;
@@ -3182,9 +4134,22 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
       [this,
        input = std::move(input_copy),
        index,
+       return_pipeline_index,
        promise = std::move(promise)]() mutable {
-        xllm::ScopeGuard index_guard([&] { index_queue_.enqueue(index); });
+        xllm::ScopeGuard index_guard([&] {
+          if (return_pipeline_index) {
+            index_queue_.enqueue(index);
+          }
+        });
         try {
+          if (enable_rec_pipeline_concurrency_debug()) {
+            LOG(INFO) << "REC pipeline execute begin, rank="
+                      << parallel_args_.rank()
+                      << ", world_size=" << parallel_args_.world_size()
+                      << ", device=" << device_.unwrap()
+                      << ", pipeline=" << index
+                      << ", thread_id=" << std::this_thread::get_id();
+          }
           auto stream_guard =
               work_pipelines_[index]->runtime().stream->set_stream_guard();
 
@@ -3198,6 +4163,13 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
           }
 
           const auto output = work_pipelines_[index]->step(input_on_device);
+          if (enable_rec_pipeline_concurrency_debug()) {
+            LOG(INFO) << "REC pipeline execute end, rank="
+                      << parallel_args_.rank()
+                      << ", device=" << device_.unwrap()
+                      << ", pipeline=" << index
+                      << ", has_output=" << output.has_value();
+          }
           promise.setValue(output);
         } catch (const std::exception& e) {
           LOG(ERROR) << "RecWorkerImpl::step_async failed on pipeline " << index
@@ -3214,6 +4186,36 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
       index);
 
   return future;
+}
+
+folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
+    const ForwardInput& input) {
+  size_t index;
+  index_queue_.wait_dequeue(index);
+  return schedule_step_async(input, index, /*return_pipeline_index=*/true);
+}
+
+folly::SemiFuture<std::optional<ForwardOutput>>
+RecWorkerImpl::step_async_with_pipeline_index(const ForwardInput& input,
+                                              size_t pipeline_index) {
+  return schedule_step_async(
+      input, pipeline_index, /*return_pipeline_index=*/false);
+}
+
+void RecWorkerImpl::set_pipeline_control_group(size_t pipeline_index,
+                                               ProcessGroup* group) {
+  CHECK_LT(pipeline_index, work_pipelines_.size())
+      << "REC pipeline control group index out of range, index="
+      << pipeline_index << ", pipelines=" << work_pipelines_.size();
+  CHECK(group != nullptr) << "REC pipeline control group must not be null.";
+  work_pipelines_[pipeline_index]->runtime().rec_tp_control_group = group;
+  LOG(INFO) << "REC pipeline control group bound, rank="
+            << parallel_args_.rank()
+            << ", world_size=" << parallel_args_.world_size()
+            << ", device=" << device_.unwrap()
+            << ", pipeline=" << pipeline_index
+            << ", control_group_rank=" << group->rank()
+            << ", control_group_world_size=" << group->world_size();
 }
 
 // ============================================================

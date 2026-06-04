@@ -18,7 +18,9 @@ limitations under the License.
 #include <folly/futures/Future.h>
 #include <torch/torch.h>
 
+#include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -62,6 +64,10 @@ class RecWorkerImpl : public LLMWorkerImpl {
 
   folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& input);
+  folly::SemiFuture<std::optional<ForwardOutput>>
+  step_async_with_pipeline_index(const ForwardInput& input,
+                                 size_t pipeline_index);
+  void set_pipeline_control_group(size_t pipeline_index, ProcessGroup* group);
 
  protected:
   std::shared_ptr<MPMCThreadPool> input_builder_thread_pool_;
@@ -76,7 +82,11 @@ class RecWorkerImpl : public LLMWorkerImpl {
       context = std::move(other.context);
       eplb_executor = std::move(other.eplb_executor);
       expert_load_data = std::move(other.expert_load_data);
+      pipeline_index = other.pipeline_index;
+      rec_tp_control_group = other.rec_tp_control_group;
     }
+    size_t pipeline_index = 0;
+    ProcessGroup* rec_tp_control_group = nullptr;
     std::unique_ptr<Stream> stream;
     std::unique_ptr<CausalLM> model;
     std::unique_ptr<Executor> executor;
@@ -234,6 +244,28 @@ class RecWorkerImpl : public LLMWorkerImpl {
       torch::Tensor out_seqgroup;  // [batch_size, beam_width, total_rounds]
     };
 
+    struct SharedControlTensors {
+      torch::Tensor top_tokens_cpu;
+      torch::Tensor top_logprobs_cpu;
+      torch::Tensor sequence_group_cpu;
+      torch::Tensor acc_logprob_cpu;
+      torch::Tensor out_token_ids_cpu;
+      torch::Tensor out_token_index_cpu;
+      torch::Tensor out_beam_count_prefix_sums_cpu;
+      bool final_round = false;
+    };
+
+    struct SharedControlSlot {
+      std::mutex mutex;
+      std::condition_variable cv;
+      std::optional<SharedControlTensors> tensors;
+    };
+
+    struct SharedControlState {
+      std::mutex slots_mutex;
+      std::map<uint64_t, std::shared_ptr<SharedControlSlot>> slots;
+    };
+
     // Prepare beam search tensors
     BeamSearchTensors prepare_beam_search_tensors(int32_t batch_size,
                                                   int32_t beam_width,
@@ -301,6 +333,31 @@ class RecWorkerImpl : public LLMWorkerImpl {
                                      int32_t round,
                                      const torch::Tensor& top_tokens,
                                      const BeamSearchTensors& beam_tensors);
+    void publish_rank0_control(uint64_t rec_tp_step_id,
+                               int32_t round,
+                               bool final_round,
+                               const torch::Tensor& top_tokens,
+                               const torch::Tensor& top_logprobs,
+                               const BeamSearchTensors& beam_tensors);
+    SharedControlTensors wait_rank0_control(uint64_t rec_tp_step_id,
+                                            int32_t round);
+    void erase_rank0_control(uint64_t rec_tp_step_id);
+    void apply_shared_control(const SharedControlTensors& control,
+                              int32_t round,
+                              BeamSearchTensors& beam_tensors,
+                              torch::Tensor& top_tokens,
+                              torch::Tensor& top_logprobs);
+    void synchronize_rank0_control_with_allreduce(
+        int32_t round,
+        bool final_round,
+        int32_t batch_size,
+        int32_t beam_width,
+        int32_t requested_result_width,
+        int32_t total_rounds,
+        int64_t top_count,
+        BeamSearchTensors& beam_tensors,
+        torch::Tensor& top_tokens,
+        torch::Tensor& top_logprobs);
 
     void prepare_two_stage_round_input(ForwardInput& input,
                                        int32_t round,
@@ -356,6 +413,7 @@ class RecWorkerImpl : public LLMWorkerImpl {
     torch::Tensor cached_beam_width_tensor_;
 
     std::unique_ptr<RecSampler> rec_sampler_;
+    std::shared_ptr<SharedControlState> shared_control_state_;
 
     // for async scheduler
     ThreadPool threadpool_;
@@ -379,6 +437,10 @@ class RecWorkerImpl : public LLMWorkerImpl {
   void prepare_multi_modal_data(ForwardInput& processed_inputs);
 
   void initialize_xattention_workspace();
+  folly::SemiFuture<std::optional<ForwardOutput>> schedule_step_async(
+      const ForwardInput& input,
+      size_t pipeline_index,
+      bool return_pipeline_index);
 
   std::vector<std::unique_ptr<RecWorkPipeline>> work_pipelines_;
 

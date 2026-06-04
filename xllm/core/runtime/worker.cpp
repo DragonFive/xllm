@@ -147,6 +147,36 @@ folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
   return impl_->step_async(inputs);
 }
 
+folly::SemiFuture<std::optional<ForwardOutput>>
+Worker::rec_step_async_with_pipeline_index(const ForwardInput& inputs,
+                                           size_t pipeline_index) {
+  auto* rec_impl = dynamic_cast<RecWorkerImpl*>(impl_);
+  CHECK(rec_impl != nullptr)
+      << "rec_step_async_with_pipeline_index requires a REC worker.";
+  return rec_impl->step_async_with_pipeline_index(inputs, pipeline_index);
+}
+
+folly::SemiFuture<std::optional<ForwardOutput>>
+Worker::rec_step_async_with_pipeline_index(const ForwardInput& inputs,
+                                           size_t pipeline_index,
+                                           uint64_t rec_tp_step_id) {
+  auto* rec_impl = dynamic_cast<RecWorkerImpl*>(impl_);
+  CHECK(rec_impl != nullptr)
+      << "rec_step_async_with_pipeline_index requires a REC worker.";
+  ForwardInput input_with_step_id = inputs;
+  input_with_step_id.rec_tp_step_id = rec_tp_step_id;
+  return rec_impl->step_async_with_pipeline_index(input_with_step_id,
+                                                  pipeline_index);
+}
+
+void Worker::set_rec_pipeline_control_group(size_t pipeline_index,
+                                            ProcessGroup* group) {
+  auto* rec_impl = dynamic_cast<RecWorkerImpl*>(impl_);
+  CHECK(rec_impl != nullptr)
+      << "set_rec_pipeline_control_group requires a REC worker.";
+  rec_impl->set_pipeline_control_group(pipeline_index, group);
+}
+
 folly::SemiFuture<folly::Unit> Worker::process_group_test_async() {
   return impl_->process_group_test_async();
 }

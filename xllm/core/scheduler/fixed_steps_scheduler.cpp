@@ -37,12 +37,20 @@ limitations under the License.
 #include "framework/request/rec_type.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
+#include "util/env_var.h"
 #include "util/rec_model_utils.h"
 #include "util/scope_guard.h"
+#include "util/timer.h"
 
 namespace xllm {
 
 namespace {
+
+bool enable_rec_multiround_scheduler_timing() {
+  static const bool enabled =
+      util::get_bool_env("XLLM_DEBUG_REC_MULTIROUND_SCHEDULER_TIMING", false);
+  return enabled;
+}
 
 void fail_step_requests(const std::vector<std::shared_ptr<Request>>& requests,
                         KVCacheManager* kv_cache_manager,
@@ -376,7 +384,19 @@ ScheduleResult FixedStepsScheduler::schedule_request(
 void FixedStepsScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
+    const bool trace_rec_multiround_timing =
+        enable_rec_multiround_scheduler_timing() &&
+        scheduler_pipeline_ != nullptr &&
+        dynamic_cast<RecMultiRoundSchedulerPipeline*>(
+            scheduler_pipeline_.get()) != nullptr;
+    Timer schedule_timer;
     ScheduleResult result = schedule_request(timeout);
+    if (trace_rec_multiround_timing) {
+      LOG(INFO) << "REC multi-round scheduler timing, stage=schedule_request"
+                << ", batches=" << result.batches.size()
+                << ", requests=" << result.requests.size()
+                << ", elapsed_us=" << schedule_timer.elapsed_microseconds();
+    }
     bool all_empty =
         std::all_of(result.batches.begin(),
                     result.batches.end(),
@@ -395,6 +415,8 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
                          scheduler_pipeline_ != nullptr &&
                          scheduler_pipeline_->requires_kv_cache()]() mutable {
       UNUSED_PARAMETER(sequences);
+      const bool trace_rec_multiround_timing =
+          enable_rec_multiround_scheduler_timing();
       xllm::ScopeGuard step_guard([this]() {
         if (options_.rec_worker_max_concurrency() > 1) {
           step_semaphore_.release();
@@ -402,7 +424,14 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
       });
 
       try {
+        Timer stage_timer;
         engine_->step(batches);
+        if (trace_rec_multiround_timing) {
+          LOG(INFO) << "REC multi-round scheduler timing, stage=engine_step"
+                    << ", requests=" << requests.size()
+                    << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+        }
+        stage_timer.reset();
         // kv_cache_manager_->reset_transfer_infos();
 
         // After step completes, check and process finished/cancelled requests
@@ -422,6 +451,13 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
         // Process finished requests
         if (!finished_requests.empty()) {
           response_processor_->process_completed_requests(finished_requests);
+        }
+        if (trace_rec_multiround_timing) {
+          LOG(INFO)
+              << "REC multi-round scheduler timing, stage=response_process"
+              << ", requests=" << requests.size()
+              << ", finished=" << finished_requests.size()
+              << ", elapsed_us=" << stage_timer.elapsed_microseconds();
         }
       } catch (const std::exception& e) {
         // kv_cache_manager_->reset_transfer_infos();
@@ -447,7 +483,13 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
     };
 
     if (options_.rec_worker_max_concurrency() > 1) {
+      Timer semaphore_wait_timer;
       step_semaphore_.acquire();
+      if (enable_rec_multiround_scheduler_timing()) {
+        LOG(INFO) << "REC scheduler host timing, stage=scheduler_semaphore_wait"
+                  << ", elapsed_us="
+                  << semaphore_wait_timer.elapsed_microseconds();
+      }
       step_threadpool_->schedule(function);
     } else {
       function();

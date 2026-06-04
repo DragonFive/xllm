@@ -27,7 +27,7 @@ void WordEmbeddingManualLoader::load_state_dict(const StateDict& state_dict) {
     set_weight(
         state_dict, "weight", 0, 1, dp_local_tp_rank_, dp_local_tp_size_, true);
   } else {
-    set_weight(state_dict, "weight", 0, 1, true);
+    set_weight(state_dict, "weight", 0, true);
   }
 }
 

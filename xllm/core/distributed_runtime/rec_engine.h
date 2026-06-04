@@ -17,7 +17,10 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 
 #include "common/macros.h"
 #include "distributed_runtime/dist_manager.h"
@@ -29,6 +32,7 @@ limitations under the License.
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
 #include "runtime/worker.h"
+#include "util/blockingconcurrentqueue.h"
 #include "util/rec_model_utils.h"
 #include "util/threadpool.h"
 
@@ -174,6 +178,30 @@ class RecEngine : public Engine {
 
    private:
     ForwardOutput get_model_output(const ForwardInput& model_inputs);
+    bool use_shared_pipeline_index() const;
+    size_t lease_shared_pipeline_index();
+    std::vector<size_t> lease_all_shared_pipeline_indices();
+    void release_shared_pipeline_index(size_t pipeline_index);
+    void initialize_shared_pipeline_indices();
+    void initialize_rec_tp_control_groups(size_t pipeline_count);
+    uint64_t next_rec_tp_step_id();
+    bool should_serialize_shape_first_use(const ForwardInput& model_inputs);
+    int64_t rec_multiround_shape_key(const ForwardInput& model_inputs) const;
+
+    moodycamel::BlockingConcurrentQueue<size_t> shared_pipeline_indices_;
+    std::vector<std::vector<std::unique_ptr<ProcessGroup>>>
+        rec_tp_control_groups_by_pipeline_;
+    std::atomic<uint64_t> rec_tp_step_id_{1};
+    std::mutex shared_pipeline_acquire_mutex_;
+    std::mutex shared_pipeline_lease_mutex_;
+    std::mutex shared_pipeline_init_mutex_;
+    std::vector<bool> shared_pipeline_in_flight_;
+    size_t shared_pipeline_count_ = 0;
+    size_t shared_pipeline_next_init_index_ = 0;
+    bool shared_pipeline_first_use_serializing_ = false;
+    bool shared_pipeline_indices_initialized_ = false;
+    std::mutex shared_pipeline_shape_init_mutex_;
+    std::unordered_set<int64_t> initialized_shape_keys_;
   };
 
   // Factory method to create pipeline (can access private classes)

@@ -19,8 +19,10 @@ limitations under the License.
 #include <mstx/ms_tools_ext.h>
 
 #include <map>
+#include <vector>
 
 #include "common/global_flags.h"
+#include "util/env_var.h"
 #include "util/rec_model_utils.h"
 
 // #include "attn_mask.h"
@@ -29,6 +31,52 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+namespace {
+
+std::string resolve_atb_tp_comm_domain(const ParallelArgs& parallel_args,
+                                       const std::string& fallback) {
+  if (!parallel_args.atb_tp_comm_domain().empty()) {
+    return parallel_args.atb_tp_comm_domain();
+  }
+  return fallback;
+}
+
+std::string tensor_shape_string(const at::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return "<undefined>";
+  }
+  std::string shape = "[";
+  for (int64_t i = 0; i < tensor.dim(); ++i) {
+    if (i > 0) {
+      shape += ",";
+    }
+    shape += std::to_string(tensor.size(i));
+  }
+  shape += "]";
+  return shape;
+}
+
+std::string tensor_vector_shape_string(const std::vector<at::Tensor>& tensors,
+                                       size_t index) {
+  if (index >= tensors.size()) {
+    return "<missing>";
+  }
+  return tensor_shape_string(tensors[index]);
+}
+
+bool enable_rec_pipeline_concurrency_debug() {
+  static const bool enabled =
+      util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false);
+  return enabled;
+}
+
+bool enable_qwen3_lcoc_experiment() {
+  static const bool enabled =
+      util::get_bool_env("XLLM_NPU_QWEN3_ENABLE_LCOC", false);
+  return enabled;
+}
+
+}  // namespace
 
 const uint64_t WEIGHT_COUNT_PER_LAYER = 56;
 
@@ -41,10 +89,9 @@ void NpuQwen3DecoderLayerImpl::param_from_args(
   // Enable SwiGLU activation, as used in LLaMA
   param.enableSwiGLU = true;
   // Enable LCOC for prefill phase, similar to LLaMA
-  // NOTE: Currently, single-process startup requires setting enableLcoc to
-  // false, which leads to performance degradation. param.enableLcoc = false;
-  // //isPrefill
-  param.enableLcoc = false;
+  // Keep the historical single-process-safe default. The env gate is an
+  // experiment for TP2 performance validation after correctness is proven.
+  param.enableLcoc = enable_qwen3_lcoc_experiment() && isPrefill;
   param.rmsnormQKNorm = true;
   param.isPrefill = isPrefill;
   param.isBF16 = args.dtype() == "bfloat16";
@@ -108,7 +155,7 @@ void NpuQwen3DecoderLayerImpl::initialize_parallel_parameters(
                               FLAGS_communication_backend,
                               FLAGS_rank_tablefile,
                               nullptr,
-                              ""};
+                              resolve_atb_tp_comm_domain(parallel_args, "")};
 }
 
 void NpuQwen3DecoderLayerImpl::initialize_quantization_parameters(
@@ -257,6 +304,10 @@ torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
     st = execute_node(prefill_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "excute prefill layer fail, error code: " << st;
+    if (enable_rec_pipeline_concurrency_debug()) {
+      LOG(INFO) << "Qwen3 decoder execute done, rank=" << parallel_args_.rank()
+                << ", layer=" << node_id << ", is_prefill=1";
+    }
   } else {
     const bool use_graph_decode_input =
         FLAGS_enable_graph && input_params.graph_buffer.tiling_data.defined();
@@ -275,6 +326,10 @@ torch::Tensor NpuQwen3DecoderLayerImpl::forward(torch::Tensor& x,
     st = execute_node(decode_node, node_id + 1000, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "excute decode layer fail, error code: " << st;
+    if (enable_rec_pipeline_concurrency_debug()) {
+      LOG(INFO) << "Qwen3 decoder execute done, rank=" << parallel_args_.rank()
+                << ", layer=" << node_id << ", is_prefill=0";
+    }
   }
 
   return at_placeholder_;
@@ -359,6 +414,18 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.inTensors.at(input_idx++) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.graph_buffer.tiling_data);
+  }
+
+  if (enable_rec_pipeline_concurrency_debug()) {
+    const std::vector<at::Tensor>& weights = loader_->get_at_weight_tensors();
+    LOG(INFO) << "Qwen3 decoder input shape, rank=" << parallel_args_.rank()
+              << ", layer=" << node_id << ", is_prefill=" << is_prefill
+              << ", x=" << tensor_shape_string(x) << ", input_norm_weight="
+              << tensor_vector_shape_string(weights, 0)
+              << ", post_attn_norm_weight="
+              << tensor_vector_shape_string(weights, 28)
+              << ", q_norm=" << tensor_vector_shape_string(weights, 54)
+              << ", k_norm=" << tensor_vector_shape_string(weights, 55);
   }
 
   for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {

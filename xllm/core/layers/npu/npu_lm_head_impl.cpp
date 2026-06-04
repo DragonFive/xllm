@@ -17,11 +17,39 @@ limitations under the License.
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+
+#include "util/env_var.h"
+
 DECLARE_string(rank_tablefile);
 DECLARE_string(communication_backend);
 
 namespace xllm {
 namespace layer {
+namespace {
+
+std::string resolve_atb_tp_comm_domain(const ParallelArgs& parallel_args,
+                                       int32_t fallback_group_id) {
+  if (!parallel_args.atb_tp_comm_domain().empty()) {
+    return parallel_args.atb_tp_comm_domain();
+  }
+  return std::to_string(fallback_group_id);
+}
+
+bool enable_lm_head_decode_node_for_full_selection() {
+  static const bool enabled = util::get_bool_env(
+      "XLLM_NPU_LM_HEAD_USE_DECODE_NODE_FOR_FULL_SELECTION", false);
+  return enabled;
+}
+
+bool can_use_decode_lm_head_node(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& selected_idxes) {
+  return enable_lm_head_decode_node_for_full_selection() &&
+         hidden_states.defined() && hidden_states.dim() >= 1 &&
+         selected_idxes.defined() && selected_idxes.dim() == 1 &&
+         selected_idxes.numel() == hidden_states.size(0);
+}
+
+}  // namespace
 
 void NpuLmHeadImpl::param_from_args(atb_speed::common::LmHeadParam& param,
                                     const ModelArgs& args,
@@ -57,7 +85,7 @@ void NpuLmHeadImpl::param_from_args(atb_speed::common::LmHeadParam& param,
       const int32_t tp_group_id =
           use_local_tp ? (parallel_args.rank() / dp_local_tp_size_) : 0;
       param.linearParallelParam.tensorParallelInfo.commDomain =
-          std::to_string(tp_group_id);
+          resolve_atb_tp_comm_domain(parallel_args, tp_group_id);
       param.linearParallelParam.tensorParallelInfo.backend =
           FLAGS_communication_backend;
     } else {
@@ -171,8 +199,12 @@ torch::Tensor NpuLmHeadImpl::forward_with_hidden(
     torch::Tensor& out_hidden,
     int nodeId) {
   atb::Status st;
-  build_node_variant_pack(lm_head_node_prefill_, hidden_states, seleted_idxes);
-  st = execute_node(lm_head_node_prefill_, nodeId);
+  const bool use_decode_node =
+      can_use_decode_lm_head_node(hidden_states, seleted_idxes);
+  atb_speed::Model::Node& node =
+      use_decode_node ? lm_head_node_decode_ : lm_head_node_prefill_;
+  build_node_variant_pack(node, hidden_states, seleted_idxes);
+  st = execute_node(node, nodeId);
   LOG_IF(FATAL, st != 0) << model_name_
                          << "execute lmhead node fail, error code: " << st;
   torch::Tensor output = atOutTensors_[0];

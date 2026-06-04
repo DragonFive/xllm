@@ -35,8 +35,9 @@ void NpuWordEmbeddingImpl::param_from_args(
         param.tensorParallelInfo.rank = dp_local_tp_rank_;
         param.tensorParallelInfo.worldSize = dp_local_tp_size_;
       } else {
-        param.tensorParallelInfo.rank = parallel_args.rank();
-        param.tensorParallelInfo.worldSize = parallel_args.world_size();
+        // WordEmbeddingLoader keeps full embedding weights for plain TP.
+        // Do not inject ATB embedding AllGather unless the weight is sharded.
+        return;
       }
       const int32_t tp_group_id =
           use_local_tp ? (parallel_args.rank() / dp_local_tp_size_) : 0;

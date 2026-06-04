@@ -17,6 +17,17 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+namespace {
+
+std::string resolve_atb_tp_comm_domain(const ParallelArgs& parallel_args,
+                                       int32_t fallback_group_id) {
+  if (!parallel_args.atb_tp_comm_domain().empty()) {
+    return parallel_args.atb_tp_comm_domain();
+  }
+  return std::to_string(fallback_group_id);
+}
+
+}  // namespace
 
 void NpuColumnParallelLinearImpl::param_from_args(
     atb_speed::common::LinearParallelParam& param,
@@ -39,7 +50,8 @@ void NpuColumnParallelLinearImpl::param_from_args(
       param.parallelType = atb_speed::common::COLUMN_PARALLEL;
       const int32_t tp_group_id =
           use_local_tp ? (parallel_args.rank() / dp_local_tp_size_) : 0;
-      param.tensorParallelInfo.commDomain = std::to_string(tp_group_id);
+      param.tensorParallelInfo.commDomain =
+          resolve_atb_tp_comm_domain(parallel_args, tp_group_id);
       param.tensorParallelInfo.backend = FLAGS_communication_backend;
     } else {
       param.parallelType = atb_speed::common::COLUMN_PARALLEL;

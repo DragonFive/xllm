@@ -134,6 +134,9 @@ struct ParallelArgs {
   // atb hccl mapping
   PROPERTY(atb_speed::base::Mapping, mapping);
 
+  // Optional ATB tensor-parallel communication domain override.
+  PROPERTY(std::string, atb_tp_comm_domain);
+
   // atb hccl dispatchAndCombinecommDomain
   PROPERTY(std::string, dispatchAndCombinecommDomain);
 

@@ -456,10 +456,22 @@ std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
   process_groups.reserve(devices.size());
 
 #if defined(USE_NPU)
-  std::vector<HcclComm> comms(devices.size());
+  std::string host;
+  int port;
+  net::parse_host_port_from_addr(
+      options.master_node_addr().value(), host, port);
+  host = "127.0.0.1";
+
   for (int32_t i = 0; i < world_size; ++i) {
-    process_groups.emplace_back(std::make_unique<ProcessGroupImpl>(
-        /*rank=*/i, world_size, devices[i], comms[i]));
+    process_groups.emplace_back(create_process_group(
+        /*rank=*/i,
+        /*world_size=*/world_size,
+        /*rank_size=*/world_size,
+        /*port=*/port,
+        /*trans=*/false,
+        host,
+        /*group_name=*/"local_tp_group",
+        devices[i]));
   }
 #elif defined(USE_CUDA) || defined(USE_MLU) || defined(USE_ILU)
   // For GPU: use create_process_group with localhost

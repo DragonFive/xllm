@@ -36,6 +36,7 @@ limitations under the License.
 #include "util/net.h"
 #include "util/pretty_print.h"
 #include "util/rec_model_utils.h"
+#include "util/scope_guard.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -43,10 +44,103 @@ namespace xllm {
 namespace {
 
 constexpr int64_t kMinimalOneRecMetadataKVBlocks = 2;
+constexpr const char* kRecMultiRoundTpPerPipelineAtbCommEnv =
+    "XLLM_REC_MULTIROUND_TP_PER_PIPELINE_ATB_COMM";
+constexpr const char* kRecMultiRoundTpSingleModelPipelineEnv =
+    "XLLM_REC_MULTIROUND_TP_SINGLE_MODEL_PIPELINE";
+constexpr const char* kRecMultiRoundTpSerializeShapeFirstUseEnv =
+    "XLLM_REC_MULTIROUND_TP_SERIALIZE_SHAPE_FIRST_USE";
+constexpr const char* kRecMultiRoundEngineTimingEnv =
+    "XLLM_DEBUG_REC_MULTIROUND_ENGINE_TIMING";
 
 }  // namespace
 
 namespace {
+
+bool enable_rec_multiround_tp_per_pipeline_atb_comm() {
+  static const bool enabled =
+      util::get_bool_env(kRecMultiRoundTpPerPipelineAtbCommEnv, false);
+  return enabled;
+}
+
+bool enable_rec_multiround_tp_single_model_pipeline() {
+  static const bool enabled =
+      util::get_bool_env(kRecMultiRoundTpSingleModelPipelineEnv, false);
+  return enabled;
+}
+
+bool serialize_rec_multiround_tp_shape_first_use() {
+  static const bool enabled =
+      util::get_bool_env(kRecMultiRoundTpSerializeShapeFirstUseEnv, true);
+  return enabled;
+}
+
+bool enable_rec_multiround_engine_timing() {
+  static const bool enabled =
+      util::get_bool_env(kRecMultiRoundEngineTimingEnv, false);
+  return enabled;
+}
+
+const char* rec_model_kind_name(RecModelKind kind) {
+  switch (kind) {
+    case RecModelKind::kOneRec:
+      return "OneRec";
+    case RecModelKind::kLlmRec:
+      return "LlmRec";
+    case RecModelKind::kNone:
+      return "None";
+  }
+  return "Unknown";
+}
+
+const char* rec_pipeline_type_name(RecPipelineType type) {
+  switch (type) {
+    case RecPipelineType::kLlmRecDefault:
+      return "LlmRecDefault";
+    case RecPipelineType::kLlmRecWithMmData:
+      return "LlmRecWithMmData";
+    case RecPipelineType::kOneRecDefault:
+      return "OneRecDefault";
+    case RecPipelineType::kLlmRecMultiRoundPipeline:
+      return "LlmRecMultiRoundPipeline";
+    case RecPipelineType::kOneRecXAttentionPipeline:
+      return "OneRecXAttentionPipeline";
+  }
+  return "Unknown";
+}
+
+std::string device_list_to_string(const std::vector<torch::Device>& devices) {
+  std::string result;
+  for (size_t i = 0; i < devices.size(); ++i) {
+    if (i > 0) {
+      result += ",";
+    }
+    result += devices[i].str();
+  }
+  return result;
+}
+
+void validate_local_rec_tp_options(const runtime::Options& options) {
+  const int32_t local_world_size =
+      static_cast<int32_t>(options.devices().size());
+  CHECK_EQ(options.nnodes(), 1)
+      << "backend=rec local TP currently supports nnodes=1 only.";
+  CHECK_EQ(options.dp_size(), 1)
+      << "backend=rec local TP currently supports dp_size=1 only.";
+  CHECK_EQ(options.cp_size(), 1)
+      << "backend=rec local TP currently supports cp_size=1 only.";
+  CHECK(options.tp_size() == 1 || options.tp_size() == local_world_size)
+      << "backend=rec local TP uses --devices as the local TP world. "
+      << "Set --tp_size=" << local_world_size << " or adjust --devices.";
+  if (options.tp_size() == 1 && local_world_size > 1) {
+    LOG(WARNING) << "backend=rec local TP is enabled by --devices size "
+                 << local_world_size
+                 << " while --tp_size keeps the default value 1.";
+  }
+  CHECK(local_world_size == 1 || local_world_size == 2)
+      << "backend=rec local TP MVP supports one device or TP2 only, got "
+      << local_world_size << " devices.";
+}
 
 void rethrow_worker_exception(
     size_t worker_index,
@@ -63,6 +157,30 @@ void rethrow_worker_exception(
   } catch (...) {
     throw std::runtime_error("Worker " + std::to_string(worker_index) +
                              " failed with unknown exception");
+  }
+}
+
+void validate_local_rec_worker_results(
+    const std::vector<folly::Try<std::optional<ForwardOutput>>>& results,
+    const char* pipeline_name) {
+  CHECK(!results.empty()) << pipeline_name << " requires at least one worker.";
+  for (size_t i = 0; i < results.size(); ++i) {
+    rethrow_worker_exception(i, results[i]);
+    if (i == 0) {
+      CHECK(results[i].value().has_value())
+          << pipeline_name
+          << " driver worker failed to execute model and returned no output.";
+      continue;
+    }
+    if (!results[i].value().has_value()) {
+      if (util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false)) {
+        LOG(INFO) << pipeline_name << " non-driver worker " << i
+                  << " returned no user-visible output.";
+      }
+      continue;
+    }
+    LOG(INFO) << pipeline_name << " non-driver worker " << i
+              << " returned output; engine will ignore it.";
   }
 }
 
@@ -122,6 +240,20 @@ bool RecEngine::init_model() {
         std::make_unique<OneRecBatchInputBuilderCache>();
   }
   auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
+  validate_local_rec_tp_options(options_);
+  LOG(INFO) << "REC local execution config, model_type=" << args_.model_type()
+            << ", rec_model_kind=" << rec_model_kind_name(rec_model_kind_)
+            << ", pipeline_type=" << rec_pipeline_type_name(pipeline_type)
+            << ", devices=" << device_list_to_string(options_.devices())
+            << ", local_tp_size=" << options_.devices().size()
+            << ", tp_size=" << options_.tp_size()
+            << ", dp_size=" << options_.dp_size()
+            << ", cp_size=" << options_.cp_size()
+            << ", nnodes=" << options_.nnodes()
+            << ", rec_worker_max_concurrency="
+            << options_.rec_worker_max_concurrency()
+            << ", beam_width=" << options_.beam_width()
+            << ", enable_graph=" << options_.enable_graph();
   pipeline_ = create_pipeline(pipeline_type, *this);
   // LlmRec-specific initialization
   if (rec_model_kind_ == RecModelKind::kLlmRec) {
@@ -599,24 +731,16 @@ bool RecEngine::OneRecLocalEnginePipeline::init_model_workers(
   // OneRec local workers still expect valid TP group metadata even on a
   // single device. For world_size == 1, only rank/world_size metadata is
   // needed, so avoid creating a real communication backend or extra streams.
-  // For multi-device NPU keep the HCCL-backed groups; other local backends use
-  // the generic local process group creation path.
+  // For multi-device local workers use a ProcessGroup-backed path. On NPU this
+  // avoids direct HcclCommInitAll, which is not reliable for 910C sibling dies.
   if (world_size == 1) {
     engine_.process_groups_.clear();
     engine_.process_groups_.emplace_back(
         std::make_unique<ProcessGroup>(/*rank=*/0, world_size, devices[0]));
-  }
-#if defined(USE_NPU)
-  else {
-    engine_.process_groups_ =
-        parallel_state::create_npu_process_groups(devices);
-  }
-#else
-  else {
+  } else {
     engine_.process_groups_ =
         parallel_state::create_local_process_groups(devices, engine_.options_);
   }
-#endif
 
   engine_.workers_.clear();
   WorkerType worker_type = WorkerType::REC;
@@ -792,12 +916,7 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::get_model_output(
   }
   auto results = folly::collectAll(futures).get();
 
-  // Check all worker results for failures
-  for (size_t i = 0; i < results.size(); ++i) {
-    rethrow_worker_exception(i, results[i]);
-    CHECK(results[i].value().has_value())
-        << "Worker " << i << " failed to execute model and returned no output.";
-  }
+  validate_local_rec_worker_results(results, "OneRec prefill-only");
 
   auto forward_output = results.front().value();
   CHECK(forward_output.has_value()) << "Failed to execute model";
@@ -933,14 +1052,7 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
   log_engine_timing("worker_step_collect");
   log_engine_stage("after_collect_all");
 
-  for (size_t i = 0; i < results.size(); ++i) {
-    if (results[i].hasException()) {
-      LOG(FATAL) << "Worker " << i
-                 << " failed with exception: " << results[i].exception().what();
-    }
-    CHECK(results[i].value().has_value())
-        << "Worker " << i << " failed to execute model and returned no output.";
-  }
+  validate_local_rec_worker_results(results, "OneRec xattention");
 
   auto forward_output = results.front().value();
   CHECK(forward_output.has_value()) << "Failed to execute model";
@@ -1043,9 +1155,8 @@ bool RecEngine::RecMultiRoundEnginePipeline::init_model_workers(
   const int32_t world_size = static_cast<int32_t>(devices.size());
 
   // Single-card REC multi-round still needs a non-null tp_group_ during
-  // model/layer construction. For NPU, construct a real rank_size=1 backend
-  // process group here so process_group semantics stay strict without touching
-  // process_group.*. Multi-card NPU keeps the direct HCCL path.
+  // model/layer construction. For NPU, construct a real backend process group
+  // through the same ProcessGroup-backed path used by local TP.
 #if defined(USE_NPU)
   if (world_size == 1) {
     std::string host;
@@ -1064,7 +1175,7 @@ bool RecEngine::RecMultiRoundEnginePipeline::init_model_workers(
         devices[0]));
   } else {
     engine_.process_groups_ =
-        parallel_state::create_npu_process_groups(devices);
+        parallel_state::create_local_process_groups(devices, engine_.options_);
   }
 #else
   engine_.process_groups_ =
@@ -1078,6 +1189,10 @@ bool RecEngine::RecMultiRoundEnginePipeline::init_model_workers(
     ParallelArgs parallel_args(rank, world_size, pg);
     // Set tp_group_ = process_group_ for TP parallelism
     parallel_args.tp_group_ = pg;
+    LOG(INFO) << "REC multi-round local worker init, rank=" << rank
+              << ", world_size=" << world_size << ", device=" << devices[rank]
+              << ", driver=" << (rank == 0) << ", rec_worker_max_concurrency="
+              << engine_.options_.rec_worker_max_concurrency();
     engine_.workers_.emplace_back(std::make_unique<Worker>(
         parallel_args, devices[rank], engine_.options_, worker_type));
   }
@@ -1094,7 +1209,235 @@ bool RecEngine::RecMultiRoundEnginePipeline::init_model_workers(
       return false;
     }
   }
+  initialize_shared_pipeline_indices();
   return true;
+}
+
+bool RecEngine::RecMultiRoundEnginePipeline::use_shared_pipeline_index() const {
+  return engine_.workers_.size() > 1 &&
+         engine_.options_.rec_worker_max_concurrency() > 1;
+}
+
+void RecEngine::RecMultiRoundEnginePipeline::
+    initialize_shared_pipeline_indices() {
+  if (shared_pipeline_indices_initialized_ || !use_shared_pipeline_index()) {
+    return;
+  }
+  // Default to multiple slots only when the per-pipeline ATB TP domain path is
+  // enabled. Without that path, all pipelines share one TP communicator and
+  // must stay serialized unless the operator explicitly opts in.
+  const bool per_pipeline_atb_comm =
+      enable_rec_multiround_tp_per_pipeline_atb_comm();
+  const bool force_single_tp_pipeline = util::get_bool_env(
+      "XLLM_REC_MULTIROUND_TP_FORCE_SINGLE_PIPELINE", !per_pipeline_atb_comm);
+  const size_t pipeline_count =
+      !enable_rec_multiround_tp_single_model_pipeline() &&
+              !force_single_tp_pipeline && per_pipeline_atb_comm
+          ? static_cast<size_t>(engine_.options_.rec_worker_max_concurrency())
+          : 1;
+  shared_pipeline_count_ = pipeline_count;
+  shared_pipeline_in_flight_.assign(pipeline_count, false);
+  initialize_rec_tp_control_groups(pipeline_count);
+  shared_pipeline_first_use_serializing_ =
+      per_pipeline_atb_comm && pipeline_count > 1;
+  if (shared_pipeline_first_use_serializing_) {
+    // ATB/HCCL lazily creates communicator state on the first real request.
+    // Serializing the first use of each pipeline avoids concurrent root-info
+    // initialization while preserving full pipeline concurrency after warmup.
+    shared_pipeline_indices_.enqueue(0);
+  } else {
+    for (size_t i = 0; i < pipeline_count; ++i) {
+      shared_pipeline_indices_.enqueue(i);
+    }
+  }
+  shared_pipeline_indices_initialized_ = true;
+  LOG(INFO) << "REC multi-round TP shared pipeline coordinator initialized, "
+            << "pipeline_count=" << pipeline_count << ", first_use_serialized="
+            << shared_pipeline_first_use_serializing_
+            << ", configured_rec_worker_max_concurrency="
+            << engine_.options_.rec_worker_max_concurrency()
+            << ", single_model_pipeline="
+            << enable_rec_multiround_tp_single_model_pipeline()
+            << ", local_tp_size=" << engine_.workers_.size();
+}
+
+void RecEngine::RecMultiRoundEnginePipeline::initialize_rec_tp_control_groups(
+    size_t pipeline_count) {
+  if (pipeline_count <= 1 ||
+      !enable_rec_multiround_tp_per_pipeline_atb_comm()) {
+    return;
+  }
+  const auto& devices = engine_.options_.devices();
+  const int32_t world_size = static_cast<int32_t>(devices.size());
+  CHECK_GT(world_size, 1)
+      << "per-pipeline REC TP control groups require local TP.";
+
+  std::string host;
+  int port;
+  net::parse_host_port_from_addr(
+      engine_.options_.master_node_addr().value(), host, port);
+  host = "127.0.0.1";
+
+  rec_tp_control_groups_by_pipeline_.clear();
+  rec_tp_control_groups_by_pipeline_.reserve(pipeline_count);
+  constexpr int kRecTpControlPortBaseOffset = 100;
+  for (size_t pipeline_index = 0; pipeline_index < pipeline_count;
+       ++pipeline_index) {
+    std::vector<std::unique_ptr<ProcessGroup>> groups;
+    groups.reserve(devices.size());
+    const int control_port =
+        port + kRecTpControlPortBaseOffset + static_cast<int>(pipeline_index);
+    const std::string group_name =
+        "rec_tp_control_pipeline_" + std::to_string(pipeline_index);
+    for (int32_t rank = 0; rank < world_size; ++rank) {
+      groups.emplace_back(create_process_group(rank,
+                                               world_size,
+                                               world_size,
+                                               control_port,
+                                               /*trans=*/false,
+                                               host,
+                                               group_name,
+                                               devices[rank]));
+    }
+    rec_tp_control_groups_by_pipeline_.emplace_back(std::move(groups));
+  }
+
+  for (int32_t rank = 0; rank < world_size; ++rank) {
+    for (size_t pipeline_index = 0; pipeline_index < pipeline_count;
+         ++pipeline_index) {
+      engine_.workers_[rank]->set_rec_pipeline_control_group(
+          pipeline_index,
+          rec_tp_control_groups_by_pipeline_[pipeline_index][rank].get());
+    }
+  }
+  LOG(INFO) << "REC multi-round TP per-pipeline control groups initialized, "
+            << "pipeline_count=" << pipeline_count
+            << ", world_size=" << world_size
+            << ", base_port=" << port + kRecTpControlPortBaseOffset;
+}
+
+size_t RecEngine::RecMultiRoundEnginePipeline::lease_shared_pipeline_index() {
+  size_t pipeline_index;
+  shared_pipeline_indices_.wait_dequeue(pipeline_index);
+  CHECK_LT(pipeline_index, shared_pipeline_in_flight_.size())
+      << "REC multi-round TP leased invalid pipeline index=" << pipeline_index
+      << ", pipeline_count=" << shared_pipeline_in_flight_.size();
+  {
+    std::lock_guard<std::mutex> lock(shared_pipeline_lease_mutex_);
+    CHECK(!shared_pipeline_in_flight_[pipeline_index])
+        << "REC multi-round TP leased pipeline already in-flight, pipeline="
+        << pipeline_index;
+    shared_pipeline_in_flight_[pipeline_index] = true;
+  }
+  if (util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false)) {
+    LOG(INFO) << "REC multi-round TP leased shared pipeline=" << pipeline_index;
+  }
+  return pipeline_index;
+}
+
+std::vector<size_t>
+RecEngine::RecMultiRoundEnginePipeline::lease_all_shared_pipeline_indices() {
+  CHECK_GT(shared_pipeline_count_, 0);
+  std::vector<size_t> leased_pipeline_indices;
+  leased_pipeline_indices.reserve(shared_pipeline_count_);
+  for (size_t i = 0; i < shared_pipeline_count_; ++i) {
+    leased_pipeline_indices.emplace_back(lease_shared_pipeline_index());
+  }
+  CHECK(std::find(leased_pipeline_indices.begin(),
+                  leased_pipeline_indices.end(),
+                  0) != leased_pipeline_indices.end())
+      << "REC multi-round TP shape first-use serialization requires pipeline 0 "
+         "to be leased.";
+  return leased_pipeline_indices;
+}
+
+int64_t RecEngine::RecMultiRoundEnginePipeline::rec_multiround_shape_key(
+    const ForwardInput& model_inputs) const {
+  const StepDecodeMeta* step_meta = model_inputs.step_meta();
+  if (step_meta == nullptr) {
+    return -1;
+  }
+  CHECK_GT(step_meta->batch_size, 0);
+  CHECK_GT(step_meta->beam_width, 0);
+  CHECK_GT(step_meta->total_round, 0);
+  int64_t key = step_meta->batch_size;
+  key = key * 1024 + step_meta->beam_width;
+  key = key * 1024 + step_meta->total_round;
+  return key;
+}
+
+bool RecEngine::RecMultiRoundEnginePipeline::should_serialize_shape_first_use(
+    const ForwardInput& model_inputs) {
+  if (!serialize_rec_multiround_tp_shape_first_use() ||
+      shared_pipeline_count_ <= 1 ||
+      !enable_rec_multiround_tp_per_pipeline_atb_comm()) {
+    return false;
+  }
+  const int64_t shape_key = rec_multiround_shape_key(model_inputs);
+  if (shape_key < 0) {
+    return false;
+  }
+  bool inserted = false;
+  {
+    std::lock_guard<std::mutex> lock(shared_pipeline_shape_init_mutex_);
+    inserted = initialized_shape_keys_.insert(shape_key).second;
+  }
+  if (inserted) {
+    {
+      std::lock_guard<std::mutex> lock(shared_pipeline_init_mutex_);
+      if (shared_pipeline_first_use_serializing_) {
+        // The existing pipeline first-use gate is already serializing this
+        // request. Remember the shape, but do not add a second serialization.
+        return false;
+      }
+    }
+    LOG(INFO) << "REC multi-round TP serializes first use of shape_key="
+              << shape_key
+              << " to avoid concurrent ATB/HCCL lazy initialization.";
+  }
+  return inserted;
+}
+
+void RecEngine::RecMultiRoundEnginePipeline::release_shared_pipeline_index(
+    size_t pipeline_index) {
+  CHECK_LT(pipeline_index, shared_pipeline_in_flight_.size())
+      << "REC multi-round TP released invalid pipeline index=" << pipeline_index
+      << ", pipeline_count=" << shared_pipeline_in_flight_.size();
+  {
+    std::lock_guard<std::mutex> lock(shared_pipeline_lease_mutex_);
+    CHECK(shared_pipeline_in_flight_[pipeline_index])
+        << "REC multi-round TP released pipeline that is not in-flight, "
+           "pipeline="
+        << pipeline_index;
+    shared_pipeline_in_flight_[pipeline_index] = false;
+  }
+  if (shared_pipeline_first_use_serializing_) {
+    std::lock_guard<std::mutex> lock(shared_pipeline_init_mutex_);
+    if (pipeline_index == shared_pipeline_next_init_index_) {
+      ++shared_pipeline_next_init_index_;
+      if (shared_pipeline_next_init_index_ < shared_pipeline_count_) {
+        shared_pipeline_indices_.enqueue(shared_pipeline_next_init_index_);
+      } else {
+        shared_pipeline_first_use_serializing_ = false;
+        for (size_t i = 0; i < shared_pipeline_count_; ++i) {
+          shared_pipeline_indices_.enqueue(i);
+        }
+        LOG(INFO)
+            << "REC multi-round TP shared pipeline first-use initialization "
+            << "completed, pipeline_count=" << shared_pipeline_count_;
+      }
+      return;
+    }
+  }
+  shared_pipeline_indices_.enqueue(pipeline_index);
+  if (util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false)) {
+    LOG(INFO) << "REC multi-round TP released shared pipeline="
+              << pipeline_index;
+  }
+}
+
+uint64_t RecEngine::RecMultiRoundEnginePipeline::next_rec_tp_step_id() {
+  return rec_tp_step_id_.fetch_add(1, std::memory_order_relaxed);
 }
 
 int64_t
@@ -1161,10 +1504,16 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::step(
     return {};
   }
 
+  const bool trace_engine_timing = enable_rec_multiround_engine_timing();
   Timer timer;
   // Call worker's prepare_inputs (multi-round logic is inside worker)
   auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
   COUNTER_ADD(prepare_input_latency_microseconds, timer.elapsed_microseconds());
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=prepare_inputs"
+              << ", batch_size=" << batches[0].size()
+              << ", elapsed_us=" << timer.elapsed_microseconds();
+  }
 
   if (!forward_inputs.token_ids.defined()) {
     return {};
@@ -1175,12 +1524,22 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::step(
   const auto& output = get_model_output(forward_inputs);
   COUNTER_ADD(rec_first_token_latency_microseconds,
               timer.elapsed_microseconds());
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=get_model_output"
+              << ", batch_size=" << batches[0].size()
+              << ", elapsed_us=" << timer.elapsed_microseconds();
+  }
 
   timer.reset();
   // Use process_beam_sequence_group for multi-round beam search results
   // instead of process_sample_output which would call append_token()
   batches[0].process_beam_sequence_group(output);
   COUNTER_ADD(rec_sampling_latency_microseconds, timer.elapsed_microseconds());
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=process_beam_sequence"
+              << ", batch_size=" << batches[0].size()
+              << ", elapsed_us=" << timer.elapsed_microseconds();
+  }
 
   batches[0].finish();
   return output;
@@ -1188,30 +1547,118 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::step(
 
 ForwardOutput RecEngine::RecMultiRoundEnginePipeline::get_model_output(
     const ForwardInput& model_inputs) {
+  const bool trace_engine_output =
+      util::get_bool_env("XLLM_DEBUG_ONEREC_ENGINE_TRACE", false);
+  auto log_engine_stage = [&](const char* stage_name,
+                              const torch::Tensor& tensor = torch::Tensor()) {
+    if (!trace_engine_output) {
+      return;
+    }
+    LOG(INFO) << "REC multi-round engine stage=" << stage_name
+              << ", tensor_defined=" << tensor.defined() << ", tensor_shape="
+              << (tensor.defined() ? tensor.sizes() : c10::IntArrayRef{})
+              << ", tensor_device="
+              << (tensor.defined() ? tensor.device().str() : "<undefined>");
+  };
+
   std::vector<folly::SemiFuture<std::optional<ForwardOutput>>> futures;
   futures.reserve(engine_.workers_.size());
+  std::optional<size_t> shared_pipeline_index;
+  std::vector<size_t> leased_pipeline_indices;
+  const bool trace_engine_timing = enable_rec_multiround_engine_timing();
+  Timer stage_timer;
+  if (use_shared_pipeline_index()) {
+    std::lock_guard<std::mutex> lock(shared_pipeline_acquire_mutex_);
+    if (should_serialize_shape_first_use(model_inputs)) {
+      leased_pipeline_indices = lease_all_shared_pipeline_indices();
+      shared_pipeline_index = 0;
+    } else {
+      shared_pipeline_index = lease_shared_pipeline_index();
+      leased_pipeline_indices.emplace_back(shared_pipeline_index.value());
+    }
+  }
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=lease_pipeline"
+              << ", shared_pipeline="
+              << (shared_pipeline_index.has_value()
+                      ? std::to_string(shared_pipeline_index.value())
+                      : "none")
+              << ", leased_count=" << leased_pipeline_indices.size()
+              << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+  }
+  stage_timer.reset();
+  const uint64_t rec_tp_step_id =
+      engine_.workers_.size() > 1 ? next_rec_tp_step_id() : 0;
+  auto pipeline_index_guard = xllm::ScopeGuard([&] {
+    for (size_t pipeline_index : leased_pipeline_indices) {
+      release_shared_pipeline_index(pipeline_index);
+    }
+  });
   for (auto& worker : engine_.workers_) {
-    futures.emplace_back(worker->step_async(model_inputs));
+    if (shared_pipeline_index.has_value()) {
+      futures.emplace_back(worker->rec_step_async_with_pipeline_index(
+          model_inputs, shared_pipeline_index.value(), rec_tp_step_id));
+    } else if (rec_tp_step_id != 0) {
+      futures.emplace_back(worker->rec_step_async_with_pipeline_index(
+          model_inputs, /*pipeline_index=*/0, rec_tp_step_id));
+    } else {
+      futures.emplace_back(worker->step_async(model_inputs));
+    }
   }
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=schedule_workers"
+              << ", rec_tp_step_id=" << rec_tp_step_id
+              << ", futures=" << futures.size()
+              << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+  }
+  stage_timer.reset();
   auto results = folly::collectAll(futures).get();
-
-  // Check all worker results for failures
-  for (size_t i = 0; i < results.size(); ++i) {
-    rethrow_worker_exception(i, results[i]);
-    CHECK(results[i].value().has_value())
-        << "Worker " << i << " failed to execute model and returned no output.";
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=collect_workers"
+              << ", rec_tp_step_id=" << rec_tp_step_id
+              << ", elapsed_us=" << stage_timer.elapsed_microseconds();
   }
+  stage_timer.reset();
+
+  validate_local_rec_worker_results(results, "REC multi-round");
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=validate_results"
+              << ", rec_tp_step_id=" << rec_tp_step_id
+              << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+  }
+  stage_timer.reset();
 
   auto forward_output = results.front().value();
   CHECK(forward_output.has_value()) << "Failed to execute model";
 
   // D2H transfer for beam_sequence_group (multi-round results)
   auto& output = forward_output.value();
+  Device(engine_.workers_[0]->device()).set_device();
   // TODO. uncomment this in next pr.
+  log_engine_stage("before_beam_sequence_group_to_cpu",
+                   output.beam_sequence_group);
   output.beam_sequence_group = safe_to(output.beam_sequence_group, torch::kCPU);
+  log_engine_stage("after_beam_sequence_group_to_cpu",
+                   output.beam_sequence_group);
+  if (trace_engine_timing) {
+    LOG(INFO) << "REC multi-round engine timing, stage=beam_sequence_to_cpu"
+              << ", rec_tp_step_id=" << rec_tp_step_id
+              << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+  }
+  stage_timer.reset();
   if (output.beam_search_output.out_logprobs.defined()) {
+    log_engine_stage("before_beam_out_logprobs_to_cpu",
+                     output.beam_search_output.out_logprobs);
     output.beam_search_output.out_logprobs =
         safe_to(output.beam_search_output.out_logprobs, torch::kCPU);
+    log_engine_stage("after_beam_out_logprobs_to_cpu",
+                     output.beam_search_output.out_logprobs);
+    if (trace_engine_timing) {
+      LOG(INFO) << "REC multi-round engine timing, stage=out_logprobs_to_cpu"
+                << ", rec_tp_step_id=" << rec_tp_step_id
+                << ", elapsed_us=" << stage_timer.elapsed_microseconds();
+    }
+    stage_timer.reset();
   }
 
   return output;
