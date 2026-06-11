@@ -116,6 +116,9 @@ bool serialize_onerec_xattention_host_stages() {
 }
 
 bool serialize_onerec_xattention_prepare() {
+  if (FLAGS_enable_multistream_perf_mode) {
+    return false;
+  }
   static const bool serialize_prepare =
       util::get_bool_env(kOnerecXAttentionSerializePrepareEnv,
                          serialize_onerec_xattention_host_stages());
@@ -123,6 +126,9 @@ bool serialize_onerec_xattention_prepare() {
 }
 
 bool serialize_onerec_xattention_model_forward() {
+  if (FLAGS_enable_multistream_perf_mode) {
+    return false;
+  }
   static const bool serialize_model_forward =
       util::get_bool_env(kOnerecXAttentionSerializeModelForwardEnv,
                          serialize_onerec_xattention_host_stages());
