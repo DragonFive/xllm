@@ -350,7 +350,11 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InferOutputTensor {
   /** Raw row-major tensor buffer. Owned by XLLM_Response. */
   const void* data;
 
-  /** Number of elements (product of shape, == byte_size / element_size). */
+  /**
+   * Number of elements (product of shape). For numeric dtypes this equals the
+   * element count. For STRING tensors (proto DataType::STRING) this is the
+   * number of strings; data is a packed buffer of [uint32_t len][bytes] chunks.
+   */
   size_t num_elements;
 } XLLM_InferOutputTensor;
 
@@ -473,6 +477,18 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RecOutput {
   /** Number of item ids in the item_ids array */
   size_t item_ids_size;
 
+  /**
+   * Extended item DID strings, parallel to item_ids (length == item_ids_size).
+   * Populated when enable_extended_item_info is true.
+   */
+  char** item_dids;
+
+  /**
+   * Extended item type strings, parallel to item_ids (length == item_ids_size).
+   * Populated when enable_extended_item_info is true.
+   */
+  char** item_types;
+
   /** Token-aligned REC/OneRec logprobs for this choice */
   float* rec_token_logprobs;
 
@@ -492,6 +508,38 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RecOutputs {
 } XLLM_RecOutputs;
 
 #define XLLM_ERROR_INFO_MAX_LEN 512
+
+/**
+ * @brief Per-request inference timing breakdown (microseconds).
+ *
+ * Populated by the embedded REC C API path (keyed by request_id across
+ * worker threads) and retrieved via xllm_rec_take_last_infer_timing().
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_InferTimingDetail {
+  /** Request id aligned with XLLM_Response::id. */
+  char request_id[XLLM_META_STRING_FIELD_MAX_LEN];
+
+  /** convert_c_infer_input_tensors_to_onerec_mm_data in rec.cpp. */
+  int64_t convert_input_tensors_us;
+
+  /** RecMaster request-handling threadpool queue wait. */
+  int64_t threadpool_wait_us;
+
+  /** verify_params + generate_request + add_request before scheduler runs. */
+  int64_t build_request_us;
+
+  /**
+   * Request created -> process_completed start; matches request.cpp
+   * total_latency.
+   */
+  int64_t scheduler_infer_us;
+
+  /** generate_output in AsyncResponseProcessor. */
+  int64_t generate_output_us;
+
+  /** build_success_response + populate_raw_output_tensors in C API callback. */
+  int64_t build_response_us;
+} XLLM_InferTimingDetail;
 
 /**
  * @brief Inference response structure
