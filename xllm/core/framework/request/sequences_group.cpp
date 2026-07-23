@@ -126,6 +126,25 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
     return;
   }
 
+  // OneRec single-step mode (max_decode_rounds == 1): return only the sampler's
+  // full vocab probability distribution (carried on each sequence's output
+  // embedding by Batch::process_sample_output). Skip multi-round beam assembly
+  // and, crucially, generate_onerec_output's token slicing, which assumes at
+  // least num_prompt_tokens_ generated tokens and would otherwise crash when
+  // single-step produces none.
+  if (is_onerec_single_step_mode()) {
+    outputs.reserve(outputs.size() + sequences_.size());
+    for (auto& seq : sequences_) {
+      if (seq == nullptr) {
+        continue;
+      }
+      SequenceOutput output;
+      seq->generate_onerec_probs_output(output);
+      outputs.push_back(std::move(output));
+    }
+    return;
+  }
+
   // Check for multi-round beam search results
   if (is_rec_multi_round_mode() && check_beam_search() &&
       sequences_.size() == 1) {

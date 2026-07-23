@@ -158,6 +158,20 @@ void Sequence::generate_onerec_output(const Slice<int32_t>& ids,
   }
 }
 
+void Sequence::generate_onerec_probs_output(SequenceOutput& output) const {
+  output.index = index_;
+  // The full vocab probability distribution [rows, vocab] is carried on
+  // output_embedding_ (routed there by Batch::process_sample_output in
+  // single-step mode). Emit it as-is; the C API layer turns it into the
+  // "vocab_probs" output tensor. No token id slicing here.
+  if (output_embedding_.defined()) {
+    output.embedding = output_embedding_;
+  }
+  if (finish_reason_ != FinishReason::NONE) {
+    output.finish_reason = finish_reason_.to_string();
+  }
+}
+
 Sequence::Sequence(size_t index,
                    const std::vector<int32_t>& prompt_token_ids,
                    torch::Tensor input_embedding,

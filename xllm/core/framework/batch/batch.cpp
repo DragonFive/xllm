@@ -675,6 +675,31 @@ void Batch::process_sample_output(const SampleOutput& sample_output,
     }
   }
 
+  // OneRec single-step mode (max_decode_rounds == 1): carry the full per-token
+  // vocab probability distribution [rows, vocab] out to the caller. The
+  // sampler already computed softmax(logits) into sample_output.probs; here we
+  // route each row through the existing embedding channel
+  // (output_embedding_ -> SequenceOutput.embedding), which the C API then emits
+  // as the "vocab_probs" output tensor. Gated so multi-round beam search never
+  // pays the large D2H copy.
+  if (FLAGS_max_decode_rounds == 1 && sample_output.probs.defined()) {
+    const int64_t num_seqs = sample_output.probs.size(0);
+    int64_t output_idx = 0;
+    const auto sequences = get_sequences();
+    for (auto* seq : sequences) {
+      CHECK_LT(output_idx, num_seqs);
+      // Force host + fp32 + contiguous so downstream (SequenceOutput.embedding
+      // -> C API) can read data_ptr<float>() directly; probs may live on NPU.
+      auto cur_seq_probs =
+          safe_to(sample_output.probs[output_idx++],
+                  torch::dtype(torch::kFloat32).device(torch::kCPU))
+              .contiguous();
+      // Direct set (not update_embeddings): the single-step sequence is already
+      // finished, so update_embeddings would no-op on the finished_ guard.
+      seq->set_onerec_probs_output(cur_seq_probs.unsqueeze(0));
+    }
+  }
+
   // if sample_output.next_tokens not defined,
   // sample_output.next_tokens.size(0) value is 0,
   // this means all sequences are in prefill stage status.

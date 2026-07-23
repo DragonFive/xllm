@@ -62,6 +62,14 @@ inline bool is_onerec_xattention_mode() {
          FLAGS_max_decode_rounds > 0;
 }
 
+// OneRec single-step mode: run one step (prefill / round 0) only and return the
+// sampler's full vocab probability distribution instead of a multi-round beam
+// search sequence. Triggered by max_decode_rounds == 1 in the OneRec xattention
+// path.
+inline bool is_onerec_single_step_mode() {
+  return is_onerec_xattention_mode() && FLAGS_max_decode_rounds == 1;
+}
+
 inline bool is_onerec_pipeline_type(RecPipelineType type) {
   return type == RecPipelineType::kOneRecDefault ||
          type == RecPipelineType::kOneRecXAttentionPipeline;

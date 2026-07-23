@@ -235,6 +235,51 @@ XLLM_InferOutputTensor make_float_output_tensor(
   return tensor;
 }
 
+// OneRec single-step mode: build a "vocab_probs" FLOAT output tensor from the
+// per-sequence probability distributions carried on SequenceOutput.embedding
+// (routed there by Batch::process_sample_output when max_decode_rounds == 1).
+// Each output row is a [vocab] distribution; the emitted tensor is
+// [num_outputs, vocab]. Returns false (no entry) when nothing is available.
+bool build_vocab_probs_output_tensor(const RequestOutput& req_output,
+                                     XLLM_InferOutputTensor* out_entry) {
+  if (out_entry == nullptr || req_output.outputs.empty()) {
+    return false;
+  }
+  const size_t num_outputs = req_output.outputs.size();
+  int64_t vocab = 0;
+  for (const auto& seq_output : req_output.outputs) {
+    if (seq_output.embedding.defined() && seq_output.embedding.numel() > 0) {
+      vocab = seq_output.embedding.numel();
+      break;
+    }
+  }
+  if (vocab <= 0) {
+    return false;
+  }
+
+  std::vector<float> values;
+  values.reserve(num_outputs * static_cast<size_t>(vocab));
+  for (const auto& seq_output : req_output.outputs) {
+    // Ensure host + fp32 + contiguous; the tensor was already moved to CPU
+    // upstream, this is a cheap no-op safeguard.
+    torch::Tensor row =
+        seq_output.embedding.defined()
+            ? seq_output.embedding.to(torch::kCPU, torch::kFloat32)
+                  .contiguous()
+                  .view({-1})
+            : torch::Tensor();
+    const int64_t row_elems = row.defined() ? row.numel() : 0;
+    const float* data = row_elems > 0 ? row.data_ptr<float>() : nullptr;
+    for (int64_t j = 0; j < vocab; ++j) {
+      values.push_back(j < row_elems ? data[j] : 0.0f);
+    }
+  }
+
+  *out_entry = make_float_output_tensor(
+      "vocab_probs", {static_cast<int64_t>(num_outputs), vocab}, values);
+  return true;
+}
+
 void append_rec_logprobs_to_vector(std::vector<float>* out,
                                    const SequenceOutput& output,
                                    int32_t expected_count) {
@@ -312,6 +357,15 @@ bool populate_raw_output_tensors(const InferenceType inference_type,
     if (FLAGS_enable_extended_item_info) {
       tensor_count += 2;
     }
+    // OneRec single-step mode: optionally emit the full vocab probability
+    // tensor.
+    XLLM_InferOutputTensor vocab_probs_entry{};
+    const bool has_vocab_probs =
+        FLAGS_max_decode_rounds == 1 &&
+        build_vocab_probs_output_tensor(req_output, &vocab_probs_entry);
+    if (has_vocab_probs) {
+      ++tensor_count;
+    }
     auto* entries = new XLLM_InferOutputTensor[tensor_count]();
 
     std::vector<int64_t> item_ids;
@@ -362,6 +416,10 @@ bool populate_raw_output_tensors(const InferenceType inference_type,
       entries[entry_idx++] = make_string_output_tensor("item_type", item_types);
     }
 
+    if (has_vocab_probs) {
+      entries[entry_idx++] = vocab_probs_entry;
+    }
+
     response->output_tensors.entries = entries;
     response->output_tensors.entries_size = tensor_count;
     return true;
@@ -371,7 +429,20 @@ bool populate_raw_output_tensors(const InferenceType inference_type,
   const size_t alloc_elems = num_outputs * token_dim;
   const bool output_sku_logprobs =
       FLAGS_enable_output_sku_logprobs && !req_output.outputs.empty();
-  const size_t tensor_count = output_sku_logprobs ? 2U : 1U;
+
+  // OneRec single-step mode: optionally emit the full vocab probability tensor.
+  XLLM_InferOutputTensor vocab_probs_entry{};
+  const bool has_vocab_probs =
+      FLAGS_max_decode_rounds == 1 &&
+      build_vocab_probs_output_tensor(req_output, &vocab_probs_entry);
+
+  size_t tensor_count = 1U;
+  if (output_sku_logprobs) {
+    ++tensor_count;
+  }
+  if (has_vocab_probs) {
+    ++tensor_count;
+  }
   auto* entries = new XLLM_InferOutputTensor[tensor_count]();
   CHECK(nullptr != entries);
   auto* shape = new int64_t[2]();
@@ -402,6 +473,7 @@ bool populate_raw_output_tensors(const InferenceType inference_type,
   entries[0].data = data;
   entries[0].num_elements = alloc_elems;
 
+  size_t entry_idx = 1;
   if (output_sku_logprobs) {
     const int32_t logprob_width =
         static_cast<int32_t>(req_output.outputs[0].token_ids_logprobs.size());
@@ -413,10 +485,15 @@ bool populate_raw_output_tensors(const InferenceType inference_type,
             &logprob_values, req_output.outputs[i], logprob_width);
       }
     }
-    entries[1] = make_float_output_tensor("sku_logprobs",
-                                          {static_cast<int64_t>(num_outputs),
-                                           static_cast<int64_t>(logprob_width)},
-                                          logprob_values);
+    entries[entry_idx++] =
+        make_float_output_tensor("sku_logprobs",
+                                 {static_cast<int64_t>(num_outputs),
+                                  static_cast<int64_t>(logprob_width)},
+                                 logprob_values);
+  }
+
+  if (has_vocab_probs) {
+    entries[entry_idx++] = vocab_probs_entry;
   }
 
   response->output_tensors.entries = entries;
