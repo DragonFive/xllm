@@ -1143,8 +1143,13 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::
   const auto& args = runtime_.context->get_model_args();
   const auto& parallel_args = runtime_.context->get_parallel_args();
   const int32_t num_layers = static_cast<int32_t>(args.n_layers());
-  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
-      args.n_kv_heads().value_or(args.decoder_n_heads()));
+  // MLA decompresses the latent KV into full per-head K/V (decoder_n_heads),
+  // so the cache must be sized by n_heads, not the GQA n_kv_heads.
+  const int64_t decoder_kv_heads =
+      args.kv_lora_rank() > 0
+          ? args.decoder_n_heads()
+          : args.decoder_n_kv_heads().value_or(
+                args.n_kv_heads().value_or(args.decoder_n_heads()));
   const int64_t local_kv_heads =
       decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
   const int64_t head_dim = args.decoder_head_dim();
@@ -1180,8 +1185,13 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::allocate_shared_kv_caches() {
   const auto& args = runtime_.context->get_model_args();
   const auto& parallel_args = runtime_.context->get_parallel_args();
   const int32_t num_layers = static_cast<int32_t>(args.n_layers());
-  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
-      args.n_kv_heads().value_or(args.decoder_n_heads()));
+  // MLA decompresses the latent KV into full per-head K/V (decoder_n_heads),
+  // so the cache must be sized by n_heads, not the GQA n_kv_heads.
+  const int64_t decoder_kv_heads =
+      args.kv_lora_rank() > 0
+          ? args.decoder_n_heads()
+          : args.decoder_n_kv_heads().value_or(
+                args.n_kv_heads().value_or(args.decoder_n_heads()));
   const int64_t local_kv_heads =
       decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
   const int64_t head_dim = args.decoder_head_dim();

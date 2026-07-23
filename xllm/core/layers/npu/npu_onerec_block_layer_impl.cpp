@@ -519,6 +519,21 @@ constexpr int32_t kInMoeSharedW1Weight =
 constexpr int32_t kInMoeSharedW2Weight =
     static_cast<int32_t>(OneRecMoeBlockLayerTensorId::IN_MOE_SHARED_W2_WEIGHT);
 
+// MLA (Multi-head Latent Attention) weight slot aliases. MLA reuses the packed
+// QKV/dense slots to avoid changing the fixed per-layer weight count:
+//   IN_Q_WEIGHT           <- q_proj
+//   IN_K_WEIGHT           <- kv_a_proj        (compressed KV down-projection)
+//   IN_K_BIAS             <- kv_a_layernorm   (RMSNorm weight, OneRec has no
+//   bias) IN_V_WEIGHT           <- kv_b_proj        (KV up-projection)
+//   IN_SELF_ATTN_OUT_WEIGHT <- o_proj
+// Cross-attention mirrors this with the IN_CROSS_* slots.
+constexpr int32_t kInKvADownWeight = kInKWeight;
+constexpr int32_t kInKvALayernormWeight = kInKBias;
+constexpr int32_t kInKvBUpWeight = kInVWeight;
+constexpr int32_t kInCrossKvADownWeight = kInCrossKWeight;
+constexpr int32_t kInCrossKvALayernormWeight = kInCrossKBias;
+constexpr int32_t kInCrossKvBUpWeight = kInCrossVWeight;
+
 static const std::unordered_map<std::string, int32_t>
     kOneRecEncoderWeightMapping = {
         {"layer.0.layer_norm.weight", kInLayerNormWeight},
@@ -528,6 +543,13 @@ static const std::unordered_map<std::string, int32_t>
         {"layer.0.SelfAttention.o.weight", kInSelfAttnOutWeight},
         {"layer.0.SelfAttention.relative_attention_bias.weight",
          kInRelativeAttentionBiasWeight},
+        // MLA self-attention (coexists with MHA entries above; only the keys
+        // present in the checkpoint match).
+        {"layer.0.SelfAttention.q_proj.weight", kInQWeight},
+        {"layer.0.SelfAttention.kv_a_proj.weight", kInKvADownWeight},
+        {"layer.0.SelfAttention.kv_a_layernorm.weight", kInKvALayernormWeight},
+        {"layer.0.SelfAttention.kv_b_proj.weight", kInKvBUpWeight},
+        {"layer.0.SelfAttention.o_proj.weight", kInSelfAttnOutWeight},
         {"layer.1.layer_norm.weight", kInFinalLayerNormWeight},
         {"layer.1.DenseReluDense.wi.weight", kInFfnWi1Weight},
         {"layer.1.DenseReluDense.wo.weight", kInFfnWoWeight},
@@ -543,6 +565,11 @@ static const std::unordered_map<std::string, int32_t>
         {"0.SelfAttention.o.weight", kInSelfAttnOutWeight},
         {"0.SelfAttention.relative_attention_bias.weight",
          kInRelativeAttentionBiasWeight},
+        {"0.SelfAttention.q_proj.weight", kInQWeight},
+        {"0.SelfAttention.kv_a_proj.weight", kInKvADownWeight},
+        {"0.SelfAttention.kv_a_layernorm.weight", kInKvALayernormWeight},
+        {"0.SelfAttention.kv_b_proj.weight", kInKvBUpWeight},
+        {"0.SelfAttention.o_proj.weight", kInSelfAttnOutWeight},
         {"1.layer_norm.weight", kInFinalLayerNormWeight},
         {"1.DenseReluDense.wi.weight", kInFfnWi1Weight},
         {"1.DenseReluDense.wo.weight", kInFfnWoWeight},
@@ -561,11 +588,24 @@ static const std::unordered_map<std::string, int32_t>
         {"layer.0.SelfAttention.o.weight", kInSelfAttnOutWeight},
         {"layer.0.SelfAttention.relative_attention_bias.weight",
          kInRelativeAttentionBiasWeight},
+        // MLA self-attention (layer.0) and cross-attention (layer.1). Coexist
+        // with the MHA entries; only the checkpoint's actual keys match.
+        {"layer.0.SelfAttention.q_proj.weight", kInQWeight},
+        {"layer.0.SelfAttention.kv_a_proj.weight", kInKvADownWeight},
+        {"layer.0.SelfAttention.kv_a_layernorm.weight", kInKvALayernormWeight},
+        {"layer.0.SelfAttention.kv_b_proj.weight", kInKvBUpWeight},
+        {"layer.0.SelfAttention.o_proj.weight", kInSelfAttnOutWeight},
         {"layer.1.layer_norm.weight", kInCrossLayerNormWeight},
         {"layer.1.EncDecAttention.q.weight", kInCrossQWeight},
         {"layer.1.EncDecAttention.k.weight", kInCrossKWeight},
         {"layer.1.EncDecAttention.v.weight", kInCrossVWeight},
         {"layer.1.EncDecAttention.o.weight", kInCrossAttnOutWeight},
+        {"layer.1.EncDecAttention.q_proj.weight", kInCrossQWeight},
+        {"layer.1.EncDecAttention.kv_a_proj.weight", kInCrossKvADownWeight},
+        {"layer.1.EncDecAttention.kv_a_layernorm.weight",
+         kInCrossKvALayernormWeight},
+        {"layer.1.EncDecAttention.kv_b_proj.weight", kInCrossKvBUpWeight},
+        {"layer.1.EncDecAttention.o_proj.weight", kInCrossAttnOutWeight},
         {"layer.2.layer_norm.weight", kInFinalLayerNormWeight},
         {"layer.2.DenseReluDense.wi.weight", kInFfnWi1Weight},
         {"layer.2.DenseReluDense.wo.weight", kInFfnWoWeight},
@@ -578,11 +618,21 @@ static const std::unordered_map<std::string, int32_t>
         {"0.SelfAttention.o.weight", kInSelfAttnOutWeight},
         {"0.SelfAttention.relative_attention_bias.weight",
          kInRelativeAttentionBiasWeight},
+        {"0.SelfAttention.q_proj.weight", kInQWeight},
+        {"0.SelfAttention.kv_a_proj.weight", kInKvADownWeight},
+        {"0.SelfAttention.kv_a_layernorm.weight", kInKvALayernormWeight},
+        {"0.SelfAttention.kv_b_proj.weight", kInKvBUpWeight},
+        {"0.SelfAttention.o_proj.weight", kInSelfAttnOutWeight},
         {"1.layer_norm.weight", kInCrossLayerNormWeight},
         {"1.EncDecAttention.q.weight", kInCrossQWeight},
         {"1.EncDecAttention.k.weight", kInCrossKWeight},
         {"1.EncDecAttention.v.weight", kInCrossVWeight},
         {"1.EncDecAttention.o.weight", kInCrossAttnOutWeight},
+        {"1.EncDecAttention.q_proj.weight", kInCrossQWeight},
+        {"1.EncDecAttention.kv_a_proj.weight", kInCrossKvADownWeight},
+        {"1.EncDecAttention.kv_a_layernorm.weight", kInCrossKvALayernormWeight},
+        {"1.EncDecAttention.kv_b_proj.weight", kInCrossKvBUpWeight},
+        {"1.EncDecAttention.o_proj.weight", kInCrossAttnOutWeight},
         {"2.layer_norm.weight", kInFinalLayerNormWeight},
         {"2.DenseReluDense.wi.weight", kInFfnWi1Weight},
         {"2.DenseReluDense.wo.weight", kInFfnWoWeight},
@@ -827,6 +877,21 @@ void NpuOneRecBlockLayerImpl::param_from_args(
   }
 }
 
+void NpuOneRecBlockLayerImpl::apply_mla_params() {
+  // OneRec MLA has no RoPE, so nope/v head dims equal the attention head dim.
+  const auto set_mla = [this](atb_speed::onerec::BlockLayerParam& param) {
+    param.use_mla = true;
+    param.kvLoraRank = kv_lora_rank_;
+    param.qkNopeHeadDim = param.hiddenSizePerAttentionHead;
+    param.vHeadDim = param.hiddenSizePerAttentionHead;
+  };
+  set_mla(prefill_param_);
+  set_mla(prefill_param_atb_);
+  set_mla(decode_param_);
+  set_mla(decoder_prefill_only_decode_param_);
+  set_mla(decoder_prefill_only_decode_param_atb_);
+}
+
 void NpuOneRecBlockLayerImpl::verify_loaded_weights(
     const std::string& prefix) const {
   std::unordered_map<std::string, int32_t> filtered_weight_mapping;
@@ -934,28 +999,49 @@ bool NpuOneRecBlockLayerImpl::validate_decoder_moe_weights(
 }
 
 void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
-  const bool q_loaded = !(at_weight_tensors_[kInQWeight].sizes().size() == 2 &&
-                          at_weight_tensors_[kInQWeight].sizes()[0] == 1);
-  const bool k_loaded = !(at_weight_tensors_[kInKWeight].sizes().size() == 2 &&
-                          at_weight_tensors_[kInKWeight].sizes()[0] == 1);
-  const bool v_loaded = !(at_weight_tensors_[kInVWeight].sizes().size() == 2 &&
-                          at_weight_tensors_[kInVWeight].sizes()[0] == 1);
-  CHECK(q_loaded && k_loaded && v_loaded)
-      << "OneRec QKV weights are not properly loaded.";
+  if (is_mla_) {
+    // MLA keeps q_proj / kv_a_proj / kv_a_layernorm / kv_b_proj in their own
+    // slots. They cannot be QKV-packed: kv_a_proj outputs kv_lora_rank (512)
+    // while q_proj outputs num_heads*head_dim (2048), so the dims do not align.
+    // The MLA projection subgraph consumes these slots individually.
+    const bool q_loaded =
+        !(at_weight_tensors_[kInQWeight].sizes().size() == 2 &&
+          at_weight_tensors_[kInQWeight].sizes()[0] == 1);
+    const bool kv_a_loaded =
+        !(at_weight_tensors_[kInKvADownWeight].sizes().size() == 2 &&
+          at_weight_tensors_[kInKvADownWeight].sizes()[0] == 1);
+    const bool kv_b_loaded =
+        !(at_weight_tensors_[kInKvBUpWeight].sizes().size() == 2 &&
+          at_weight_tensors_[kInKvBUpWeight].sizes()[0] == 1);
+    CHECK(q_loaded && kv_a_loaded && kv_b_loaded)
+        << "OneRec MLA self-attention weights are not properly loaded.";
+  } else {
+    const bool q_loaded =
+        !(at_weight_tensors_[kInQWeight].sizes().size() == 2 &&
+          at_weight_tensors_[kInQWeight].sizes()[0] == 1);
+    const bool k_loaded =
+        !(at_weight_tensors_[kInKWeight].sizes().size() == 2 &&
+          at_weight_tensors_[kInKWeight].sizes()[0] == 1);
+    const bool v_loaded =
+        !(at_weight_tensors_[kInVWeight].sizes().size() == 2 &&
+          at_weight_tensors_[kInVWeight].sizes()[0] == 1);
+    CHECK(q_loaded && k_loaded && v_loaded)
+        << "OneRec QKV weights are not properly loaded.";
 
-  auto new_q_weight = torch::cat({at_weight_tensors_[kInQWeight],
-                                  at_weight_tensors_[kInKWeight],
-                                  at_weight_tensors_[kInVWeight]},
-                                 0);
-  at_weight_tensors_[kInQWeight] = new_q_weight;
-  at_weight_tensors_[kInKWeight] =
-      torch::zeros({1, at_weight_tensors_[kInQWeight].size(1)})
-          .to(device_)
-          .to(dtype_);
-  at_weight_tensors_[kInVWeight] =
-      torch::zeros({1, at_weight_tensors_[kInQWeight].size(1)})
-          .to(device_)
-          .to(dtype_);
+    auto new_q_weight = torch::cat({at_weight_tensors_[kInQWeight],
+                                    at_weight_tensors_[kInKWeight],
+                                    at_weight_tensors_[kInVWeight]},
+                                   0);
+    at_weight_tensors_[kInQWeight] = new_q_weight;
+    at_weight_tensors_[kInKWeight] =
+        torch::zeros({1, at_weight_tensors_[kInQWeight].size(1)})
+            .to(device_)
+            .to(dtype_);
+    at_weight_tensors_[kInVWeight] =
+        torch::zeros({1, at_weight_tensors_[kInQWeight].size(1)})
+            .to(device_)
+            .to(dtype_);
+  }
 
   // Keep decoder cross-attention Q/K/V unpacked for current OneRec ATB
   // contract. Do not merge IN_CROSS_{Q,K,V}_WEIGHT here.
@@ -1014,6 +1100,26 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
 }
 
 void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
+  // Detect MLA from the checkpoint: presence of a kv_a_proj weight means the
+  // attention uses Multi-head Latent Attention. kv_lora_rank is the kv_a_proj
+  // output dim. The MLA config is propagated to every BlockLayerParam so the
+  // ATB graph built later in init_layer() takes the MLA projection path.
+  if (!is_mla_) {
+    for (const auto& [name, tensor] : state_dict) {
+      if (absl::EndsWith(name, "SelfAttention.kv_a_proj.weight") ||
+          absl::EndsWith(name, "EncDecAttention.kv_a_proj.weight")) {
+        is_mla_ = true;
+        if (tensor.defined() && tensor.dim() >= 1) {
+          kv_lora_rank_ = static_cast<int32_t>(tensor.size(0));
+        }
+        break;
+      }
+    }
+    if (is_mla_) {
+      apply_mla_params();
+    }
+  }
+
   const auto target_weight_dtype = [this]() -> torch::ScalarType {
     if (torch_dtype_.empty()) {
       return dtype_;

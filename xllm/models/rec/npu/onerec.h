@@ -371,6 +371,16 @@ REGISTER_MODEL_ARGS(onerec, [&] {
   LOAD_ARG(n_kv_heads, "num_key_value_heads");
   LOAD_ARG(decoder_n_kv_heads, "decoder_num_key_value_heads");
 
+  // MLA (Multi-head Latent Attention) config. The OneRec MLA checkpoints do not
+  // carry these fields in config.json, so they default to 0 here and are
+  // inferred from the attention weight shapes during load_state_dict (presence
+  // of kv_a_proj implies MLA; kv_lora_rank = kv_a_proj output dim). Reuses the
+  // shared ModelArgs MLA fields (see xllm/models/llm/deepseek_v2.h:237-241).
+  LOAD_ARG_OR(kv_lora_rank, "kv_lora_rank", 0);
+  LOAD_ARG_OR(q_lora_rank, "q_lora_rank", 0);
+  LOAD_ARG_OR(qk_nope_head_dim, "qk_nope_head_dim", 0);
+  LOAD_ARG_OR(v_head_dim, "v_head_dim", 0);
+
   LOAD_ARG_OR(vocab_size, "vocab_size", 8200);
   LOAD_ARG_OR(rms_norm_eps, "layer_norm_epsilon", 1e-6);
   LOAD_ARG_OR(max_position_embeddings, "max_length", 500);

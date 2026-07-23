@@ -74,6 +74,10 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
                        bool is_prefill,
                        const ModelInputParams* input_params = nullptr);
 
+  // Propagate detected MLA config (is_mla_, kv_lora_rank_) onto every
+  // BlockLayerParam so the ATB graph built in init_layer() takes the MLA path.
+  void apply_mla_params();
+
   void build_encoder_node_variant_pack(atb_speed::Model::Node& node,
                                        torch::Tensor& x,
                                        at::Tensor& attn_mask,
@@ -164,6 +168,13 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   int32_t device_id_ = 0;
   bool is_decoder_ = false;
   int32_t layer_id_ = 0;
+
+  // MLA (Multi-head Latent Attention) state. Detected from weight keys during
+  // load_state_dict (presence of kv_a_proj). When true, the attention
+  // projection uses q_proj / kv_a_proj / kv_a_layernorm / kv_b_proj and the
+  // QKV pack in merge_loaded_weights is skipped.
+  bool is_mla_ = false;
+  int32_t kv_lora_rank_ = 0;
 
   std::unordered_map<std::string, std::vector<torch::Tensor>> experts_weights_;
   std::mutex experts_mutex_;
