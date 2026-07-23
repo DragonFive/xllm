@@ -186,10 +186,15 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         xllm_init_options.enable_prefill_piecewise_graph;
     FLAGS_enable_onerec_prefill_acl_graph =
         xllm_init_options.enable_onerec_prefill_acl_graph;
+    if (xllm_init_options.enable_onerec_prefill_acl_graph) {
+      FLAGS_enable_graph = true;
+    }
     FLAGS_enable_xattention_one_stage =
         xllm_init_options.enable_xattention_one_stage;
     FLAGS_enable_graph_mode_decode_no_padding =
         xllm_init_options.enable_graph_mode_decode_no_padding;
+    FLAGS_max_tokens_for_graph_mode =
+        xllm_init_options.max_tokens_for_graph_mode;
     FLAGS_enable_block_copy_kernel = xllm_init_options.enable_block_copy_kernel;
     FLAGS_enable_topk_sorted = xllm_init_options.enable_topk_sorted;
     FLAGS_enable_rec_prefill_only = xllm_init_options.enable_rec_prefill_only;
@@ -250,8 +255,11 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
               << ", enable_prefix_cache=" << FLAGS_enable_prefix_cache
               << ", enable_schedule_overlap=" << FLAGS_enable_schedule_overlap
               << ", enable_chunked_prefill=" << FLAGS_enable_chunked_prefill
+              << ", enable_graph=" << FLAGS_enable_graph
               << ", enable_onerec_prefill_acl_graph="
               << FLAGS_enable_onerec_prefill_acl_graph
+              << ", max_tokens_for_graph_mode="
+              << FLAGS_max_tokens_for_graph_mode
               << ", enable_multistream_perf_mode="
               << FLAGS_enable_multistream_perf_mode
               << ", enable_onerec_multistream_core_split="

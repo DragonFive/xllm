@@ -169,6 +169,9 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Whether to enable OneRec decoder prefill ACL graph on NPU */
   bool enable_onerec_prefill_acl_graph;
 
+  /** Max tokens in graph **/
+  int32_t max_tokens_for_graph_mode;
+
   /** Whether to enable xattention one-stage execution for REC */
   bool enable_xattention_one_stage;
 

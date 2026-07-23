@@ -128,6 +128,7 @@ const XLLM_InitOptions XLLM_INIT_REC_OPTIONS_DEFAULT = {
     .enable_rec_fast_sampler = true,
     .enable_prefill_piecewise_graph = false,
     .enable_onerec_prefill_acl_graph = false,
+    .max_tokens_for_graph_mode = 20480,
     .enable_xattention_one_stage = false,
     .enable_graph_mode_decode_no_padding = false,
     .enable_block_copy_kernel = false,
