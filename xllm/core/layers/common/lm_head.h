@@ -27,6 +27,14 @@ class LmHead : public torch::nn::ModuleHolder<ColumnParallelLinearImpl> {
 
   LmHead(const ModelContext& context)
       : ModuleHolder(std::make_shared<ColumnParallelLinearImpl>(context)) {}
+
+  // Build an lm_head with an explicit output width (vocab segment). Used by
+  // OneRec split lm_head, where each per-step head produces only its segment
+  // [seg_width, hidden] instead of the full vocab.
+  LmHead(const ModelContext& context, int64_t out_features)
+      : ModuleHolder(
+            std::make_shared<ColumnParallelLinearImpl>(context, out_features)) {
+  }
 };
 
 }  // namespace layer

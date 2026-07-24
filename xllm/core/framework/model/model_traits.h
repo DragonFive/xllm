@@ -79,6 +79,18 @@ struct has_logits_with_hidden<T,
                                   std::declval<torch::Tensor&>()))>>
     : std::true_type {};
 
+// Detects a decode-step-aware logits(hidden, selected, int32_t step) overload
+// (OneRec split lm_head). Distinct from has_logits_with_hidden by the int arg.
+template <typename T, typename = void>
+struct has_logits_with_step : std::false_type {};
+
+template <typename T>
+struct has_logits_with_step<T,
+                            std::void_t<decltype(std::declval<T>()->logits(
+                                std::declval<const torch::Tensor&>(),
+                                std::declval<const torch::Tensor&>(),
+                                std::declval<int32_t>()))>> : std::true_type {};
+
 template <typename T, typename = void>
 struct has_lazy_load_model : std::false_type {};
 

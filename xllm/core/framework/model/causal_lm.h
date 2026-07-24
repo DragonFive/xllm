@@ -85,6 +85,15 @@ class CausalLM : public torch::nn::Module {
     return torch::Tensor();
   }
 
+  // OneRec split lm_head: decode-step-aware logits. Default falls back to the
+  // full-vocab logits; models with per-step segment heads (e.g. OneRec split
+  // lm_head) override to compute only the step's vocab segment.
+  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
+                               const torch::Tensor& seleted_idxes,
+                               int32_t step) {
+    return logits(hidden_states, seleted_idxes);
+  }
+
   virtual void load_model(std::unique_ptr<ModelLoader> loader) = 0;
 
   virtual torch::Device device() const = 0;
@@ -191,6 +200,16 @@ class CausalLMImpl : public CausalLM {
       return model_->logits(hidden_states, seleted_idxes, out_hidden);
     } else {
       return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
+    }
+  }
+
+  torch::Tensor logits(const torch::Tensor& hidden_states,
+                       const torch::Tensor& seleted_idxes,
+                       int32_t step) override {
+    if constexpr (detail::has_logits_with_step<Model>::value) {
+      return model_->logits(hidden_states, seleted_idxes, step);
+    } else {
+      return CausalLM::logits(hidden_states, seleted_idxes, step);
     }
   }
 
