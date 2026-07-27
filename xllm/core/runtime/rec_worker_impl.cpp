@@ -1856,8 +1856,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       }
 #endif
       Timer logits_host_timer;
-      result.logits =
-          runtime_.model->logits(hidden_states, selected_token_idxes);
+      result.logits = runtime_.model->logits(
+          hidden_states, selected_token_idxes, current_step);
       log_onerec_xattention_host_stage_timing(
           "logits", stage_round, logits_host_timer);
       log_stage_timing("logits", stage_round, stage_timer);

@@ -29,13 +29,15 @@ limitations under the License.
 #include "core/framework/model_loader.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/word_embedding.h"
+#include "core/util/rec_model_utils.h"
 
 namespace xllm {
 
 template <typename ModelType>
 class RecForCausalLMImplBase : public torch::nn::Module {
  public:
-  explicit RecForCausalLMImplBase(const ModelContext& context) {
+  explicit RecForCausalLMImplBase(const ModelContext& context)
+      : context_(context) {
     const auto& args = context.get_model_args();
     tie_word_embeddings_ = args.tie_word_embeddings();
     const float denom =
@@ -63,6 +65,50 @@ class RecForCausalLMImplBase : public torch::nn::Module {
       h = h.index_select(/*dim=*/0, selected_idxes);
     }
     return lm_head_(h);
+  }
+
+  // OneRec split lm_head: at decode step N, use only lm_head_segments_[N]
+  // (shape [seg_width_N, hidden]) to compute that segment's logits.
+  //
+  // Two output shapes, orthogonal to the single-step vocab-probs feature:
+  //  - Multi-round beam search: scatter the segment back into a full
+  //    [rows, vocab_size] tensor at seg_offsets_[N] (other positions filled
+  //    with a very negative value), preserving the 25000-wide, global-token-id
+  //    contract that beam search / constrained topk / embedding all rely on.
+  //  - Single-step mode (max_decode_rounds == 1, is_onerec_single_step_mode()):
+  //    return the narrow segment [rows, seg_width_N] directly. The sampler's
+  //    softmax then yields vocab_probs of the segment width, which the C API
+  //    emits as-is (P2 semantics: the caller wants the split-sized probs, not
+  //    the padded full vocab). Single-step is always step 0, so the segment
+  //    offset is 0 and local index == global token id.
+  //
+  // Falls back to the plain full-vocab logits when the model has no split
+  // heads or step is out of range.
+  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
+                               const torch::Tensor& selected_idxes,
+                               int32_t step) {
+    if (!use_split_lm_head_ || step < 0 ||
+        step >= static_cast<int32_t>(lm_head_segments_.size())) {
+      return logits(hidden_states, selected_idxes);
+    }
+    auto h = hidden_states;
+    if (tie_word_embeddings_) {
+      h = hidden_states * scale_factor_;
+    }
+    if (selected_idxes.defined()) {
+      h = h.index_select(/*dim=*/0, selected_idxes);
+    }
+    auto seg = lm_head_segments_[step](h);  // [rows, seg_width_step]
+    if (is_onerec_single_step_mode()) {
+      return seg;
+    }
+    const int64_t rows = seg.size(0);
+    auto full = torch::full(
+        {rows, full_vocab_size_}, kSplitLmHeadNegInf, seg.options());
+    full.slice(/*dim=*/1,
+               /*start=*/seg_offsets_[step],
+               /*end=*/seg_offsets_[step] + seg_widths_[step]) = seg;
+    return full;
   }
 
   virtual torch::Tensor pooler(const torch::Tensor& hidden_states,
@@ -98,6 +144,52 @@ class RecForCausalLMImplBase : public torch::nn::Module {
 
   virtual void set_lm_head(layer::LmHead& head) { lm_head_ = head; }
 
+  // Detect split lm_head weights (lm_head_0/1/2/...) in the checkpoint and, if
+  // present, build one LmHead per segment (each [seg_width, hidden]) and load
+  // its weight. Segment count / widths are inferred from the weights; offsets
+  // are the prefix sum. Returns true if split heads were built. Called by the
+  // model's load_model before falling back to the single-head path.
+  bool try_build_split_lm_head(const StateDict& state_dict) {
+    // Collect consecutive lm_head_<i>.weight entries.
+    std::vector<torch::Tensor> seg_weights;
+    for (int32_t i = 0;; ++i) {
+      const std::string key = "lm_head_" + std::to_string(i) + ".weight";
+      auto t = state_dict.get_tensor(key);
+      if (!t.defined()) {
+        break;
+      }
+      seg_weights.push_back(t);
+    }
+    if (seg_weights.empty()) {
+      return false;
+    }
+
+    full_vocab_size_ = context_.get_model_args().vocab_size();
+    seg_widths_.clear();
+    seg_offsets_.clear();
+    lm_head_segments_.clear();
+    int64_t offset = 0;
+    for (size_t i = 0; i < seg_weights.size(); ++i) {
+      const int64_t width = seg_weights[i].size(0);
+      seg_widths_.push_back(width);
+      seg_offsets_.push_back(offset);
+      offset += width;
+      auto head = register_module("lm_head_" + std::to_string(i),
+                                  layer::LmHead(context_, width));
+      const std::string prefix = "lm_head_" + std::to_string(i) + ".";
+      head->load_state_dict(state_dict.get_dict_with_prefix(prefix));
+      lm_head_segments_.push_back(head);
+    }
+    CHECK_LE(offset, full_vocab_size_)
+        << "OneRec split lm_head total width " << offset
+        << " exceeds vocab_size " << full_vocab_size_;
+    use_split_lm_head_ = true;
+    LOG(INFO) << "OneRec split lm_head enabled: " << seg_weights.size()
+              << " segments, widths sum=" << offset
+              << ", vocab_size=" << full_vocab_size_;
+    return true;
+  }
+
   virtual layer::WordEmbedding get_word_embedding() {
     return model_->get_word_embedding();
   }
@@ -109,6 +201,19 @@ class RecForCausalLMImplBase : public torch::nn::Module {
  protected:
   float scale_factor_ = 1.0f;
   bool tie_word_embeddings_ = false;
+  ModelContext context_;
+
+  // OneRec split lm_head state. When use_split_lm_head_ is true, per-step heads
+  // in lm_head_segments_ replace the single lm_head_ for logits computation.
+  // Segment count / widths / offsets are inferred from the checkpoint weights
+  // (not hardcoded); offsets are the prefix sum of widths. full_vocab_size_ is
+  // the scatter target width (= config vocab_size).
+  static constexpr float kSplitLmHeadNegInf = -1e30f;
+  bool use_split_lm_head_ = false;
+  int64_t full_vocab_size_ = 0;
+  std::vector<layer::LmHead> lm_head_segments_;
+  std::vector<int64_t> seg_widths_;
+  std::vector<int64_t> seg_offsets_;
 
   ModelType model_{nullptr};
   layer::LmHead lm_head_{nullptr};

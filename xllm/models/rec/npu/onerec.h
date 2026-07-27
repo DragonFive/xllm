@@ -320,7 +320,18 @@ class OneRecForConditionalGenerationImpl final
       }
       model_->load_state_dict(model_state_dict);
 
-      if (tie_word_embeddings_) {
+      // OneRec split lm_head: if the checkpoint carries lm_head_0/1/2 weights,
+      // build per-step segment heads (each computes only its vocab slice).
+      // Detect on the raw state_dict (split weights are top-level). Falls back
+      // to the single tied/lm_head path below when absent.
+      bool split_built = this->try_build_split_lm_head(*state_dict);
+      if (!split_built) {
+        split_built = this->try_build_split_lm_head(model_state_dict);
+      }
+
+      if (split_built) {
+        // segment heads already loaded; skip single-head load
+      } else if (tie_word_embeddings_) {
         auto shared_dict = model_state_dict.get_dict_with_prefix("shared.");
         if (shared_dict.size() == 0) {
           shared_dict = state_dict->get_dict_with_prefix("shared.");

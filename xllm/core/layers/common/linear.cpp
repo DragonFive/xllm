@@ -190,6 +190,17 @@ ColumnParallelLinearImpl::ColumnParallelLinearImpl(const ModelContext& context)
           context.get_parallel_args().tp_group_,
           context.get_tensor_options()) {}
 
+ColumnParallelLinearImpl::ColumnParallelLinearImpl(const ModelContext& context,
+                                                   int64_t out_features)
+    : ColumnParallelLinearImpl(
+          context.get_model_args().hidden_size(),
+          out_features,
+          /*bias=*/false,
+          /*gather_output=*/true,
+          QuantArgs{},  // do not use quantization for lm_head
+          context.get_parallel_args().tp_group_,
+          context.get_tensor_options()) {}
+
 // Linear layer with column parallelism.
 ColumnParallelLinearImpl::ColumnParallelLinearImpl(
     int64_t in_features,

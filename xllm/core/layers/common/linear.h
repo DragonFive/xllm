@@ -55,6 +55,10 @@ class ColumnParallelLinearImpl : public torch::nn::Module {
 
   ColumnParallelLinearImpl(const ModelContext& context);
 
+  // Same as the context ctor but with an explicit output width, for OneRec
+  // split lm_head segment heads ([out_features, hidden] instead of full vocab).
+  ColumnParallelLinearImpl(const ModelContext& context, int64_t out_features);
+
   torch::Tensor forward(torch::Tensor input);
 
   // load the weight from the checkpoint
