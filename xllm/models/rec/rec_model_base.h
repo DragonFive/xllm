@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/model_loader.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/word_embedding.h"
+#include "core/util/rec_model_utils.h"
 
 namespace xllm {
 
@@ -67,13 +68,22 @@ class RecForCausalLMImplBase : public torch::nn::Module {
   }
 
   // OneRec split lm_head: at decode step N, use only lm_head_segments_[N]
-  // (shape [seg_width_N, hidden]) to compute that segment's logits, then
-  // scatter back into a full [rows, vocab_size] tensor at seg_offsets_[N]
-  // (other positions filled with a very negative value). This keeps the full
-  // 25000-wide, global-token-id contract for all downstream consumers
-  // (sampler / beam search / constrained topk / embedding) while cutting the
-  // matmul to ~1/num_segments. Falls back to the plain full-vocab logits when
-  // the model has no split heads or step is out of range.
+  // (shape [seg_width_N, hidden]) to compute that segment's logits.
+  //
+  // Two output shapes, orthogonal to the single-step vocab-probs feature:
+  //  - Multi-round beam search: scatter the segment back into a full
+  //    [rows, vocab_size] tensor at seg_offsets_[N] (other positions filled
+  //    with a very negative value), preserving the 25000-wide, global-token-id
+  //    contract that beam search / constrained topk / embedding all rely on.
+  //  - Single-step mode (max_decode_rounds == 1, is_onerec_single_step_mode()):
+  //    return the narrow segment [rows, seg_width_N] directly. The sampler's
+  //    softmax then yields vocab_probs of the segment width, which the C API
+  //    emits as-is (P2 semantics: the caller wants the split-sized probs, not
+  //    the padded full vocab). Single-step is always step 0, so the segment
+  //    offset is 0 and local index == global token id.
+  //
+  // Falls back to the plain full-vocab logits when the model has no split
+  // heads or step is out of range.
   virtual torch::Tensor logits(const torch::Tensor& hidden_states,
                                const torch::Tensor& selected_idxes,
                                int32_t step) {
@@ -89,6 +99,9 @@ class RecForCausalLMImplBase : public torch::nn::Module {
       h = h.index_select(/*dim=*/0, selected_idxes);
     }
     auto seg = lm_head_segments_[step](h);  // [rows, seg_width_step]
+    if (is_onerec_single_step_mode()) {
+      return seg;
+    }
     const int64_t rows = seg.size(0);
     auto full = torch::full(
         {rows, full_vocab_size_}, kSplitLmHeadNegInf, seg.options());
