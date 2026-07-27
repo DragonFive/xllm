@@ -189,6 +189,15 @@ class Sequence final {
   void update_mm_embeddings(const std::vector<torch::Tensor>& mm_embeddings);
   // update embeddings to the sequence
   void update_embeddings(const torch::Tensor& embedding);
+  // OneRec single-step mode: directly store the full vocab probability
+  // distribution [1, vocab] as the output embedding, bypassing the finished_
+  // guard and is_embeddings logic in update_embeddings (single-step sequences
+  // are already finished by the time the sampler probs are routed).
+  void set_onerec_probs_output(const torch::Tensor& probs) {
+    if (probs.defined()) {
+      output_embedding_ = probs;
+    }
+  }
   bool has_embedding_id() const { return embedding_block_.is_valid(); }
   int32_t get_embedding_id() const { return embedding_block_.id(); }
   void set_embedding_block(Block embedding_block) {
@@ -228,6 +237,12 @@ class Sequence final {
   SequenceOutput generate_output();
   void generate_sample_outputs(std::vector<SequenceOutput>& outputs,
                                const Tokenizer& tokenizer);
+
+  // OneRec single-step mode output: emit only the sampler's full vocab
+  // probability distribution (stored on output_embedding_ by
+  // Batch::process_sample_output). Does not slice token ids, so it is safe when
+  // single-step generates no decode tokens. Called from SequencesGroup.
+  void generate_onerec_probs_output(SequenceOutput& output) const;
 
   // get the sampling parameters
   const RequestSamplingParam* sampling_param() const {
