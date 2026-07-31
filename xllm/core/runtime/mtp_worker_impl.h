@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -82,6 +83,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
 #endif
 
   ForwardInput update_input_by_last_step_output(ForwardInput& inputs) override;
+  ForwardInput update_input_by_last_step_output_for_schedule_overlap(
+      ForwardInput& inputs) override;
+  folly::SemiFuture<std::optional<ForwardOutput>> step_async(
+      const ForwardInput& inputs) override;
   void prepare_work_before_execute(const ForwardInput& inputs,
                                    ForwardInput& processed_inputs) override;
 
@@ -94,6 +99,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   std::optional<ForwardOutput> step_empty(const ForwardInput& inputs) override;
 
   void fill_validate_input_from_draft_outputs(
+      const ForwardInput& input,
       const std::vector<ForwardOutput>& draft_outputs,
       ForwardInput& validate_input,
       const std::vector<int32_t>& per_seq_val_tokens,
@@ -128,7 +134,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       // statically from the declared base type, so an override changing the
       // default would silently diverge when called through a base reference.
       // Callers must pass nullptr explicitly for the static path.
-      const std::vector<int32_t>* pruned_prefix_lengths);
+      const std::vector<int32_t>* pruned_prefix_lengths,
+      const torch::Tensor& target_filter_mask,
+      const std::vector<uint8_t>& invalid_draft);
 
   // Hook for algorithm-specific draft output post-processing during decode.
   // Default MTP behavior always compresses probs for cache storage.
@@ -140,7 +148,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const torch::Tensor& draft_probs,
       const ForwardOutput& target_output,
       int32_t num_speculative_tokens,
-      const std::vector<int32_t>* pruned_prefix_lengths = nullptr);
+      const std::vector<int32_t>* pruned_prefix_lengths = nullptr,
+      const torch::Tensor& target_filter_mask = torch::Tensor(),
+      const std::vector<uint8_t>& invalid_draft = {});
 
   // PD separation: placeholder size for empty embedding slot. Default: 1x
   // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
