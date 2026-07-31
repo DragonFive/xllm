@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <mutex>
 
 #include "framework/kv_cache/embedding_cache.h"
@@ -79,6 +80,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   std::optional<ForwardOutput> step_empty(const ForwardInput& inputs) override;
 
   void fill_validate_input_from_draft_outputs(
+      const ForwardInput& input,
       const std::vector<ForwardOutput>& draft_outputs,
       ForwardInput& validate_input,
       Stream& compute_stream);
@@ -87,18 +89,24 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const std::vector<ForwardOutput>& draft_outputs,
       ForwardInput& validate_input);
 
-  virtual SampleOutput validate(const SamplingParameters& sampling_params,
-                                const std::vector<ForwardOutput>& draft_outputs,
-                                const ForwardOutput& target_output);
+  virtual SampleOutput validate(
+      const SamplingParameters& sampling_params,
+      const std::vector<ForwardOutput>& draft_outputs,
+      const ForwardOutput& target_output,
+      const torch::Tensor& target_filter_mask = torch::Tensor(),
+      const std::vector<uint8_t>& invalid_draft = {});
 
   // Hook for algorithm-specific draft output post-processing during decode.
   // Default MTP behavior always compresses probs for cache storage.
   virtual void process_draft_sample_output(SampleOutput& sample_output);
 
-  SampleOutput validate(const SamplingParameters& sampling_params,
-                        const torch::Tensor& draft_token_ids,
-                        const torch::Tensor& draft_probs,
-                        const ForwardOutput& target_output);
+  SampleOutput validate(
+      const SamplingParameters& sampling_params,
+      const torch::Tensor& draft_token_ids,
+      const torch::Tensor& draft_probs,
+      const ForwardOutput& target_output,
+      const torch::Tensor& target_filter_mask = torch::Tensor(),
+      const std::vector<uint8_t>& invalid_draft = {});
 
   // PD separation: placeholder size for empty embedding slot. Default: 1x
   // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
