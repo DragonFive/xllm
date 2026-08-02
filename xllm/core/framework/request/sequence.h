@@ -213,6 +213,9 @@ class Sequence final {
   }
   Block reset_single_block() { return std::move(single_block_); }
   const std::string& request_id() const { return request_id_; }
+  std::string sample_sequence_id() const {
+    return request_id_ + "#" + std::to_string(index_);
+  }
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
 

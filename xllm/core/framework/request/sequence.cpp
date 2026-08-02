@@ -368,6 +368,15 @@ void Sequence::append_token(const Token& token) {
   }
 
   if (json_object_state_.has_value() && token_id >= 0) {
+    if (!json_object_state_->can_accept_token(token_id)) {
+      const JsonObjectGrammarSnapshot snapshot = json_object_state_->snapshot();
+      LOG(ERROR) << "JSON grammar commit mismatch: request_id=" << request_id_
+                 << ", sequence_index=" << index_
+                 << ", output_row=-1, token_offset=-1"
+                 << ", token_id=" << token_id
+                 << ", committed_tokens=" << snapshot.token_ids.size()
+                 << ", state_fingerprint=" << json_object_state_->fingerprint();
+    }
     CHECK(json_object_state_->accept_token(token_id))
         << "generated token violates json_object grammar, token_id="
         << token_id;
@@ -421,8 +430,11 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
       const JsonObjectGrammar* grammar = json_object_state_->grammar();
       LOG(ERROR)
           << "MTP JSON grammar mismatch: token_offset=" << token_offset
+          << ", request_id=" << request_id_ << ", sequence_index=" << index_
+          << ", output_row=-1"
           << ", token_id=" << token_id
           << ", committed_tokens=" << snapshot.token_ids.size()
+          << ", state_fingerprint=" << json_object_state_->fingerprint()
           << ", allowed_tokens="
           << (grammar == nullptr
                   ? 0

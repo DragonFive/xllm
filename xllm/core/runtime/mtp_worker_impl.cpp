@@ -854,12 +854,16 @@ folly::SemiFuture<std::optional<ForwardOutput>> MTPWorkerImpl::step_async(
         std::unique_lock<std::mutex> output_lock(mtx_);
         cv_.wait(output_lock, [this] { return !is_recorded_; });
         update_last_step_output(
-            output, input_on_device.input_params.embedding.request_ids);
+            output,
+            input_on_device.input_params.embedding.request_ids,
+            input_on_device.sample_sequence_ids);
         is_recorded_ = true;
         cv_.notify_one();
       } else {
         update_last_step_output(
-            output, input_on_device.input_params.embedding.request_ids);
+            output,
+            input_on_device.input_params.embedding.request_ids,
+            input_on_device.sample_sequence_ids);
       }
     } else {
       if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
@@ -867,11 +871,13 @@ folly::SemiFuture<std::optional<ForwardOutput>> MTPWorkerImpl::step_async(
         cv_.wait(output_lock, [this] { return !is_recorded_; });
         last_step_output_valid_ = false;
         last_step_request_ids_.clear();
+        last_step_sample_sequence_ids_.clear();
         is_recorded_ = true;
         cv_.notify_one();
       } else {
         last_step_output_valid_ = false;
         last_step_request_ids_.clear();
+        last_step_sample_sequence_ids_.clear();
       }
     }
     promise.setValue(output);

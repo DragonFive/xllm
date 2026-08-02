@@ -2262,6 +2262,7 @@ inline void deserialize_forward_input_payload(
   }
   // acc_logprob
   read_tensor(context, forward_input.sampling_params.acc_logprob, stream);
+  read_string_vector(context, forward_input.sample_sequence_ids);
   read_json_object_state_snapshots(context,
                                    forward_input.json_object_state_snapshots);
 
@@ -2597,6 +2598,7 @@ inline void serialize_forward_input_sections(
   }
 
   write_tensor(context, sampling_params.acc_logprob);
+  write_string_vector(context.descriptor, input.sample_sequence_ids);
   write_json_object_state_snapshots(context.descriptor,
                                     input.json_object_state_snapshots);
 
