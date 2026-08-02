@@ -691,6 +691,8 @@ class BuildDistWheel(bdist_wheel):
         super().finalize_options()
 
     def run(self) -> None:
+        global BUILD_TEST_FILE
+
         build_ext_cmd = self.get_finalized_command("build_ext")
         build_ext_cmd.device = self.device
         build_ext_cmd.arch = self.arch
