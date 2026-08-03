@@ -875,8 +875,6 @@ ForwardInput MTPWorkerImpl::update_input_by_last_step_output(
 ForwardInput
 MTPWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
     ForwardInput& inputs) {
-  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-  wait_output_ready_event(last_step_output_, *compute_stream_);
   update_json_object_states_by_last_step_output(inputs);
   return update_input_by_last_step_output(inputs);
 }
