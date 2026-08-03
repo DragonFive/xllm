@@ -171,7 +171,8 @@ class WorkerService : public proto::DistributeWorker {
             int64_t& prepared_token,
             torch::Tensor& src_seq_idxes,
             torch::Tensor& out_tokens,
-            torch::Tensor& out_logprobs);
+            torch::Tensor& out_logprobs,
+            std::vector<JsonObjectOutputError>& json_object_errors);
   void record_speculative_metrics_from_output(const torch::Tensor& next_tokens);
   DISALLOW_COPY_AND_ASSIGN(WorkerService);
 

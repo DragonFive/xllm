@@ -39,6 +39,7 @@ limitations under the License.
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "runtime/dit_forward_params.h"
+#include "runtime/json_object_output_rows.h"
 
 namespace xllm {
 
@@ -538,6 +539,7 @@ struct ForwardInput {
     inputs.metadata_ready_event = metadata_ready_event;
     inputs.retained_device_tensors = retained_device_tensors;
     inputs.sample_sequence_ids = sample_sequence_ids;
+    inputs.sample_prior_output_rows = sample_prior_output_rows;
     inputs.json_object_states = json_object_states;
     inputs.json_object_state_snapshots = json_object_state_snapshots;
   }
@@ -595,11 +597,14 @@ struct ForwardInput {
   SamplingParameters sampling_params;
   SamplingParameters decoder_sampling_params;
   std::vector<std::string> sample_sequence_ids;
+  std::vector<int32_t> sample_prior_output_rows;
   std::vector<JsonObjectGrammarState> json_object_states;
   std::vector<JsonObjectGrammarSnapshot> json_object_state_snapshots;
   // Flattened [sequence][draft position] flags produced during MTP
   // validation. This is execution-local metadata and is not transported.
   std::vector<uint8_t> json_object_invalid_draft;
+  // Errors detected while aligning prior overlap output with grammar rows.
+  std::vector<JsonObjectOutputError> json_object_errors;
 
   // step-level decode metadata
   std::optional<StepDecodeMeta> step_decode;
@@ -646,6 +651,7 @@ struct ForwardOutput {
   // max number of top logprobs in the batch
   int64_t max_top_logprobs = 0;
   SampleOutput sample_output;
+  std::vector<JsonObjectOutputError> json_object_errors;
   // Keep no-sync input tensor handles alive until downstream consumers finish
   // using outputs on the same compute stream. Composite workers append child
   // outputs' retained inputs here. Local runtime handles; not in proto/shm.
@@ -706,6 +712,7 @@ struct RawSampleOutput {
 
 struct RawForwardOutput {
   std::vector<RawSampleOutput> outputs;  // num seqs
+  std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<int64_t> expert_load_data;
   int64_t prepared_token = -1;
   // beam search kernel output

@@ -205,7 +205,8 @@ void WorkerService::step(ForwardInput& fwd_input,
                          int64_t& prepared_token,
                          torch::Tensor& src_seq_idxes,
                          torch::Tensor& out_tokens,
-                         torch::Tensor& out_logprobs) {
+    torch::Tensor& out_logprobs,
+    std::vector<JsonObjectOutputError>& json_object_errors) {
   const bool use_default_stream =
       !options_.enable_schedule_overlap() && options_.backend() == "llm";
   if (options_.enable_schedule_overlap()) {
@@ -227,6 +228,7 @@ void WorkerService::step(ForwardInput& fwd_input,
                                  torch::kCPU,
                                  /*non_blocking=*/true);
       prepared_token = forward_outputs.value().prepared_token;
+      json_object_errors = forward_outputs.value().json_object_errors;
 
       {
         auto copy_output_to_host = [&]() {
@@ -364,6 +366,7 @@ void WorkerService::create_polling_shm_thread(
           torch::Tensor src_seq_idxes;
           torch::Tensor out_tokens;
           torch::Tensor out_logprobs;
+          std::vector<JsonObjectOutputError> json_object_errors;
 
           step(fwd_input,
                next_tokens,
@@ -378,7 +381,8 @@ void WorkerService::create_polling_shm_thread(
                prepared_token,
                src_seq_idxes,
                out_tokens,
-               out_logprobs);
+               out_logprobs,
+               json_object_errors);
 
           const bool shm_write_ok =
               output_shm_manager->raw_output_write(next_tokens,
@@ -393,7 +397,8 @@ void WorkerService::create_polling_shm_thread(
                                                    prepared_token,
                                                    src_seq_idxes,
                                                    out_tokens,
-                                                   out_logprobs);
+                                                   out_logprobs,
+                                                   json_object_errors);
           CHECK(shm_write_ok) << "Worker output shared memory write failed.";
           COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
         }
@@ -802,6 +807,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         torch::Tensor src_seq_idxes;
         torch::Tensor out_tokens;
         torch::Tensor out_logprobs;
+        std::vector<JsonObjectOutputError> json_object_errors;
 
         step(forward_input,
              next_tokens,
@@ -816,7 +822,8 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              prepared_token,
              src_seq_idxes,
              out_tokens,
-             out_logprobs);
+             out_logprobs,
+             json_object_errors);
         // convert to proto output
         forward_output_to_proto(next_tokens,
                                 logprobs,
@@ -831,6 +838,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                 out_logprobs,
                                 dit_images,
                                 dit_text_output,
+                                json_object_errors,
                                 pb_forward_output);
         COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
       });
@@ -947,7 +955,8 @@ void WorkerService::GetLastStepResult(
 
           if (next_tokens.defined() || !dit_images.empty() ||
               !dit_text_output.empty() ||
-              ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+              ::xllm::EPLBConfig::get_instance().enable_eplb() ||
+              !forward_output.json_object_errors.empty()) {
             const std::vector<std::vector<torch::Tensor>> mm_embeddings;
             forward_output_to_proto(next_tokens,
                                     logprobs,
@@ -962,6 +971,7 @@ void WorkerService::GetLastStepResult(
                                     out_logprobs,
                                     dit_images,
                                     dit_text_output,
+                                    forward_output.json_object_errors,
                                     pb_forward_output);
           }
         }
