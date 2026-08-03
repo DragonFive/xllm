@@ -49,10 +49,8 @@ std::string ModelsServiceImpl::list_model_versions() {
 
   for (size_t i = 0; i < model_versions_.size(); ++i) {
     nlohmann::json model_state;
-    // The repository index reports the model directory name (carried by
-    // model_versions_), so it stays stable regardless of a user-provided
-    // --model_id.
-    model_state["name"] = model_versions_[i];
+    // Keep the repository model identity aligned with the OpenAI model ID.
+    model_state["name"] = model_names_[i];
     model_state["version"] = model_versions_[i];
     model_state["state"] = "READY";
     model_state["reason"] = "normal";
