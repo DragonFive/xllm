@@ -134,6 +134,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       // Callers must pass nullptr explicitly for the static path.
       const std::vector<int32_t>* pruned_prefix_lengths,
       const torch::Tensor& target_filter_mask,
+      const torch::Tensor& target_filter_bitmask,
       const std::vector<uint8_t>& invalid_draft);
 
   // Hook for algorithm-specific draft output post-processing during decode.
@@ -148,6 +149,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       int32_t num_speculative_tokens,
       const std::vector<int32_t>* pruned_prefix_lengths = nullptr,
       const torch::Tensor& target_filter_mask = torch::Tensor(),
+      const torch::Tensor& target_filter_bitmask = torch::Tensor(),
       const std::vector<uint8_t>& invalid_draft = {});
 
   // PD separation: placeholder size for empty embedding slot. Default: 1x
