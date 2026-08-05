@@ -28,6 +28,7 @@ limitations under the License.
 #include "framework/kv_cache_transfer/spec_kv_cache_transfer.h"
 #endif
 #include "core/framework/speculative/adaptive_speculative_controller.h"
+#include "core/runtime/mtp_json_object_state.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
@@ -101,6 +102,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const std::vector<ForwardOutput>& draft_outputs,
       ForwardInput& validate_input,
       const std::vector<int32_t>& per_seq_val_tokens,
+      const detail::JsonDraftValidationScratch* json_scratch,
       Stream& compute_stream);
   // Adaptive pruning path: compute per-seq prefix lengths, truncate draft
   // outputs, and run variable-length validate.
@@ -114,14 +116,16 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const std::vector<ForwardOutput>& draft_outputs,
       ForwardInput& validate_input,
       int32_t num_speculative_tokens,
-      const std::vector<int32_t>* pruned_prefix_lengths = nullptr);
+      const std::vector<int32_t>* pruned_prefix_lengths,
+      const detail::JsonDraftValidationScratch* json_scratch);
   std::optional<ForwardOutput> run_validate(
       const ForwardInput& input,
       const std::vector<ForwardOutput>& draft_outputs,
       ForwardInput& validate_input,
       int32_t num_speculative_tokens,
       const std::vector<int32_t>& per_seq_val_tokens,
-      const std::vector<int32_t>* pruned_prefix_lengths = nullptr);
+      const std::vector<int32_t>* pruned_prefix_lengths,
+      const detail::JsonDraftValidationScratch* json_scratch);
 
   virtual SampleOutput validate(
       const SamplingParameters& sampling_params,
@@ -214,6 +218,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     torch::Tensor accepted_embeddings;
     torch::Tensor base_positions;
     torch::Tensor base_kv_seq_lens;
+    std::vector<uint8_t> json_constrained_rows;
     StreamEventPtr ready_event;
   };
 
