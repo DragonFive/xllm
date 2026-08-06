@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 
 #include "framework/kv_cache/embedding_cache.h"
@@ -30,6 +31,10 @@ namespace xllm {
 
 #if defined(USE_NPU)
 using namespace llm_datadist;
+
+namespace detail {
+class NpuJsonDraftTokenHandoff;
+}  // namespace detail
 #endif
 
 // MTP (Multi-Token Prediction) speculative worker.
@@ -41,7 +46,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                 const torch::Device& device,
                 const runtime::Options& options);
 
-  ~MTPWorkerImpl() override = default;
+  ~MTPWorkerImpl() override;
 
  protected:
   // For derived classes (e.g. Eagle3WorkerImpl) that need custom options for
@@ -159,6 +164,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Whether validation directly uses selected-only draft_probs [B, S].
   // If false, selected-only cache values are restored to dense [B, S, V].
   bool enable_opt_validate_probs_ = false;
+
+#if defined(USE_NPU)
+  std::unique_ptr<detail::NpuJsonDraftTokenHandoff> json_draft_token_handoff_;
+#endif
 
 #if defined(USE_NPU) || defined(USE_MLU)
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;

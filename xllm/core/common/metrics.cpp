@@ -202,6 +202,23 @@ DEFINE_COUNTER(speculative_num_draft_tokens_total,
                "Total number of draft tokens");
 DEFINE_HISTOGRAM(speculative_draft_token_d2h_latency_microseconds,
                  "Latency of draft token host copies in microseconds");
+DEFINE_MULTI_HISTOGRAM(
+    speculative_draft_token_copy_submission_latency_microseconds,
+    "draft_index",
+    "Latency of draft token asynchronous host-copy submission in microseconds");
+DEFINE_MULTI_HISTOGRAM(
+    speculative_draft_token_ready_wait_latency_microseconds,
+    "draft_index",
+    "Latency of draft token host event wait in microseconds");
+DEFINE_MULTI_HISTOGRAM(speculative_draft_token_bulk_read_latency_microseconds,
+                       "draft_index",
+                       "Latency of draft token bulk host read in microseconds");
+DEFINE_MULTI_HISTOGRAM(
+    speculative_draft_token_handoff_latency_microseconds,
+    "draft_index",
+    "Total latency of draft token host handoff in microseconds");
+DEFINE_COUNTER(speculative_draft_token_handoff_fallback_total,
+               "Draft token host handoff fallback count");
 DEFINE_HISTOGRAM(
     speculative_mtp_final_sync_latency_microseconds,
     "Latency of final MTP compute stream synchronization in microseconds");
