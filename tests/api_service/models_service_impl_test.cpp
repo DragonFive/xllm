@@ -25,10 +25,13 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(ModelsServiceImplTest, RepositoryIndexUsesPublicModelIds) {
+TEST(ModelsServiceImplTest, RepositoryIndexUsesRepositoryMetadata) {
   const std::vector<std::string> model_names = {"GLM-5.1", "Qwen3-8B"};
+  const std::vector<std::string> model_repository_names = {"glm-51-w8a8-npu",
+                                                           "qwen3"};
   const std::vector<std::string> model_versions = {"2", "3"};
-  ModelsServiceImpl service(model_names, model_versions);
+  ModelsServiceImpl service(
+      model_names, model_repository_names, model_versions);
 
   proto::ModelListRequest request;
   proto::ModelListResponse response;
@@ -47,7 +50,7 @@ TEST(ModelsServiceImplTest, RepositoryIndexUsesPublicModelIds) {
     ASSERT_TRUE(repository_index[i].contains("version"));
     ASSERT_TRUE(repository_index[i].contains("state"));
     ASSERT_TRUE(repository_index[i].contains("reason"));
-    EXPECT_EQ(repository_index[i]["name"], model_names[i]);
+    EXPECT_EQ(repository_index[i]["name"], model_repository_names[i]);
     EXPECT_EQ(repository_index[i]["version"], model_versions[i]);
     EXPECT_EQ(repository_index[i]["state"], "READY");
     EXPECT_EQ(repository_index[i]["reason"], "normal");
