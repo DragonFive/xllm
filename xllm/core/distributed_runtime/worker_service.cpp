@@ -192,19 +192,20 @@ void WorkerService::set_worker(std::unique_ptr<Worker> worker) {
   initialized_ = true;
 }
 
-void WorkerService::step(ForwardInput& fwd_input,
-                         torch::Tensor& next_tokens,
-                         torch::Tensor& logprobs,
-                         torch::Tensor& top_tokens,
-                         torch::Tensor& top_logprobs,
-                         torch::Tensor& embeddings,
-                         std::vector<std::vector<torch::Tensor>>& mm_embeddings,
-                         std::vector<torch::Tensor>& dit_images,
-                         std::vector<std::string>& dit_text_output,
-                         torch::Tensor& expert_load_data,
-                         int64_t& prepared_token,
-                         torch::Tensor& src_seq_idxes,
-                         torch::Tensor& out_tokens,
+void WorkerService::step(
+    ForwardInput& fwd_input,
+    torch::Tensor& next_tokens,
+    torch::Tensor& logprobs,
+    torch::Tensor& top_tokens,
+    torch::Tensor& top_logprobs,
+    torch::Tensor& embeddings,
+    std::vector<std::vector<torch::Tensor>>& mm_embeddings,
+    std::vector<torch::Tensor>& dit_images,
+    std::vector<std::string>& dit_text_output,
+    torch::Tensor& expert_load_data,
+    int64_t& prepared_token,
+    torch::Tensor& src_seq_idxes,
+    torch::Tensor& out_tokens,
     torch::Tensor& out_logprobs,
     std::vector<JsonObjectOutputError>& json_object_errors) {
   const bool use_default_stream =
