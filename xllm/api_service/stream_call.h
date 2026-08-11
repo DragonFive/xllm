@@ -66,7 +66,7 @@ class StreamCall : public Call {
     }
 
     json_options_.bytes_to_base64 = false;
-    json_options_.jsonify_empty_array = true;
+    json_options_.jsonify_empty_array = false;
   }
 
   ~StreamCall() override {
@@ -176,7 +176,10 @@ class AnthropicCall : public StreamCall<proto::AnthropicMessagesRequest,
                                                      done,
                                                      request,
                                                      response,
-                                                     use_arena) {}
+                                                     use_arena) {
+    // Anthropic responses require empty content arrays to remain visible.
+    this->json_options_.jsonify_empty_array = true;
+  }
 
   ~AnthropicCall() {}
 
