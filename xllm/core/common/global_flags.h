@@ -374,3 +374,5 @@ DECLARE_bool(enable_split_rmsnorm_rope);
 DECLARE_bool(use_cpp_chat_template);
 
 DECLARE_int32(health_check_interval_ms);
+
+DECLARE_bool(enable_json_object_output);

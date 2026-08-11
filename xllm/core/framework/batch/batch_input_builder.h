@@ -86,6 +86,9 @@ class BatchInputBuilder {
 
     // Sampling data
     std::vector<const RequestSamplingParam*> sampling_params;
+    std::vector<JsonObjectGrammarState> json_object_states;
+    std::vector<std::string> sample_sequence_ids;
+    std::vector<int32_t> sample_prior_output_rows;
     std::vector<int32_t> selected_token_idxes;
     std::vector<int32_t> sample_idxes;
 
@@ -179,6 +182,7 @@ class BatchInputBuilder {
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;
   int32_t cp_size_ = 1;
+  bool enable_json_object_output_ = true;
 
   // copy in and out cache contents
   std::unordered_set<int32_t> write_block_ids_;
