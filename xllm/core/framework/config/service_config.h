@@ -50,7 +50,8 @@ class ServiceConfig final {
          "max_concurrent_requests",
          "num_request_handling_threads",
          "num_response_handling_threads",
-         "health_check_interval_ms"}};
+         "health_check_interval_ms",
+         "enable_json_object_output"}};
     return kOptionCategory;
   }
 
@@ -73,6 +74,8 @@ class ServiceConfig final {
   PROPERTY(int32_t, num_response_handling_threads) = 4;
 
   PROPERTY(int32_t, health_check_interval_ms) = 3000;
+
+  PROPERTY(bool, enable_json_object_output) = true;
 };
 
 }  // namespace xllm

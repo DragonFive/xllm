@@ -182,6 +182,7 @@ class BatchInputBuilder {
   uint32_t num_sequences_ = 0;
   bool need_unique_tokens_ = true;
   int32_t cp_size_ = 1;
+  bool enable_json_object_output_ = true;
 
   // copy in and out cache contents
   std::unordered_set<int32_t> write_block_ids_;
