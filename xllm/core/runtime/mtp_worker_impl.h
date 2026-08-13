@@ -224,6 +224,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     torch::Tensor base_positions;
     torch::Tensor base_kv_seq_lens;
     std::vector<uint8_t> json_constrained_rows;
+    std::vector<size_t> failed_rows;
     StreamEventPtr ready_event;
   };
 
@@ -242,7 +243,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                   torch::Tensor base_positions,
                                   torch::Tensor base_kv_seq_lens,
                                   StreamEventPtr ready_event,
-                                  torch::Tensor accepted_tokens_host);
+                                  torch::Tensor accepted_tokens_host,
+                                  std::vector<size_t> failed_rows);
   torch::Tensor acquire_accepted_tokens_host_buffer(
       const torch::Tensor& accepted_tokens);
   bool pending_target_context_matches(const ForwardInput& input) const;

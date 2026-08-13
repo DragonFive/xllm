@@ -1220,6 +1220,12 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
 
   auto prepare_device_on_stream = [&]() {
     processed_input = input.to(device_, dtype_);
+    // Packed RPC/SHM inputs deserialize JSON snapshots inside ForwardInput::to.
+    // Restore them before speculative dispatch so MTP sees the grammar rows.
+    if (processed_input.json_object_states.empty() &&
+        !processed_input.json_object_state_snapshots.empty()) {
+      restore_json_object_states(processed_input);
+    }
     ensure_forward_input_device_tensors(processed_input, device_);
 
     auto& input_params = processed_input.input_params;
@@ -1547,7 +1553,9 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
       }
 #endif
       if (output.has_value()) {
-        output->json_object_errors = input.json_object_errors;
+        output->json_object_errors.insert(output->json_object_errors.end(),
+                                          input.json_object_errors.begin(),
+                                          input.json_object_errors.end());
         if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
           std::unique_lock<std::mutex> lock(mtx_);
           cv_.wait(lock, [this] { return !is_recorded_; });
