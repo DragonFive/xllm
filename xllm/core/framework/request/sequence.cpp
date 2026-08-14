@@ -356,6 +356,47 @@ void Sequence::record_first_token(const Token& token) {
   first_token_ = std::move(t);
 }
 
+bool Sequence::try_commit_json_object_token(int32_t token_id,
+                                            int64_t token_offset) {
+  if (!json_object_state_.has_value() || token_id < 0) {
+    return true;
+  }
+  if (json_object_state_->can_accept_token(token_id)) {
+    CHECK(json_object_state_->accept_token(token_id));
+    return true;
+  }
+
+  const JsonObjectGrammarSnapshot snapshot = json_object_state_->snapshot();
+  const bool is_overlap_commit = token_offset >= 0;
+  if (is_overlap_commit) {
+    const JsonObjectGrammar* grammar = json_object_state_->grammar();
+    LOG(ERROR)
+        << "MTP JSON grammar mismatch: token_offset=" << token_offset
+        << ", request_id=" << request_id_ << ", sequence_index=" << index_
+        << ", output_row=-1"
+        << ", token_id=" << token_id
+        << ", committed_tokens=" << snapshot.token_ids.size()
+        << ", state_fingerprint=" << json_object_state_->fingerprint()
+        << ", allowed_tokens="
+        << (grammar == nullptr
+                ? 0
+                : grammar->allowed_token_ids(*json_object_state_).size());
+  } else {
+    LOG(ERROR) << "JSON grammar commit mismatch: request_id=" << request_id_
+               << ", sequence_index=" << index_
+               << ", output_row=-1, token_offset=-1"
+               << ", token_id=" << token_id
+               << ", committed_tokens=" << snapshot.token_ids.size()
+               << ", state_fingerprint=" << json_object_state_->fingerprint();
+  }
+  const std::string token_source =
+      is_overlap_commit ? "accepted MTP token" : "generated token";
+  fail(Status(StatusCode::UNKNOWN,
+              token_source + " violates json_object grammar, token_id=" +
+                  std::to_string(token_id)));
+  return false;
+}
+
 void Sequence::append_token(const Token& token) {
   CHECK_LT(num_tokens_, tokens_.size())
       << "exceed the token capacity of the sequence";
@@ -367,21 +408,8 @@ void Sequence::append_token(const Token& token) {
   }
 
   const int32_t token_id = static_cast<int32_t>(token.id);
-  if (json_object_state_.has_value() && token_id >= 0) {
-    if (!json_object_state_->can_accept_token(token_id)) {
-      const JsonObjectGrammarSnapshot snapshot = json_object_state_->snapshot();
-      LOG(ERROR) << "JSON grammar commit mismatch: request_id=" << request_id_
-                 << ", sequence_index=" << index_
-                 << ", output_row=-1, token_offset=-1"
-                 << ", token_id=" << token_id
-                 << ", committed_tokens=" << snapshot.token_ids.size()
-                 << ", state_fingerprint=" << json_object_state_->fingerprint();
-      fail(Status(StatusCode::UNKNOWN,
-                  "generated token violates json_object grammar, token_id=" +
-                      std::to_string(token_id)));
-      return;
-    }
-    CHECK(json_object_state_->accept_token(token_id));
+  if (!try_commit_json_object_token(token_id, /*token_offset=*/-1)) {
+    return;
   }
 
   // The real token was generated in function
@@ -429,27 +457,9 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
   }
 
   const int32_t token_id = static_cast<int32_t>(token.id);
-  if (json_object_state_.has_value() && token_id >= 0) {
-    if (!json_object_state_->can_accept_token(token_id)) {
-      const JsonObjectGrammarSnapshot snapshot = json_object_state_->snapshot();
-      const JsonObjectGrammar* grammar = json_object_state_->grammar();
-      LOG(ERROR)
-          << "MTP JSON grammar mismatch: token_offset=" << token_offset
-          << ", request_id=" << request_id_ << ", sequence_index=" << index_
-          << ", output_row=-1"
-          << ", token_id=" << token_id
-          << ", committed_tokens=" << snapshot.token_ids.size()
-          << ", state_fingerprint=" << json_object_state_->fingerprint()
-          << ", allowed_tokens="
-          << (grammar == nullptr
-                  ? 0
-                  : grammar->allowed_token_ids(*json_object_state_).size());
-      fail(Status(StatusCode::UNKNOWN,
-                  "accepted MTP token violates json_object grammar, token_id=" +
-                      std::to_string(token_id)));
-      return;
-    }
-    CHECK(json_object_state_->accept_token(token_id));
+  if (!try_commit_json_object_token(token_id,
+                                    static_cast<int64_t>(token_offset))) {
+    return;
   }
   // check if the token is the first token
   is_first_token_ = cur_generated_token_idx_ == num_prompt_tokens_;

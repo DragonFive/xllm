@@ -797,8 +797,11 @@ JsonObjectGrammar::cached_mask_for_state(
     std::lock_guard<std::mutex> lock(filter_mask_cache_->mutex);
     const auto it = filter_mask_cache_->entries.find(cache_key);
     if (it != filter_mask_cache_->entries.end()) {
+      filter_mask_cache_->recency.splice(filter_mask_cache_->recency.begin(),
+                                         filter_mask_cache_->recency,
+                                         it->second.recency_iterator);
       COUNTER_INC(json_object_mask_cache_hits_total);
-      return it->second;
+      return it->second.mask;
     }
   }
 
@@ -822,12 +825,20 @@ JsonObjectGrammar::cached_mask_for_state(
   std::lock_guard<std::mutex> lock(filter_mask_cache_->mutex);
   const auto existing = filter_mask_cache_->entries.find(cache_key);
   if (existing != filter_mask_cache_->entries.end()) {
-    return existing->second;
+    filter_mask_cache_->recency.splice(filter_mask_cache_->recency.begin(),
+                                       filter_mask_cache_->recency,
+                                       existing->second.recency_iterator);
+    return existing->second.mask;
   }
   if (filter_mask_cache_->entries.size() >= kMaxFilterMaskCacheEntries) {
-    filter_mask_cache_->entries.erase(filter_mask_cache_->entries.begin());
+    CHECK(!filter_mask_cache_->recency.empty());
+    filter_mask_cache_->entries.erase(filter_mask_cache_->recency.back());
+    filter_mask_cache_->recency.pop_back();
   }
-  filter_mask_cache_->entries.emplace(cache_key, cached);
+  filter_mask_cache_->recency.emplace_front(cache_key);
+  filter_mask_cache_->entries.emplace(
+      cache_key,
+      FilterMaskCacheEntry{cached, filter_mask_cache_->recency.begin()});
   return cached;
 }
 

@@ -15,10 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "core/framework/sampling/json_object_grammar.h"
@@ -34,6 +37,43 @@ namespace detail {
 
 constexpr int32_t kNoPriorJsonObjectOutputRow = -1;
 constexpr int32_t kInvalidJsonObjectOutputRow = -2;
+
+inline bool has_request_id_overlap(
+    const std::vector<std::string>& current_request_ids,
+    const std::vector<std::string>& last_request_ids) {
+  if (current_request_ids.empty() || last_request_ids.empty()) {
+    return true;
+  }
+
+  const auto first_current = std::find_if(
+      current_request_ids.begin(),
+      current_request_ids.end(),
+      [](const std::string& request_id) { return !request_id.empty(); });
+  if (first_current == current_request_ids.end()) {
+    return false;
+  }
+  // Stable decode batches usually match near the front. Allocate a hash set
+  // only after that common path misses and the batch may have churned.
+  if (std::find(last_request_ids.begin(),
+                last_request_ids.end(),
+                *first_current) != last_request_ids.end()) {
+    return true;
+  }
+
+  std::unordered_set<std::string> last_request_id_set;
+  last_request_id_set.reserve(last_request_ids.size());
+  for (const std::string& request_id : last_request_ids) {
+    if (!request_id.empty()) {
+      last_request_id_set.emplace(request_id);
+    }
+  }
+  return std::any_of(std::next(first_current),
+                     current_request_ids.end(),
+                     [&last_request_id_set](const std::string& request_id) {
+                       return !request_id.empty() &&
+                              last_request_id_set.contains(request_id);
+                     });
+}
 
 inline bool resolve_json_object_output_rows(
     const std::vector<JsonObjectGrammarState>& states,

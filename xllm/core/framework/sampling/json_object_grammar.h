@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -209,9 +210,15 @@ class JsonObjectGrammar final {
     torch::Tensor float_mask_cpu;
   };
 
+  struct FilterMaskCacheEntry final {
+    std::shared_ptr<const CachedMask> mask;
+    std::list<std::string>::iterator recency_iterator;
+  };
+
   struct FilterMaskCache final {
     std::mutex mutex;
-    std::unordered_map<std::string, std::shared_ptr<const CachedMask>> entries;
+    std::list<std::string> recency;
+    std::unordered_map<std::string, FilterMaskCacheEntry> entries;
   };
 
   torch::Tensor get_cpu_filter_mask(const JsonObjectGrammarState& state) const;

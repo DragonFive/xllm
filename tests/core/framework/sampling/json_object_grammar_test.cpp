@@ -461,20 +461,44 @@ TEST(JsonObjectGrammarTest, BuildsCachedMasksConcurrently) {
 
 TEST(JsonObjectGrammarTest, RemainsCorrectAfterMaskCacheEviction) {
   JsonObjectGrammar grammar({"{", "\"a\"", ":", "[", "]", "}", "0"});
-  JsonObjectGrammarState nested = grammar.initial_state();
-  ASSERT_TRUE(nested.accept_token(/*open_object=*/0));
-  ASSERT_TRUE(nested.accept_token(/*key=*/1));
-  ASSERT_TRUE(nested.accept_token(/*colon=*/2));
-  for (size_t depth = 0; depth < 80; ++depth) {
-    ASSERT_TRUE(nested.accept_token(/*open_array=*/3));
-    const torch::Tensor mask = grammar.build_filter_mask(nested);
-    EXPECT_EQ(mask.size(0), static_cast<int64_t>(grammar.vocab_size()));
-  }
-
   JsonObjectGrammarState initial = grammar.initial_state();
   const torch::Tensor initial_mask = grammar.build_filter_mask(initial);
   EXPECT_EQ(initial_mask.index({0}).item<float>(), 0.0F);
   EXPECT_LT(initial_mask.index({3}).item<float>(), -1.0F);
+
+  JsonObjectGrammarState nested = grammar.initial_state();
+  ASSERT_TRUE(nested.accept_token(/*open_object=*/0));
+  ASSERT_TRUE(nested.accept_token(/*key=*/1));
+  ASSERT_TRUE(nested.accept_token(/*colon=*/2));
+  JsonObjectGrammarState oldest_nested;
+  for (size_t depth = 0; depth < 63; ++depth) {
+    ASSERT_TRUE(nested.accept_token(/*open_array=*/3));
+    if (depth == 0) {
+      oldest_nested = nested;
+    }
+    const torch::Tensor mask = grammar.build_filter_mask(nested);
+    EXPECT_EQ(mask.size(0), static_cast<int64_t>(grammar.vocab_size()));
+  }
+
+  // Promote the initial state before inserting the 65th distinct state.
+  const double hits_before_touch =
+      COUNTER_json_object_mask_cache_hits_total.get_value();
+  grammar.build_filter_mask(initial);
+  EXPECT_GT(COUNTER_json_object_mask_cache_hits_total.get_value(),
+            hits_before_touch);
+
+  ASSERT_TRUE(nested.accept_token(/*open_array=*/3));
+  grammar.build_filter_mask(nested);
+
+  const double misses_before_hot_lookup =
+      COUNTER_json_object_mask_cache_misses_total.get_value();
+  grammar.build_filter_mask(initial);
+  EXPECT_EQ(COUNTER_json_object_mask_cache_misses_total.get_value(),
+            misses_before_hot_lookup);
+
+  grammar.build_filter_mask(oldest_nested);
+  EXPECT_GT(COUNTER_json_object_mask_cache_misses_total.get_value(),
+            misses_before_hot_lookup);
 }
 
 TEST(JsonObjectGrammarTest, StopsAtObjectCompletionWithMultipleStopTokens) {

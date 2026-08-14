@@ -29,6 +29,30 @@ JsonObjectGrammar make_grammar() {
                            /*stop_token_ids=*/{2});
 }
 
+TEST(WorkerJsonObjectOverlapTest, FindsStableRequestIdOverlap) {
+  EXPECT_TRUE(
+      detail::has_request_id_overlap({"req-a", "req-b"}, {"req-a", "req-b"}));
+  EXPECT_TRUE(
+      detail::has_request_id_overlap({"req-b", "req-a"}, {"req-a", "req-b"}));
+}
+
+TEST(WorkerJsonObjectOverlapTest, FindsOverlapAfterInsertedFirstRequest) {
+  EXPECT_TRUE(
+      detail::has_request_id_overlap({"req-new", "req-b"}, {"req-a", "req-b"}));
+}
+
+TEST(WorkerJsonObjectOverlapTest, HandlesMissingDuplicateAndEmptyRequestIds) {
+  EXPECT_FALSE(
+      detail::has_request_id_overlap({"req-c", "req-d"}, {"req-a", "req-b"}));
+  EXPECT_TRUE(
+      detail::has_request_id_overlap({"req-b", "req-b"}, {"req-a", "req-b"}));
+  EXPECT_TRUE(detail::has_request_id_overlap({}, {"req-a"}));
+  EXPECT_TRUE(detail::has_request_id_overlap({"req-a"}, {}));
+  EXPECT_TRUE(
+      detail::has_request_id_overlap({"", "req-b"}, {"req-a", "req-b"}));
+  EXPECT_FALSE(detail::has_request_id_overlap({"", ""}, {"req-a"}));
+}
+
 TEST(WorkerJsonObjectOverlapTest, ResolvesReorderedAndInsertedRows) {
   JsonObjectGrammar grammar = make_grammar();
   std::vector<JsonObjectGrammarState> states = {grammar.initial_state(),

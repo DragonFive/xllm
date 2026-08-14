@@ -524,6 +524,7 @@ class Sequence final {
 
  private:
   void record_first_token(const Token& token);
+  bool try_commit_json_object_token(int32_t token_id, int64_t token_offset);
 
   // Drop cached block hashes that may be stale after the token at
   // `token_index` was rewritten (beam search / speculative / disagg PD).

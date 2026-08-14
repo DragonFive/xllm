@@ -607,6 +607,89 @@ TEST(BatchTest, ProcessRawOutputStoresMtpBootstrapEmbedding) {
   EXPECT_TRUE(torch::equal(stored, torch::tensor({3.0f, 4.0f})));
 }
 
+TEST(SequenceTest, JsonObjectCommitAdvancesGrammarOnce) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4);
+  BlockManagerImpl manager(options);
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(4);
+  std::shared_ptr<const JsonObjectGrammar> grammar =
+      std::make_shared<const JsonObjectGrammar>(
+          std::vector<std::string>{"{", "}", ""},
+          std::unordered_set<int32_t>{2});
+
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 16;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.request_id = "req-valid-commit";
+  seq_params.json_object_grammar = grammar;
+  IncrementalDecoder decoder("", 2, false, false);
+  Sequence sequence(/*index=*/0,
+                    /*prompt_token_ids=*/{10, 11},
+                    torch::Tensor(),
+                    MMData(),
+                    std::move(decoder),
+                    seq_params);
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  const size_t original_num_tokens = sequence.num_tokens();
+
+  sequence.append_token(Token(/*id=*/0));
+
+  EXPECT_EQ(sequence.num_tokens(), original_num_tokens + 1);
+  EXPECT_EQ(sequence.tokens()[sequence.num_prompt_tokens()], 0);
+  const JsonObjectGrammarState* state = sequence.json_object_state();
+  ASSERT_NE(state, nullptr);
+  EXPECT_EQ(state->snapshot().token_ids, std::vector<int32_t>({0}));
+}
+
+TEST(SequenceTest, JsonObjectOverlapCommitAdvancesGrammarOnce) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4);
+  BlockManagerImpl manager(options);
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(4);
+  std::shared_ptr<const JsonObjectGrammar> grammar =
+      std::make_shared<const JsonObjectGrammar>(
+          std::vector<std::string>{"{", "}", ""},
+          std::unordered_set<int32_t>{2});
+
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 16;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.enable_schedule_overlap = true;
+  seq_params.request_id = "req-valid-overlap-commit";
+  seq_params.json_object_grammar = grammar;
+  IncrementalDecoder decoder("", 2, false, false);
+  Sequence sequence(/*index=*/0,
+                    /*prompt_token_ids=*/{10, 11},
+                    torch::Tensor(),
+                    MMData(),
+                    std::move(decoder),
+                    seq_params);
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+
+  sequence.append_token(Token(/*id=*/-1));
+  const size_t placeholder_num_tokens = sequence.num_tokens();
+  const JsonObjectGrammarState* placeholder_state =
+      sequence.json_object_state();
+  ASSERT_NE(placeholder_state, nullptr);
+  EXPECT_TRUE(placeholder_state->snapshot().token_ids.empty());
+
+  sequence.update_last_step_token(Token(/*id=*/0), /*token_offset=*/0);
+
+  EXPECT_EQ(sequence.num_tokens(), placeholder_num_tokens);
+  EXPECT_EQ(sequence.tokens()[sequence.num_prompt_tokens()], 0);
+  const JsonObjectGrammarState* committed_state = sequence.json_object_state();
+  ASSERT_NE(committed_state, nullptr);
+  EXPECT_EQ(committed_state->snapshot().token_ids, std::vector<int32_t>({0}));
+}
+
 TEST(SequenceTest, JsonObjectCommitMismatchFailsBeforeTokenMutation) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4);
@@ -641,6 +724,9 @@ TEST(SequenceTest, JsonObjectCommitMismatchFailsBeforeTokenMutation) {
   EXPECT_EQ(sequence.num_tokens(), original_num_tokens);
   ASSERT_TRUE(sequence.error_status().has_value());
   EXPECT_TRUE(sequence.finished());
+  const JsonObjectGrammarState* state = sequence.json_object_state();
+  ASSERT_NE(state, nullptr);
+  EXPECT_TRUE(state->snapshot().token_ids.empty());
 }
 
 TEST(SequenceTest, JsonObjectOverlapMismatchKeepsPlaceholderToken) {
@@ -681,6 +767,9 @@ TEST(SequenceTest, JsonObjectOverlapMismatchKeepsPlaceholderToken) {
   EXPECT_EQ(sequence.tokens()[sequence.num_prompt_tokens()], -1);
   ASSERT_TRUE(sequence.error_status().has_value());
   EXPECT_TRUE(sequence.finished());
+  const JsonObjectGrammarState* state = sequence.json_object_state();
+  ASSERT_NE(state, nullptr);
+  EXPECT_TRUE(state->snapshot().token_ids.empty());
 }
 
 TEST(BatchTest, JsonObjectCommitMismatchSkipsRemainingSampleSlotsAndEmbedding) {
