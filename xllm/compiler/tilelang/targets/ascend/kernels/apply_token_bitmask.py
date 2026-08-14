@@ -17,8 +17,8 @@
 import tilelang
 import tilelang.language as T
 
-from .utils import DEFAULT_ASCEND_PASS_CONFIGS, detect_vec_core_num
 from ....common.spec import DispatchField, TilelangKernel, register_kernel
+from .utils import DEFAULT_ASCEND_PASS_CONFIGS, detect_vec_core_num
 
 MAX_NUM_ROWS = 4096
 MAX_VOCAB_SIZE = 262144
@@ -37,13 +37,9 @@ DISALLOWED_TOKEN_MASK = -1.0e9
 
 def build_apply_token_bitmask_kernel(*, dtype: str, vec_core_num: int):
     if dtype not in SUPPORTED_DTYPES:
-        raise ValueError(
-            f"apply_token_bitmask only supports {SUPPORTED_DTYPES}, got {dtype}"
-        )
+        raise ValueError(f"apply_token_bitmask only supports {SUPPORTED_DTYPES}, got {dtype}")
     if vec_core_num <= 0 or vec_core_num % VEC_NUM != 0:
-        raise ValueError(
-            f"vec_core_num({vec_core_num}) must be positive and divisible by {VEC_NUM}"
-        )
+        raise ValueError(f"vec_core_num({vec_core_num}) must be positive and divisible by {VEC_NUM}")
 
     tensor_dtype = TENSOR_DTYPES[dtype]
     block_num = vec_core_num // VEC_NUM
@@ -62,12 +58,8 @@ def build_apply_token_bitmask_kernel(*, dtype: str, vec_core_num: int):
             total_words = num_rows * num_words
             words_per_task = (total_words + task_num - 1) // task_num
             word_start = task_id * words_per_task
-            words_left = T.if_then_else(
-                total_words > word_start, total_words - word_start, 0
-            )
-            word_count = T.if_then_else(
-                words_left < words_per_task, words_left, words_per_task
-            )
+            words_left = T.if_then_else(total_words > word_start, total_words - word_start, 0)
+            word_count = T.if_then_else(words_left < words_per_task, words_left, words_per_task)
 
             with T.Scope("V"):
                 logits_input_ub = T.alloc_ub((128,), tensor_dtype)
@@ -82,9 +74,7 @@ def build_apply_token_bitmask_kernel(*, dtype: str, vec_core_num: int):
                 allowed_mask_ub = T.alloc_ub((8,), "uint8")
 
                 T.tile.fill(zero_fp32_ub, 0.0)
-                T.tile.fill(
-                    disallowed_fp32_ub, DISALLOWED_TOKEN_MASK
-                )
+                T.tile.fill(disallowed_fp32_ub, DISALLOWED_TOKEN_MASK)
                 T.tile.fill(bit_values_ub, 0)
                 T.tile.fill(zero_int32_ub, 0)
                 for bit_index in T.serial(32):
@@ -103,62 +93,57 @@ def build_apply_token_bitmask_kernel(*, dtype: str, vec_core_num: int):
 
                     # All-one words are common for unconstrained rows and do
                     # not need to touch logits.
-                    with T.If(packed_word != -1):
-                        with T.Then():
+                    with T.If(packed_word != -1), T.Then():
+                        T.copy(logits[logit_base], logits_input_ub[0:32])
+                        if dtype == "float32":
                             T.copy(
-                                logits[logit_base], logits_input_ub[0:32]
+                                logits_input_ub[0:32],
+                                logits_fp32_ub[0:32],
                             )
-                            if dtype == "float32":
-                                T.copy(
-                                    logits_input_ub[0:32],
-                                    logits_fp32_ub[0:32],
-                                )
-                            else:
-                                T.tile.cast(
-                                    logits_fp32_ub,
-                                    logits_input_ub,
-                                    "CAST_NONE",
-                                    32,
-                                )
-                            T.tile.fill(packed_word_ub, packed_word)
-                            T.tile.bitwise_and(
-                                allowed_bits_ub,
-                                packed_word_ub,
-                                bit_values_ub,
-                            )
-                            T.tile.compare(
-                                allowed_mask_ub,
-                                allowed_bits_ub,
-                                zero_int32_ub,
-                                "NE",
-                            )
-                            T.tile.select(
-                                additive_fp32_ub,
-                                allowed_mask_ub,
-                                disallowed_fp32_ub,
-                                zero_fp32_ub,
-                                "VSEL_TENSOR_TENSOR_MODE",
-                            )
-                            T.tile.add(
+                        else:
+                            T.tile.cast(
                                 logits_fp32_ub,
-                                logits_fp32_ub,
-                                additive_fp32_ub,
+                                logits_input_ub,
+                                "CAST_NONE",
+                                32,
                             )
-                            if dtype == "float32":
-                                T.copy(
-                                    logits_fp32_ub[0:32],
-                                    logits_input_ub[0:32],
-                                )
-                            else:
-                                T.tile.cast(
-                                    logits_input_ub,
-                                    logits_fp32_ub,
-                                    "CAST_RINT",
-                                    32,
-                                )
+                        T.tile.fill(packed_word_ub, packed_word)
+                        T.tile.bitwise_and(
+                            allowed_bits_ub,
+                            packed_word_ub,
+                            bit_values_ub,
+                        )
+                        T.tile.compare(
+                            allowed_mask_ub,
+                            allowed_bits_ub,
+                            zero_int32_ub,
+                            "NE",
+                        )
+                        T.tile.select(
+                            additive_fp32_ub,
+                            allowed_mask_ub,
+                            disallowed_fp32_ub,
+                            zero_fp32_ub,
+                            "VSEL_TENSOR_TENSOR_MODE",
+                        )
+                        T.tile.add(
+                            logits_fp32_ub,
+                            logits_fp32_ub,
+                            additive_fp32_ub,
+                        )
+                        if dtype == "float32":
                             T.copy(
-                                logits_input_ub[0:32], logits[logit_base]
+                                logits_fp32_ub[0:32],
+                                logits_input_ub[0:32],
                             )
+                        else:
+                            T.tile.cast(
+                                logits_input_ub,
+                                logits_fp32_ub,
+                                "CAST_RINT",
+                                32,
+                            )
+                        T.copy(logits_input_ub[0:32], logits[logit_base])
 
     return apply_token_bitmask_kernel
 
@@ -181,8 +166,6 @@ class ApplyTokenBitmaskKernel(TilelangKernel):
             dtype=dtype,
             vec_core_num=detect_vec_core_num(),
         )
-        with tilelang.tvm.transform.PassContext(
-            opt_level=3, config=DEFAULT_ASCEND_PASS_CONFIGS
-        ):
+        with tilelang.tvm.transform.PassContext(opt_level=3, config=DEFAULT_ASCEND_PASS_CONFIGS):
             kernel = tilelang.engine.lower(tilelang_kernel)
         return kernel.kernel_source
