@@ -1471,7 +1471,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   // ensuring profiling warmup never triggers the adaptive HCCL broadcast.
   const bool use_adaptive_speculative_decode =
       adaptive_enabled() &&
-      SpeculativeProfileRegistry::get_instance().has_validate_time_predictor() &&
+      SpeculativeProfileRegistry::get_instance()
+          .has_validate_time_predictor() &&
       input.json_object_states.empty();
 
   std::vector<ForwardOutput> draft_outputs;
@@ -2177,13 +2178,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
     const detail::JsonDraftValidationScratch* json_scratch) {
   Timer timer;
   ForwardInput target_prepared;
-  fill_validate_input_from_draft_outputs(
-      input,
-      draft_outputs,
-      validate_input,
-      per_seq_val_tokens,
-      json_scratch,
-      *compute_stream_);
+  fill_validate_input_from_draft_outputs(input,
+                                         draft_outputs,
+                                         validate_input,
+                                         per_seq_val_tokens,
+                                         json_scratch,
+                                         *compute_stream_);
   ForwardOutput target_output = run_llm_no_sync_impl(*impl_,
                                                      validate_input,
                                                      *compute_stream_,
@@ -4054,8 +4054,8 @@ SampleOutput MTPWorkerImpl::validate(
         int32_t first_invalid = -1;
         for (int32_t draft_idx = 0; draft_idx < num_val_tokens - 1;
              ++draft_idx) {
-          if (invalid_draft[static_cast<size_t>(
-                  seq_id * (num_val_tokens - 1) + draft_idx)] != 0) {
+          if (invalid_draft[static_cast<size_t>(seq_id * (num_val_tokens - 1) +
+                                                draft_idx)] != 0) {
             first_invalid = draft_idx;
             break;
           }
