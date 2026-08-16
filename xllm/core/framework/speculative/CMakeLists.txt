@@ -10,6 +10,7 @@ cc_library(
     spec_input_builder.h
     mtp_async_input_builder.h
     mtp_async_state.h
+    mtp_json_object_state.h
     embedding_cache.h
   SRCS
     adaptive_speculative_controller.cpp
@@ -25,6 +26,7 @@ cc_library(
     :common
     :util
     :sampler
+    :json_object_grammar
     :common_layers
     $<$<BOOL:${USE_NPU}>:xllm_ops>
     glog::glog

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/runtime/mtp_json_object_state.h"
+#include "core/framework/speculative/mtp_json_object_state.h"
 
 #include <gtest/gtest.h>
 

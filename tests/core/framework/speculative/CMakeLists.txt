@@ -57,6 +57,17 @@ endif()
 
 cc_test(
   NAME
+    mtp_json_object_state_test
+  SRCS
+    mtp_json_object_state_test.cpp
+  DEPS
+    :speculative
+    :json_object_grammar
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     adaptive_speculative_controller_test
   SRCS
     adaptive_speculative_controller_test.cpp
