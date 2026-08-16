@@ -338,7 +338,8 @@ std::shared_ptr<Request> LLMMaster::generate_request(
     std::optional<std::vector<int>> prompt_tokens,
     const RequestParams& sp,
     std::optional<Call*> call,
-    OutputCallback callback) {
+    OutputCallback callback,
+    std::optional<ChatTemplateGenerationMode> generation_mode) {
   // The caller (service_impl) has already incremented the rate limiter's
   // slot via is_limited() returning false. This guard releases it on any
   // early return below; we dismiss it right before Request takes ownership.
@@ -556,7 +557,22 @@ std::shared_ptr<Request> LLMMaster::generate_request(
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
   if (json_object) {
     std::string grammar_error;
-    const bool reasoning_enabled = get_enable_thinking(sp.chat_template_kwargs);
+    bool reasoning_enabled = false;
+    if (generation_mode.has_value()) {
+      if (generation_mode == ChatTemplateGenerationMode::UNKNOWN) {
+        CALLBACK_WITH_ERROR(
+            StatusCode::INVALID_ARGUMENT,
+            "JSON object constraint requires a recognizable chat generation "
+            "mode",
+            sp.service_request_id,
+            sp.source_xservice_addr);
+        return nullptr;
+      }
+      reasoning_enabled =
+          generation_mode == ChatTemplateGenerationMode::REASONING;
+    } else {
+      reasoning_enabled = get_enable_thinking(sp.chat_template_kwargs);
+    }
     req_state.json_object_grammar =
         get_json_object_grammar(reasoning_enabled, &grammar_error);
     if (req_state.json_object_grammar == nullptr) {
@@ -599,9 +615,10 @@ std::shared_ptr<Request> LLMMaster::generate_request(
 
   Timer timer;
 
-  std::optional<std::string> prompt;
-  prompt = chat_template_->apply(messages, sp.tools, sp.chat_template_kwargs);
-  if (!prompt.has_value()) {
+  const std::optional<ChatTemplateRenderResult> render_result =
+      chat_template_->apply_with_generation_mode(
+          messages, sp.tools, sp.chat_template_kwargs);
+  if (!render_result.has_value()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "Failed to construct prompt from messages",
                         sp.service_request_id,
@@ -613,8 +630,12 @@ std::shared_ptr<Request> LLMMaster::generate_request(
   COUNTER_ADD(chat_template_latency_seconds, timer.elapsed_seconds());
 
   rate_limit_guard.dismiss();
-  return generate_request(
-      std::move(prompt.value()), std::move(prompt_tokens), sp, call, callback);
+  return generate_request(std::move(render_result->prompt),
+                          std::move(prompt_tokens),
+                          sp,
+                          call,
+                          callback,
+                          render_result->generation_mode);
 }
 
 bool LLMMaster::handle_rpc_response(const RequestOutput& output) {

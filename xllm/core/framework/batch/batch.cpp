@@ -822,9 +822,15 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
     std::vector<float> src_acc_logprob_vec;
     std::vector<std::vector<int32_t>> src_token_ids;
     std::vector<std::vector<std::optional<float>>> src_logprobs;
+    const bool restore_json_states =
+        group_sequences[0]->json_object_state() != nullptr;
+    std::vector<JsonObjectGrammarSnapshot> src_json_states;
     src_acc_logprob_vec.resize(beam_width);
     src_token_ids.resize(beam_width);
     src_logprobs.resize(beam_width);
+    if (restore_json_states) {
+      src_json_states.resize(beam_width);
+    }
 
     for (size_t i = 0; i < beam_width; i++) {
       size_t task_id = sequence_group_id * beam_width + i;
@@ -834,6 +840,12 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
       src_acc_logprob_vec[i] = src_seq->get_acc_logprob();
       src_token_ids[i] = std::vector<int32_t>(src_seq->tokens());
       src_logprobs[i] = src_seq->logprob_state()->get_logprobs();
+      if (restore_json_states) {
+        const JsonObjectGrammarState* json_state = src_seq->json_object_state();
+        CHECK(json_state != nullptr)
+            << "beam sequences in one request must share JSON grammar state";
+        src_json_states[i] = json_state->snapshot();
+      }
     }
 
     for (size_t i = 0; i < beam_width; i++) {
@@ -842,6 +854,11 @@ void Batch::process_beam_search_output(const RawForwardOutput& raw_output,
       CHECK_LE(src_seq_idx, sequences_.size());
       auto& base_seq = sequences_[task_id];
       auto& src_seq = sequences_[src_seq_idx];
+
+      if (restore_json_states &&
+          !base_seq->restore_json_object_state(src_json_states[i])) {
+        return;
+      }
 
       for (size_t token_idx = base_seq->num_prompt_tokens();
            token_idx < base_seq->num_tokens();

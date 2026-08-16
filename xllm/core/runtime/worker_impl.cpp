@@ -809,6 +809,7 @@ std::optional<ForwardOutput> WorkerImpl::step_for_schedule_overlap(
 ForwardInput WorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
     ForwardInput& input) {
   update_json_object_states_by_last_step_output(input);
+  sanitize_json_object_error_inputs(input);
   return update_input_by_last_step_output(input);
 }
 
@@ -954,31 +955,14 @@ void WorkerImpl::update_json_object_states_by_last_step_output(
 }
 
 void WorkerImpl::sanitize_json_object_error_inputs(ForwardInput& input) {
-  if (input.json_object_errors.empty() || !input.token_ids.defined()) {
-    return;
-  }
-
-  std::unordered_set<std::string> failed_sample_sequence_ids;
-  failed_sample_sequence_ids.reserve(input.json_object_errors.size());
-  for (const JsonObjectOutputError& error : input.json_object_errors) {
-    failed_sample_sequence_ids.emplace(error.sample_sequence_id);
-  }
-
-  for (size_t state_idx = 0; state_idx < input.sample_sequence_ids.size();
-       ++state_idx) {
-    if (!failed_sample_sequence_ids.contains(
-            input.sample_sequence_ids[state_idx])) {
-      continue;
-    }
-    const int32_t prior_output_row = input.sample_prior_output_rows[state_idx];
-    if (prior_output_row < 0) {
-      continue;
-    }
-    const int32_t placeholder_token = -prior_output_row - 1;
-    input.token_ids = torch::where(input.token_ids == placeholder_token,
-                                   torch::zeros_like(input.token_ids),
-                                   input.token_ids);
-  }
+  std::string error;
+  CHECK(detail::sanitize_json_object_error_token_ids(
+      &input.token_ids,
+      input.sample_sequence_ids,
+      input.sample_prior_output_rows,
+      input.json_object_errors,
+      &error))
+      << error;
 }
 
 #if defined(USE_NPU)

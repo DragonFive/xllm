@@ -176,5 +176,33 @@ TEST(WorkerJsonObjectOverlapTest, RejectsInvalidNegativePriorOutputRow) {
   EXPECT_NE(error.find("-1 or non-negative"), std::string::npos);
 }
 
+TEST(WorkerJsonObjectOverlapTest, SanitizesOnlyFailedRowPlaceholder) {
+  torch::Tensor token_ids = torch::tensor({-1, 17, -2}, torch::kInt);
+  std::string error;
+
+  ASSERT_TRUE(detail::sanitize_json_object_error_token_ids(
+      &token_ids,
+      {"req-failed#0", "req-healthy#0"},
+      {0, 1},
+      {{"req-failed#0", "row mismatch"}},
+      &error))
+      << error;
+  EXPECT_TRUE(torch::equal(token_ids, torch::tensor({0, 17, -2})));
+}
+
+TEST(WorkerJsonObjectOverlapTest, RejectsAmbiguousFailedRowPlaceholder) {
+  torch::Tensor token_ids = torch::tensor({-1, 17, -1}, torch::kInt);
+  std::string error;
+
+  EXPECT_FALSE(detail::sanitize_json_object_error_token_ids(
+      &token_ids,
+      {"req-failed#0"},
+      {0},
+      {{"req-failed#0", "row mismatch"}},
+      &error));
+  EXPECT_NE(error.find("exactly one"), std::string::npos);
+  EXPECT_TRUE(torch::equal(token_ids, torch::tensor({-1, 17, -1})));
+}
+
 }  // namespace
 }  // namespace xllm

@@ -108,7 +108,8 @@ class LLMMaster : public Master {
       std::optional<std::vector<int>> prompt_tokens,
       const RequestParams& sp,
       std::optional<Call*> call,
-      OutputCallback callback);
+      OutputCallback callback,
+      std::optional<ChatTemplateGenerationMode> generation_mode = std::nullopt);
 
   std::shared_ptr<Request> generate_request(
       const std::vector<Message>& messages,

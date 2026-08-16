@@ -1148,6 +1148,7 @@ ForwardInput
 MTPWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
     ForwardInput& inputs) {
   update_json_object_states_by_last_step_output(inputs);
+  sanitize_json_object_error_inputs(inputs);
   return update_input_by_last_step_output(inputs);
 }
 

@@ -164,5 +164,54 @@ inline bool resolve_json_object_output_rows(
   return true;
 }
 
+inline bool sanitize_json_object_error_token_ids(
+    torch::Tensor* token_ids,
+    const std::vector<std::string>& sample_sequence_ids,
+    const std::vector<int32_t>& prior_output_rows,
+    const std::vector<JsonObjectOutputError>& errors,
+    std::string* error) {
+  if (token_ids == nullptr || error == nullptr) {
+    return false;
+  }
+  error->clear();
+  if (errors.empty() || !token_ids->defined()) {
+    return true;
+  }
+  if (sample_sequence_ids.size() != prior_output_rows.size()) {
+    *error = "JSON error sanitization metadata must align";
+    return false;
+  }
+
+  std::unordered_set<std::string> failed_sequence_ids;
+  failed_sequence_ids.reserve(errors.size());
+  for (const JsonObjectOutputError& output_error : errors) {
+    failed_sequence_ids.emplace(output_error.sample_sequence_id);
+  }
+
+  for (size_t state_idx = 0; state_idx < sample_sequence_ids.size();
+       ++state_idx) {
+    if (!failed_sequence_ids.contains(sample_sequence_ids[state_idx])) {
+      continue;
+    }
+    const int32_t prior_output_row = prior_output_rows[state_idx];
+    if (prior_output_row < 0) {
+      continue;
+    }
+    const int32_t placeholder_token = -prior_output_row - 1;
+    const torch::Tensor& input_token_ids = *token_ids;
+    const torch::Tensor placeholder_mask = input_token_ids == placeholder_token;
+    const int64_t match_count = placeholder_mask.sum().item<int64_t>();
+    if (match_count != 1) {
+      *error =
+          "failed JSON row placeholder must identify exactly one input "
+          "token";
+      return false;
+    }
+    *token_ids = torch::where(
+        placeholder_mask, torch::zeros_like(input_token_ids), input_token_ids);
+  }
+  return true;
+}
+
 }  // namespace detail
 }  // namespace xllm

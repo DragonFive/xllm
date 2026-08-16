@@ -302,6 +302,33 @@ TEST_F(FastTokenizerTest, NoSpecialTokens) {
   EXPECT_NE(ids.back(), 1) << "EOS token should not be present";
 }
 
+TEST_F(FastTokenizerTest, CallLevelFalseSuppressesConfiguredSpecialTokens) {
+  TokenizerArgs args;
+  args.tokenizer_type() = "fast";
+  args.vocab_file() = tokenizer_json_path_.string();
+  args.add_bos_token() = true;
+  args.bos_token() = "<|bos|>";
+  args.add_eos_token() = true;
+  args.eos_token() = "<|eos|>";
+
+  FastTokenizer tokenizer(args);
+  std::vector<int32_t> ids_without_special_tokens;
+  std::vector<int32_t> ids_with_special_tokens;
+  ASSERT_TRUE(tokenizer.encode("hello",
+                               &ids_without_special_tokens,
+                               /*add_special_tokens=*/false));
+  ASSERT_TRUE(tokenizer.encode("hello",
+                               &ids_with_special_tokens,
+                               /*add_special_tokens=*/true));
+
+  ASSERT_FALSE(ids_without_special_tokens.empty());
+  ASSERT_FALSE(ids_with_special_tokens.empty());
+  EXPECT_NE(ids_without_special_tokens.front(), 0);
+  EXPECT_NE(ids_without_special_tokens.back(), 1);
+  EXPECT_EQ(ids_with_special_tokens.front(), 0);
+  EXPECT_EQ(ids_with_special_tokens.back(), 1);
+}
+
 TEST_F(FastTokenizerTest, DecodeTokenPreservesByteLevelPieces) {
   const std::filesystem::path byte_level_path =
       test_dir_ / "byte_level_tokenizer.json";

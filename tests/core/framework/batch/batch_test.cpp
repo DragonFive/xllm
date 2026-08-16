@@ -690,6 +690,43 @@ TEST(SequenceTest, JsonObjectOverlapCommitAdvancesGrammarOnce) {
   EXPECT_EQ(committed_state->snapshot().token_ids, std::vector<int32_t>({0}));
 }
 
+TEST(SequenceTest, RestoresJsonObjectStateForBeamCandidate) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4);
+  BlockManagerImpl manager(options);
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(4);
+  std::shared_ptr<const JsonObjectGrammar> grammar =
+      std::make_shared<const JsonObjectGrammar>(
+          std::vector<std::string>{"{", " {", "\"a\"", ":", "1"},
+          std::unordered_set<int32_t>{});
+
+  SequenceParams seq_params;
+  seq_params.seq_capacity = 16;
+  seq_params.stopping_checker = &stopping_checker;
+  seq_params.sampling_param = &sampling_param;
+  seq_params.request_id = "req-beam-restore";
+  seq_params.json_object_grammar = grammar;
+  IncrementalDecoder decoder("", 2, false, false);
+  Sequence sequence(/*index=*/0,
+                    /*prompt_token_ids=*/{10, 11},
+                    torch::Tensor(),
+                    MMData(),
+                    std::move(decoder),
+                    seq_params);
+  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  sequence.append_token(Token(/*id=*/0));
+
+  JsonObjectGrammarSnapshot candidate_snapshot =
+      sequence.json_object_state()->snapshot();
+  candidate_snapshot.token_ids.back() = 1;
+  ASSERT_TRUE(sequence.restore_json_object_state(candidate_snapshot));
+  EXPECT_EQ(sequence.json_object_state()->snapshot().token_ids,
+            std::vector<int32_t>({1}));
+}
+
 TEST(SequenceTest, JsonObjectCommitMismatchFailsBeforeTokenMutation) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4);

@@ -397,6 +397,30 @@ bool Sequence::try_commit_json_object_token(int32_t token_id,
   return false;
 }
 
+bool Sequence::restore_json_object_state(
+    const JsonObjectGrammarSnapshot& snapshot) {
+  if (!json_object_state_.has_value()) {
+    return true;
+  }
+  const JsonObjectGrammar* grammar = json_object_state_->grammar();
+  if (grammar == nullptr) {
+    fail(Status(StatusCode::UNKNOWN,
+                "cannot restore an uninitialized json_object grammar state"));
+    return false;
+  }
+  JsonObjectGrammarState restored_state = grammar->restore_state(snapshot);
+  if (!restored_state.is_valid()) {
+    LOG(ERROR) << "JSON grammar replay failed during beam state restoration: "
+               << "request_id=" << request_id_ << ", sequence_index=" << index_
+               << ", committed_tokens=" << snapshot.token_ids.size();
+    fail(Status(StatusCode::UNKNOWN,
+                "beam candidate violates json_object grammar"));
+    return false;
+  }
+  json_object_state_ = std::move(restored_state);
+  return true;
+}
+
 void Sequence::append_token(const Token& token) {
   CHECK_LT(num_tokens_, tokens_.size())
       << "exceed the token capacity of the sequence";

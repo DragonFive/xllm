@@ -202,6 +202,7 @@ class Sequence final {
   void append_token(const Token& token);
   void append_token(int64_t token_id) { append_token(Token(token_id)); }
   void update_token(size_t index, const Token& token);
+  bool restore_json_object_state(const JsonObjectGrammarSnapshot& snapshot);
   void update_last_step_token(const Token& token, size_t token_offset = 0);
   bool has_new_tokens_generated() const {
     return num_tokens_ > stream_output_token_offset_;
