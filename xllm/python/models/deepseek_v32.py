@@ -577,7 +577,14 @@ class W8A8WeightLoader:
                 raise ValueError(f"{prefix}{names} must share {suffix} for fused W8A8")
             self.copy_in(prefix + target_proj + "." + suffix, reference)
 
-    def load_w8a8_b(self, mlp_pfx: str) -> None:
+    def load_w8a8_b(
+        self,
+        mlp_pfx: str,
+        shard_world: Optional[int] = None,
+        shard_rank: Optional[int] = None,
+    ) -> None:
+        world = self.tp_size if shard_world is None else shard_world
+        rank = self.tp_rank if shard_rank is None else shard_rank
         gw = self.load_tensor(mlp_pfx + "gate_proj.weight")
         gs = self.load_tensor(mlp_pfx + "gate_proj.weight_scale")
         go = self.load_tensor(mlp_pfx + "gate_proj.weight_offset")
@@ -585,16 +592,21 @@ class W8A8WeightLoader:
         us = self.load_tensor(mlp_pfx + "up_proj.weight_scale")
         uo = self.load_tensor(mlp_pfx + "up_proj.weight_offset")
         self.copy_in(
-            mlp_pfx + "gate_up_proj.weight", torch.cat([self.shard(gw, 0), self.shard(uw, 0)], dim=0).contiguous()
+            mlp_pfx + "gate_up_proj.weight",
+            torch.cat([self.shard(gw, 0, world, rank), self.shard(uw, 0, world, rank)], dim=0).contiguous(),
         )
         self.copy_in(
-            mlp_pfx + "gate_up_proj.weight_scale", torch.cat([self.shard(gs, 0), self.shard(us, 0)], dim=0).contiguous()
+            mlp_pfx + "gate_up_proj.weight_scale",
+            torch.cat([self.shard(gs, 0, world, rank), self.shard(us, 0, world, rank)], dim=0).contiguous(),
         )
         self.copy_in(
             mlp_pfx + "gate_up_proj.weight_offset",
-            torch.cat([self.shard(go, 0), self.shard(uo, 0)], dim=0).contiguous(),
+            torch.cat([self.shard(go, 0, world, rank), self.shard(uo, 0, world, rank)], dim=0).contiguous(),
         )
-        self.copy_in(mlp_pfx + "down_proj.weight", self.shard(self.load_tensor(mlp_pfx + "down_proj.weight"), dim=1))
+        self.copy_in(
+            mlp_pfx + "down_proj.weight",
+            self.shard(self.load_tensor(mlp_pfx + "down_proj.weight"), dim=1, world=world, rank=rank),
+        )
         self.copy_in(mlp_pfx + "down_proj.weight_scale", self.load_tensor(mlp_pfx + "down_proj.weight_scale"))
         self.copy_in(mlp_pfx + "down_proj.weight_offset", self.load_tensor(mlp_pfx + "down_proj.weight_offset"))
 

@@ -26,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "framework/model/model_input_params.h"
+#include "framework/parallel_state/kv_split_topology.h"
 #include "framework/parallel_state/process_group.h"
 
 namespace xllm {
@@ -672,7 +673,11 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
       config.cp_size = test_case.cp_size;
       config.cp_rank = cp_rank;
       config.kv_split_size = test_case.kv_split_size;
-      config.kv_split_rank = cp_rank % test_case.kv_split_size;
+      config.kv_split_rank =
+          parallel_state::compute_kv_split_rank(cp_rank,
+                                                test_case.cp_size,
+                                                test_case.cp_size,
+                                                test_case.kv_split_size);
       config.attention_cp_size = test_case.cp_size;
       config.attention_cp_group_size = test_case.cp_size;
       const NpuCpPlan plan = NpuCpPlan::build(input, config);

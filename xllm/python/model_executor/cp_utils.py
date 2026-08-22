@@ -93,17 +93,25 @@ class CpContext:
     # cumulative. prefix_len == segment_start + query_count, so with
     # sparse_mode=3 query row i attends KV [0, segment_start + i] exactly.
     kv_cu_seqlens: list[int]
+    # Original block-table row for each non-empty (sequence, half) segment.
+    segment_seq_indices: torch.Tensor
+    # Absolute KV prefix length for each non-empty (sequence, half) segment.
+    segment_kv_seq_lens: list[int]
+    # True when this forward extends an existing paged-cache prefix.
+    has_prefix: bool
 
 
 def build_cp_context(
-    seq_lens: Sequence[int],
+    q_seq_lens: Sequence[int],
+    kv_seq_lens: Sequence[int],
     cp_size: int,
     cp_rank: int,
     device: torch.device,
 ) -> CpContext:
     """Build a zigzag CP context from per-sequence lengths.
 
-    ``seq_lens`` are the per-request query lengths in the packed batch order.
+    ``q_seq_lens`` and ``kv_seq_lens`` are per-request lengths in packed batch
+    order. Their difference is the already-cached prefix for chunked prefill.
     The index math runs in the ``xllm_ops::build_cp_context`` C++ op (host
     scalar loops are far cheaper there than in Python on the prefill critical
     path); this wrapper just packs the returned tensors into a ``CpContext``.
@@ -118,8 +126,16 @@ def build_cp_context(
         kv_gather_index,
         q_cu_seqlens,
         kv_cu_seqlens,
+        segment_seq_indices,
+        segment_kv_seq_lens,
         total_local,
-    ) = torch.ops.xllm_ops.build_cp_context([int(length) for length in seq_lens], cp_size, cp_rank, device)
+    ) = torch.ops.xllm_ops.build_cp_context(
+        [int(length) for length in q_seq_lens],
+        [int(length) for length in kv_seq_lens],
+        cp_size,
+        cp_rank,
+        device,
+    )
 
     return CpContext(
         cp_size=cp_size,
@@ -133,6 +149,9 @@ def build_cp_context(
         q_cu_seqlens=q_cu_seqlens,
         kv_gather_index=kv_gather_index,
         kv_cu_seqlens=kv_cu_seqlens,
+        segment_seq_indices=segment_seq_indices,
+        segment_kv_seq_lens=segment_kv_seq_lens,
+        has_prefix=any(kv != q for q, kv in zip(q_seq_lens, kv_seq_lens, strict=True)),
     )
 
 
@@ -170,9 +189,9 @@ def cp_gather_kv(local_kv: torch.Tensor, ctx: CpContext) -> torch.Tensor:
 
     ``local_kv`` is ``[total_local, ...]`` (this rank's padded segments of every
     sequence). Returns ``kv_global`` ``[T_global, ...]``: the complete sequence
-    in original token order, used both to write the full KV into this rank's
-    paged cache (decode stays on the non-CP path and needs every position) and,
-    via ``ctx.kv_gather_index``, to select each owned segment's causal prefix.
+    in original token order. The caller uses this request-local intermediate to
+    write only owner-local persistent cache slots and to construct the current
+    attention view; it does not make the persistent cache replicated.
 
     Identical all-gather + restore as :func:`cp_merge_rows`; kept as a named
     alias to document the KV-gather intent at the attention call site.

@@ -929,6 +929,37 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
+     PushRejectsDuplicateKvSplitDestinationBeforeFilter) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  std::vector<KVCache> caches;
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+
+  TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                  /*dst_tp_size=*/1,
+                                  /*dst_dp_rank=*/0);
+  info.mappings[0].remote_ids = {21, 21, 23};
+  ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                         /*world_size=*/2,
+                                         /*dp_size=*/1);
+  parallel_args.kv_split_size(2);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
+
+  folly::SemiFuture<bool> future = transfer.push_kv_blocks_async(
+      {info}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_FALSE(std::move(future).get());
+  EXPECT_TRUE(engine_observer->move_calls.empty());
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
      PushRejectsExcessKvSplitCoverageBeforeFilter) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
       /*listen_port=*/0, torch::Device(torch::kCPU));

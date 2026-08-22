@@ -39,6 +39,46 @@ TEST(PushRouteTest, InvalidTpSizeNotUseOwnerAndReturnEmpty) {
   EXPECT_TRUE(dst_ranks.empty());
 }
 
+TEST(PushRouteTest, KvPushRepresentativeHandlesReplicatedOwners) {
+  EXPECT_TRUE(is_kv_push_representative(/*cp_rank=*/0,
+                                        /*cp_size=*/4,
+                                        /*kv_split_size=*/2));
+  EXPECT_FALSE(is_kv_push_representative(/*cp_rank=*/1,
+                                         /*cp_size=*/4,
+                                         /*kv_split_size=*/2));
+  EXPECT_TRUE(is_kv_push_representative(/*cp_rank=*/2,
+                                        /*cp_size=*/4,
+                                        /*kv_split_size=*/2));
+  EXPECT_FALSE(is_kv_push_representative(/*cp_rank=*/3,
+                                         /*cp_size=*/4,
+                                         /*kv_split_size=*/2));
+
+  EXPECT_TRUE(is_kv_push_representative(/*cp_rank=*/0,
+                                        /*cp_size=*/4,
+                                        /*kv_split_size=*/1));
+  EXPECT_FALSE(is_kv_push_representative(/*cp_rank=*/1,
+                                         /*cp_size=*/4,
+                                         /*kv_split_size=*/1));
+
+  for (int32_t cp_rank = 0; cp_rank < 4; ++cp_rank) {
+    EXPECT_TRUE(is_kv_push_representative(cp_rank,
+                                          /*cp_size=*/4,
+                                          /*kv_split_size=*/4));
+  }
+}
+
+TEST(PushRouteTest, KvPushRepresentativeRejectsInvalidTopology) {
+  EXPECT_FALSE(is_kv_push_representative(/*cp_rank=*/0,
+                                         /*cp_size=*/0,
+                                         /*kv_split_size=*/1));
+  EXPECT_FALSE(is_kv_push_representative(/*cp_rank=*/0,
+                                         /*cp_size=*/4,
+                                         /*kv_split_size=*/3));
+  EXPECT_FALSE(is_kv_push_representative(/*cp_rank=*/4,
+                                         /*cp_size=*/4,
+                                         /*kv_split_size=*/2));
+}
+
 TEST(PushRouteTest, SrcTpEqualsDstTpNotUseOwner) {
   EXPECT_FALSE(use_push_owner(4, 4));
 

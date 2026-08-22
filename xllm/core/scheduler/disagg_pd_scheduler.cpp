@@ -145,6 +145,7 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name,
   engine->get_cache_info(
       instance_info_.cluster_ids, instance_info_.addrs, instance_info_.ports);
   instance_info_.dp_size = options_.dp_size();
+  instance_info_.cp_size = options_.cp_size();
   instance_info_.kv_split_size =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
 
@@ -396,7 +397,7 @@ void DisaggPDScheduler::dispatch_requests() {
       continue;
     }
 
-    // NOTE: TODO: maybe we need to support batch disatch
+    // NOTE: TODO: maybe we need to support batch dispatch
     // later, this maybe decrease the communication cost.
     // currently we only support one request per dispatch.
 

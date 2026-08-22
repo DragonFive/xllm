@@ -21,6 +21,8 @@ limitations under the License.
 #include <cstdlib>
 #include <limits>
 
+#include "core/framework/parallel_state/kv_split_topology.h"
+
 #define MAX_LCCL_COMM_DOMAIN 63
 #define ENV_enable_extra_o_proj_tp false
 #define ENV_lm_head_local_tp false
@@ -404,12 +406,22 @@ void MappingNPU::get_dp_group(ParallelInfo& parallel_info) {
 }
 
 void MappingNPU::get_kv_split_group(ParallelInfo& parallel_info) {
-  // Reuse the get_dp_group stride layout. The stride is world_size /
-  // group_size, so when group_size == attn_cp_.group_size() the produced
-  // rank_per_group is identical to attn_cp_'s and ATB will de-dup the HCCL
-  // commDomain. When group_size == 1 each rank is its own single-element group,
-  // i.e. no collective communication will be issued for KV split.
-  get_dp_group(parallel_info);
+  const int32_t kv_split_size = parallel_info.group_size();
+  const int32_t group_count = world_size_ / kv_split_size;
+  std::vector<std::vector<int32_t>> rank_per_group;
+  rank_per_group.reserve(group_count);
+  for (int32_t group_id = 0; group_id < group_count; ++group_id) {
+    rank_per_group.emplace_back(parallel_state::compute_kv_split_group_ranks(
+        group_id, world_size_, attn_cp_.group_size(), kv_split_size));
+  }
+  parallel_info.num_group(group_count);
+  parallel_info.rank_per_group(rank_per_group);
+  auto [current_group_id, local_rank] =
+      get_current_group_id(rank_per_group, rank_);
+  CHECK(current_group_id >= 0 && local_rank >= 0)
+      << "Failed to get KV split group for rank " << rank_;
+  parallel_info.current_group_id(current_group_id);
+  parallel_info.rank(local_rank);
 }
 
 void MappingNPU::get_layerwise_split_group(ParallelInfo& parallel_info) {

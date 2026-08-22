@@ -26,18 +26,19 @@ from xllm.python.model_executor.forward_context import (
 from xllm.python.model_executor.runners.base import BaseRunner
 
 
-def _per_seq_lens_from_metadata(metadata: AttentionMetadata) -> list[int] | None:
-    """Per-sequence query lengths for the packed prefill batch, or None.
+def _per_seq_lens_from_metadata(metadata: AttentionMetadata) -> tuple[list[int], list[int]] | None:
+    """Per-sequence query and KV lengths for the packed prefill batch.
 
     Read straight from ``q_seq_lens_host`` — the host-side per-sequence query
     lengths (NPU keeps these non-cumulative, one entry per sequence), so no
     D2H copy and no diff. Returns None when the field is absent so the caller
     falls back to the non-CP path.
     """
-    lens = metadata.q_seq_lens_host
-    if lens is None:
+    q_lens = metadata.q_seq_lens_host
+    kv_lens = metadata.kv_seq_lens_host
+    if q_lens is None or kv_lens is None:
         return None
-    return lens.tolist()
+    return q_lens.tolist(), kv_lens.tolist()
 
 
 class EagerRunner(BaseRunner):
@@ -54,13 +55,28 @@ class EagerRunner(BaseRunner):
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
     ) -> torch.Tensor:
-        self.attention_backend.prepare(metadata)
-
         cp_context = None
-        if self.cp_size > 1 and metadata.is_prefill:
+        if self.cp_size > 1 and metadata.is_spec_verify:
+            raise NotImplementedError("Python Context-Parallel does not support MTP speculative verification")
+        if self.cp_size > 1 and metadata.is_mixed:
+            raise NotImplementedError("Python Context-Parallel does not support mixed batches")
+        if self.cp_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             seq_lens = _per_seq_lens_from_metadata(metadata)
-            if seq_lens is not None:
-                cp_context = build_cp_context(seq_lens, self.cp_size, self.cp_rank, self.device)
+            if seq_lens is None:
+                raise RuntimeError("Python Context-Parallel requires host query and KV sequence lengths")
+            q_seq_lens, kv_seq_lens = seq_lens
+            cp_context = build_cp_context(
+                q_seq_lens,
+                kv_seq_lens,
+                self.cp_size,
+                self.cp_rank,
+                self.device,
+            )
+
+        # Admission and context construction must finish before prepare(). A
+        # sharded MLA backend enters CP collectives during prepare, so rejecting
+        # unsupported batches afterwards could leave peer ranks deadlocked.
+        self.attention_backend.prepare(metadata)
 
         with forward_context(
             ForwardContext(

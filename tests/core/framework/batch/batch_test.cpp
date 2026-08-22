@@ -1748,6 +1748,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   info.mappings.emplace_back(make_mapping(BlockType::KV, {100, 101}));
   info.dp_rank = 1;
   info.remote_instance_info.dp_size = 2;
+  info.remote_instance_info.cp_size = 4;
+  info.remote_instance_info.kv_split_size = 2;
   seq.kv_state().set_transfer_kv_info(std::move(info));
 
   std::vector<Sequence*> sequences = {&seq};
@@ -1802,6 +1804,10 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
             std::vector<int32_t>{0});
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,
             (std::vector<uint64_t>{3, 7}));
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].remote_instance_info.dp_size, 2);
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].remote_instance_info.cp_size, 4);
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].remote_instance_info.kv_split_size,
+            2);
   EXPECT_EQ(round_trip.sample_sequence_ids,
             std::vector<std::string>{"req-packed#0"});
   EXPECT_EQ(round_trip.sample_prior_output_rows, std::vector<int32_t>{3});

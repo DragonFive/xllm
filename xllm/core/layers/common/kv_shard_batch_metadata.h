@@ -30,6 +30,9 @@ struct AttentionMetadata;
 struct KVShardBatchMetadata {
   torch::Tensor local_slot_mapping;
   torch::Tensor expanded_indexer_block_table;
+  int32_t physical_block_size = 1;
+  int32_t kv_split_size = 1;
+  int32_t kv_split_rank = 0;
 };
 
 torch::Tensor localize_kv_shard_slots(const torch::Tensor& logical_slots,

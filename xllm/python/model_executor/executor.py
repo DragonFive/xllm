@@ -112,6 +112,11 @@ class ModelExecutor:
         dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
+        if self.eager_runner.cp_size > 1 and dp_size > 1:
+            raise NotImplementedError(
+                "Python Context-Parallel cannot be combined with data parallel "
+                "execution in this version; set dp_size=1 or cp_size=1."
+            )
         if dp_size > 1 and graph_backend not in (
             "",
             "off",

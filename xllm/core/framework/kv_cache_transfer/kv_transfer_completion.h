@@ -44,6 +44,11 @@ class KVTransferCompletion final {
   // reports failure or completes with an exception.
   bool wait();
 
+  // Waits without a timeout after the transfer synchronizer has been aborted.
+  // This is only for exception unwinding, where every transfer must reach a
+  // terminal state before source blocks can be released.
+  bool drain_after_abort() noexcept;
+
  private:
   std::chrono::milliseconds wait_timeout_;
   std::vector<folly::SemiFuture<bool>> futures_;

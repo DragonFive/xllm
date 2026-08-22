@@ -48,7 +48,7 @@ TEST(PdTopologyGuardTest, HomoTopoBypass) {
   EXPECT_TRUE(result.reason.empty());
 }
 
-TEST(PdTopologyGuardTest, RegistrationOmitsCpAndKeepsTopologyCompatible) {
+TEST(PdTopologyGuardTest, DefaultCpSizeKeepsTopologyCompatible) {
   InstanceInfo prefill = make_info(1, {0, 1, 2, 3});
   prefill.name = "prefill";
   prefill.type = "PREFILL";
@@ -60,14 +60,23 @@ TEST(PdTopologyGuardTest, RegistrationOmitsCpAndKeepsTopologyCompatible) {
 
   const nlohmann::json prefill_registration = prefill.serialize_to_json();
   const nlohmann::json decode_registration = decode.serialize_to_json();
-  EXPECT_FALSE(prefill_registration.contains("cp_size"));
-  EXPECT_FALSE(prefill_registration.contains("requested_cp_size"));
-  EXPECT_FALSE(decode_registration.contains("cp_size"));
-  EXPECT_FALSE(decode_registration.contains("requested_cp_size"));
+  EXPECT_EQ(prefill.cp_size, 1);
+  EXPECT_EQ(prefill_registration.at("cp_size"), 1);
+  EXPECT_EQ(decode.cp_size, 1);
+  EXPECT_EQ(decode_registration.at("cp_size"), 1);
 
   const PdTopoResult result = check_pd_topo(prefill, decode, "PUSH");
   EXPECT_EQ(result.status, PdTopoStatus::ALLOW_HOMO);
   EXPECT_TRUE(result.reason.empty());
+}
+
+TEST(PdTopologyGuardTest, CpSizeReducesTensorParallelSize) {
+  InstanceInfo info = make_info(1, {0, 1, 2, 3, 4, 5, 6, 7});
+  info.cp_size = 4;
+
+  const PdTopo topo = get_pd_topo(info);
+  EXPECT_EQ(topo.dp_size, 1);
+  EXPECT_EQ(topo.tp_size, 2);
 }
 
 TEST(PdTopologyGuardTest, TryGetPdTopoReturnTopo) {
@@ -153,16 +162,18 @@ TEST(PdTopologyGuardTest, CheckPdTopoRejectInvalidRemoteTopo) {
   EXPECT_EQ(result.status, PdTopoStatus::INVALID_REMOTE);
   EXPECT_EQ(result.reason,
             "invalid remote pd topo: cluster_ids.size() must be divisible by "
-            "dp_size");
+            "dp_size * cp_size");
 }
 
 TEST(PdTopologyGuardTest, TryGetPdTopoRejectBadClusterSplit) {
-  const InstanceInfo info = make_info(2, {0, 1, 2});
+  InstanceInfo info = make_info(2, {0, 1, 2, 3, 4, 5});
+  info.cp_size = 2;
 
   PdTopo topo;
   std::string reason;
   EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
-  EXPECT_EQ(reason, "cluster_ids.size() must be divisible by dp_size");
+  EXPECT_EQ(reason,
+            "cluster_ids.size() must be divisible by dp_size * cp_size");
 }
 
 TEST(PdTopologyGuardTest, TryGetPdTopoRejectEmptyClusterIds) {
@@ -183,12 +194,67 @@ TEST(PdTopologyGuardTest, TryGetPdTopoRejectZeroDpSize) {
   EXPECT_EQ(reason, "dp_size must be greater than 0");
 }
 
+TEST(PdTopologyGuardTest, TryGetPdTopoRejectNegativeCpSize) {
+  InstanceInfo info = make_info(1, {0, 1, 2, 3});
+  info.cp_size = -1;
+
+  PdTopo topo;
+  std::string reason;
+  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
+  EXPECT_EQ(reason, "cp_size must be greater than 0");
+}
+
+TEST(PdTopologyGuardTest, TryGetPdTopoRejectNonPositiveEffectiveCpSize) {
+  InstanceInfo info = make_info(1, {0, 1, 2, 3});
+  info.cp_size = 0;
+  info.kv_split_size = 0;
+
+  PdTopo topo;
+  std::string reason;
+  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
+  EXPECT_EQ(reason, "cp_size must be greater than 0");
+}
+
+TEST(PdTopologyGuardTest, TryGetPdTopoRejectKvSplitLargerThanCpSize) {
+  InstanceInfo info = make_info(1, {0, 1, 2, 3});
+  info.cp_size = 2;
+  info.kv_split_size = 4;
+
+  PdTopo topo;
+  std::string reason;
+  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
+  EXPECT_EQ(reason, "kv_split_size must not exceed cp_size");
+}
+
+TEST(PdTopologyGuardTest, TryGetPdTopoRejectNonDivisorKvSplit) {
+  InstanceInfo info = make_info(1, {0, 1, 2, 3, 4, 5});
+  info.cp_size = 3;
+  info.kv_split_size = 2;
+
+  PdTopo topo;
+  std::string reason;
+  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
+  EXPECT_EQ(reason, "cp_size must be divisible by kv_split_size");
+}
+
+TEST(PdTopologyGuardTest, LegacyZeroCpSizeRejectsOwnerShardedKv) {
+  InstanceInfo info = make_info(1, {0, 1, 2, 3, 4, 5, 6, 7});
+  info.cp_size = 0;
+  info.kv_split_size = 4;
+
+  PdTopo topo;
+  std::string reason;
+  EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
+  EXPECT_EQ(reason, "cp_size is required when kv_split_size > 1");
+}
+
 TEST(PdTopologyGuardTest, GetPdTopoRejectBadClusterSplit) {
   set_death_style();
   const InstanceInfo info = make_info(2, {0, 1, 2});
 
   EXPECT_DEATH(get_pd_topo(info),
-               "cluster_ids.size\\(\\) must be divisible by dp_size");
+               "cluster_ids.size\\(\\) must be divisible by dp_size \\* "
+               "cp_size");
 }
 
 TEST(PdTopologyGuardTest, GetPdTopoRejectEmptyClusterIds) {

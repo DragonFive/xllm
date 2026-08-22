@@ -48,6 +48,7 @@ limitations under the License.
 #include "core/platform/device_name_utils.h"
 #include "framework/kv_cache/layerwise_split_layout.h"
 #include "framework/model/model_args.h"
+#include "framework/parallel_state/kv_split_topology.h"
 #include "framework/request/request.h"
 #include "llm_engine.h"
 #include "llm_master.h"
@@ -222,17 +223,34 @@ std::optional<std::string> validate_model_cp(const Options& options,
       // model_impl=python model_type.
       static const std::unordered_set<std::string> kPythonCpCapableModels = {
           "qwen3",
+          "glm_moe_dsa",
       };
       if (kPythonCpCapableModels.find(model_type) ==
           kPythonCpCapableModels.end()) {
         return "Python model-side CP does not support model_type=" +
-               model_type + "; only qwen3 implements the CP sequence sharding.";
+               model_type + "; supported models are qwen3 and glm_moe_dsa.";
       }
       if (options.dp_size() != 1) {
         return "Python CP requires dp_size == 1";
       }
       if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
         return "Python CP requires world_size divisible by dp_size * cp_size";
+      }
+      const int32_t kv_split =
+          ParallelConfig::get_instance().kv_split_size_effective();
+      if (kv_split < 1 || options.cp_size() % kv_split != 0) {
+        return "Python CP requires kv_split_size effective value to be a "
+               "positive divisor of cp_size";
+      }
+      if (model_type == "glm_moe_dsa") {
+        const std::optional<std::string> kv_execution_error =
+            parallel_state::validate_owner_sharded_kv_execution(
+                kv_split,
+                options.enable_disagg_pd(),
+                options.instance_role() == InstanceRole::PREFILL);
+        if (kv_execution_error.has_value()) {
+          return "Python GLM CP: " + kv_execution_error.value();
+        }
       }
       return std::nullopt;
     }

@@ -23,6 +23,17 @@ bool use_push_owner(const int32_t src_tp_size, const int32_t dst_tp_size) {
   return src_tp_size > 0 && dst_tp_size > 0 && src_tp_size > dst_tp_size;
 }
 
+bool is_kv_push_representative(const int32_t cp_rank,
+                               const int32_t cp_size,
+                               const int32_t kv_split_size) {
+  if (cp_size <= 0 || kv_split_size <= 0 || kv_split_size > cp_size ||
+      cp_size % kv_split_size != 0 || cp_rank < 0 || cp_rank >= cp_size) {
+    return false;
+  }
+  const int32_t replicas_per_owner = cp_size / kv_split_size;
+  return cp_rank % replicas_per_owner == 0;
+}
+
 std::vector<int32_t> get_dst_ranks(const int32_t src_tp_rank,
                                    const int32_t src_tp_size,
                                    const int32_t dst_tp_size,

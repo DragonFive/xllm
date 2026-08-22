@@ -27,6 +27,7 @@ from xllm.python.attention.expanded_decode_metadata import (
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
+    from xllm.python.model_executor.cp_utils import CpContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,14 @@ class AttentionMetadata(Protocol):
     expanded_decode_metadata: ExpandedDecodeMetadataLike
     is_prefill: bool
     is_chunked_prefill: bool
+    is_mixed: bool
+    is_spec_verify: bool
+    local_slot_mapping: torch.Tensor | None
+    expanded_indexer_block_table: torch.Tensor | None
+    kv_split_size: int
+    kv_split_rank: int
+    kv_split_block_size: int
+    has_kv_shard: bool
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,8 @@ class MlaIndexContext:
     index_cache_scale: torch.Tensor | None
     get_quant_indexer_metadata: Callable[[int, int, int, int], torch.Tensor]
     update_index_cache: Callable[[torch.Tensor, torch.Tensor | None], None]
+    materialize_index_cache: Callable[[], tuple[torch.Tensor, torch.Tensor]]
+    cp_context: CpContext | None = None
 
 
 @dataclass(frozen=True)

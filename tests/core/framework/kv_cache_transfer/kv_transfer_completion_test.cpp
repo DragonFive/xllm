@@ -20,6 +20,7 @@ limitations under the License.
 #include <chrono>
 #include <future>
 #include <memory>
+#include <stdexcept>
 
 namespace xllm {
 namespace {
@@ -57,6 +58,34 @@ TEST(KVTransferCompletionTest, ReportsTransferFailure) {
   failure_promise.setValue(false);
 
   EXPECT_FALSE(completion.wait());
+}
+
+TEST(KVTransferCompletionTest, DrainAfterAbortIgnoresConfiguredTimeout) {
+  folly::Promise<bool> promise;
+  KVTransferCompletion completion(1ms);
+  completion.add(promise.getSemiFuture());
+
+  std::promise<void> drain_started;
+  std::future<void> started = drain_started.get_future();
+  std::future<bool> result = std::async(std::launch::async, [&]() {
+    drain_started.set_value();
+    return completion.drain_after_abort();
+  });
+
+  started.wait();
+  EXPECT_EQ(result.wait_for(50ms), std::future_status::timeout);
+  promise.setValue(false);
+  EXPECT_FALSE(result.get());
+}
+
+TEST(KVTransferCompletionTest,
+     DrainAfterAbortConvertsFutureExceptionToFailure) {
+  folly::Promise<bool> promise;
+  KVTransferCompletion completion;
+  completion.add(promise.getSemiFuture());
+  promise.setException(std::runtime_error("transfer failed"));
+
+  EXPECT_FALSE(completion.drain_after_abort());
 }
 
 TEST(KVTransferCompletionTest, RejectsPendingTransferAfterTimeout) {

@@ -46,18 +46,14 @@ from xllm.python.layers import (
     HiddenParallelEmbedding,
     RMSNorm,
 )
-from xllm.python.model_executor.forward_context import get_forward_context
+from xllm.python.model_executor.cp_utils import cp_gather_kv, cp_merge_rows, cp_shard_positions, cp_shard_rows
+from xllm.python.model_executor.forward_context import get_forward_context, record_layer_event
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3MLP as Glm52MLP,
 )
 from xllm.python.models.deepseek_v32 import (
-    DeepseekV3MoE as Glm52MoE,
-)
-from xllm.python.models.deepseek_v32 import (
-    DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
-)
-from xllm.python.models.deepseek_v32 import (
+    DeepseekV3MoE,
     W8A8StaticLinear,
     W8A8WeightLoader,
     _apply_half_rope,
@@ -65,6 +61,9 @@ from xllm.python.models.deepseek_v32 import (
     _interleave_rope_with,
     _tp_rank_from_device,
     _yarn_get_mscale,
+)
+from xllm.python.models.deepseek_v32 import (
+    DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
 )
 
 
@@ -447,11 +446,8 @@ class Glm52Indexer(nn.Module):
         ctx: MlaIndexContext,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        index_cache = ctx.index_cache
-        slot_mapping = ctx.slot_mapping
         actual_seq_q = ctx.actual_seq_q
         actual_seq_kv = ctx.actual_seq_kv
-        block_table = ctx.block_table
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         k = self.wk(hidden)
@@ -466,9 +462,13 @@ class Glm52Indexer(nn.Module):
             k_pe = _apply_half_rope(k_pe.unsqueeze(1), cos_sin_cache, positions).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
-        if index_cache is not None and slot_mapping is not None:
-            ctx.update_index_cache(k, None)
         weights = self.weights_proj(hidden.to(torch.float32)).to(torch.bfloat16)
+        if ctx.cp_context is not None:
+            q = cp_gather_kv(q, ctx.cp_context).contiguous()
+            k = cp_gather_kv(k, ctx.cp_context).contiguous()
+            weights = cp_gather_kv(weights, ctx.cp_context).contiguous()
+        ctx.update_index_cache(k, None)
+        index_cache, block_table = ctx.materialize_index_cache()
         topk = kernels.lightning_indexer(
             q,
             index_cache,
@@ -484,7 +484,22 @@ class Glm52Indexer(nn.Module):
             9223372036854775807,
             False,
         )
+        if ctx.cp_context is not None:
+            return cp_shard_rows(topk, ctx.cp_context)
         return topk
+
+
+class Glm52MoE(DeepseekV3MoE):
+    """EP MoE with CP rows materialized before expert reduction."""
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        cp_context = get_forward_context().cp_context
+        if cp_context is None or self.ep_size == 1:
+            return super().forward(hidden)
+
+        global_hidden = cp_gather_kv(hidden, cp_context)
+        global_output = super().forward(global_hidden)
+        return cp_shard_rows(global_output, cp_context)
 
 
 class Glm52DecoderLayer(nn.Module):
@@ -560,12 +575,19 @@ class Glm52Model(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
+        cp_context = get_forward_context().cp_context
+        if cp_context is not None:
+            hidden = cp_shard_rows(hidden, cp_context)
+            positions = cp_shard_positions(positions, cp_context).contiguous()
         cos_sin_cache = self.rotary.cos_sin_cache
         residual: torch.Tensor | None = None
         prev_topk: torch.Tensor | None = None
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
             hidden, residual, prev_topk = layer(hidden, residual, positions, cos_sin_cache, prev_topk)
-        hidden, last_hidden = self.norm(hidden, residual)
+            record_layer_event(layer_id)
+        hidden, _ = self.norm(hidden, residual)
+        if cp_context is not None:
+            hidden = cp_merge_rows(hidden, cp_context)
         return hidden
 
 
@@ -707,11 +729,11 @@ class Glm52ForCausalLM(PyModelBase):
                 loader.copy_in(
                     p + "mlp.e_score_correction_bias", loader.load_tensor(p + "mlp.gate.e_score_correction_bias")
                 )
-                saved_tp = (loader.tp_size, loader.tp_rank)
-                loader.tp_size = shard_world
-                loader.tp_rank = shard_rank
-                loader.load_w8a8_b(p + "mlp.shared_experts.")
-                loader.tp_size, loader.tp_rank = saved_tp
+                loader.load_w8a8_b(
+                    p + "mlp.shared_experts.",
+                    shard_world=shard_world,
+                    shard_rank=shard_rank,
+                )
                 self.model.layers[i].mlp.process_weights_after_loading()
 
         loader.copy_in("model.norm.weight", loader.load_tensor("model.norm.weight"))

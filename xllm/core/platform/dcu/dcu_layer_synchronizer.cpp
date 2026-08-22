@@ -56,7 +56,13 @@ bool DCULayerSynchronizerImpl::synchronize_layer(int64_t layer_index) {
       << "layer_index out of bounds.";
   size_t layer = static_cast<size_t>(layer_index);
   while (!event_record_flags_[layer].load(std::memory_order_acquire)) {
+    if (aborted_.load(std::memory_order_acquire)) {
+      return false;
+    }
     std::this_thread::yield();
+  }
+  if (aborted_.load(std::memory_order_acquire)) {
+    return false;
   }
 
   auto deadline =
@@ -97,6 +103,13 @@ bool DCULayerSynchronizerImpl::record_current(int64_t layer_index,
   }
   event_record_flags_[layer].store(true, std::memory_order_release);
   return true;
+}
+
+void DCULayerSynchronizerImpl::abort() {
+  aborted_.store(true, std::memory_order_release);
+  for (std::atomic<bool>& flag : event_record_flags_) {
+    flag.store(true, std::memory_order_release);
+  }
 }
 
 uint32_t DCULayerSynchronizerImpl::get_event_size() const {

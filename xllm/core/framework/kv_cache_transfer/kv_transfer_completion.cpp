@@ -21,6 +21,7 @@ limitations under the License.
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <mutex>
 #include <utility>
 
@@ -61,6 +62,27 @@ bool KVTransferCompletion::wait() {
       results.begin(), results.end(), [](const folly::Try<bool>& result) {
         return result.hasValue() && result.value();
       });
+}
+
+bool KVTransferCompletion::drain_after_abort() noexcept {
+  if (futures_.empty()) {
+    return true;
+  }
+
+  try {
+    std::vector<folly::Try<bool>> results = folly::collectAll(futures_).get();
+    futures_.clear();
+    return std::all_of(
+        results.begin(), results.end(), [](const folly::Try<bool>& result) {
+          return result.hasValue() && result.value();
+        });
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "Failed to drain KV transfers after abort: " << error.what();
+  } catch (...) {
+    LOG(ERROR) << "Failed to drain KV transfers after abort: unknown error";
+  }
+  futures_.clear();
+  return false;
 }
 
 class KVTransferTracker::State final {

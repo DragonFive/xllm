@@ -9,6 +9,7 @@ cc_library(
     npu_dp_ep_padding.h
     dit_mapping.h
     rank_generator.h
+    kv_split_topology.h
     parallel_args.h
     parallel_state.h
     process_group.h
@@ -27,6 +28,7 @@ cc_library(
     npu_cp_plan.cpp
     npu_dp_ep_padding.cpp
     dit_mapping.cpp
+    kv_split_topology.cpp
     parallel_state.cpp
     parallel_state_async.cpp
     process_group.cpp

@@ -44,6 +44,7 @@ limitations under the License.
 #endif
 #include "models/model_registry.h"
 #include "util/env_var.h"
+#include "util/scope_guard.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
 
@@ -276,21 +277,22 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   auto& sampling_params = input.sampling_params;
 
   KVTransferCompletion kv_transfers;
+  bool transfer_cleanup_needed = true;
 
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  std::shared_ptr<KVPushSynchronizerImpl> layer_synchronizer;
+#endif
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
 #if defined(USE_NPU)
-    std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer =
-        std::make_shared<NPULayerSynchronizerImpl>(
-            context_.get_model_args().n_layers());
+    layer_synchronizer = std::make_shared<NPULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
 #elif defined(USE_MLU)
-    std::shared_ptr<MLULayerSynchronizerImpl> layer_synchronizer =
-        std::make_shared<MLULayerSynchronizerImpl>(
-            context_.get_model_args().n_layers());
+    layer_synchronizer = std::make_shared<MLULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
 #elif defined(USE_DCU)
-    std::shared_ptr<DCULayerSynchronizerImpl> layer_synchronizer =
-        std::make_shared<DCULayerSynchronizerImpl>(
-            context_.get_model_args().n_layers());
+    layer_synchronizer = std::make_shared<DCULayerSynchronizerImpl>(
+        context_.get_model_args().n_layers());
 #endif
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
     const_cast<ModelInputParams*>(&(input.input_params))
@@ -303,21 +305,39 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
                                                  is_spec_draft_));
 #endif
   }
-  auto wait_kv_push = [&kv_transfers]() {
-    CHECK(kv_transfers.wait()) << "KV cache push failed";
+  auto wait_kv_push = [&]() {
+    const bool success = kv_transfers.wait();
+    transfer_cleanup_needed = false;
+    if (!success) {
+      LOG(ERROR) << "KV cache push failed";
+    }
+    return success;
   };
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     eplb_executor_->start_eplb_step(input.input_params.expert.eplb_info);
   }
 
   // call model executor forward to get hidden states
-  auto model_output = model_executor_->forward(
+  ModelOutput model_output;
+  SCOPE_GUARD([&]() {
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+    if (transfer_cleanup_needed && layer_synchronizer != nullptr) {
+      layer_synchronizer->abort();
+      if (!kv_transfers.drain_after_abort()) {
+        LOG(ERROR) << "KV cache push failed while unwinding worker step";
+      }
+    }
+#endif
+  });
+  model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     eplb_executor_->finish_eplb_step();
   }
   if (!model_output.hidden_states.defined()) {
-    wait_kv_push();
+    if (!wait_kv_push()) {
+      return std::nullopt;
+    }
     return std::nullopt;
   }
 
@@ -367,12 +387,16 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       !options_.enable_speculative_decode()) {
     MULTI_MODEL_STEP_UNLOCK();
     if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-      wait_kv_push();
+      if (!wait_kv_push()) {
+        return std::nullopt;
+      }
       return std::nullopt;
     }
     int ret = device_.synchronize_default_stream();
     CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
-    wait_kv_push();
+    if (!wait_kv_push()) {
+      return std::nullopt;
+    }
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       return output;
     }
@@ -433,7 +457,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       !can_skip_npu_graph_decode_sync(input.input_params);
 #endif
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
-    wait_kv_push();
+    if (!wait_kv_push()) {
+      return std::nullopt;
+    }
     output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
     if (enable_schedule_overlap() && record_ready_event) {
       output.ready_event = record_current_stream_event(device_);
@@ -445,7 +471,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
   }
 
-  wait_kv_push();
+  if (!wait_kv_push()) {
+    return std::nullopt;
+  }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   if (should_sync_default_stream) {

@@ -22,6 +22,12 @@ namespace xllm {
 
 bool use_push_owner(int32_t src_tp_size, int32_t dst_tp_size);
 
+// KV may be replicated when kv_split_size is a proper divisor of cp_size.
+// Only the first CP replica for each KV owner should PUSH its identical cache.
+bool is_kv_push_representative(int32_t cp_rank,
+                               int32_t cp_size,
+                               int32_t kv_split_size);
+
 std::vector<int32_t> get_dst_ranks(int32_t src_tp_rank,
                                    int32_t src_tp_size,
                                    int32_t dst_tp_size,

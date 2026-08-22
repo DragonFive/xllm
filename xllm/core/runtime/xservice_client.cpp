@@ -332,6 +332,11 @@ InstanceInfo XServiceClient::get_instance_info(
   if (resp.kv_split_size() > 0) {
     result.kv_split_size = resp.kv_split_size();
   }
+  // cp_size and kv_split_size are independent topology dimensions. Older
+  // xservice responses do not carry cp_size; retain the only compatible
+  // legacy interpretation (replicated KV with cp_size=1) instead of deriving
+  // CP ownership from kv_split_size.
+  result.cp_size = resp.cp_size() > 0 ? resp.cp_size() : 1;
   for (auto& port : resp.ports()) {
     result.ports.emplace_back(port);
   }

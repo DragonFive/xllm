@@ -316,12 +316,17 @@ std::tuple<torch::Tensor,
            torch::Tensor,
            std::vector<int64_t>,
            std::vector<int64_t>,
+           torch::Tensor,
+           std::vector<int64_t>,
            int64_t>
-build_cp_context_npu(const std::vector<int64_t>& seq_lens,
+build_cp_context_npu(const std::vector<int64_t>& q_seq_lens,
+                     const std::vector<int64_t>& kv_seq_lens,
                      int64_t cp_size,
                      int64_t cp_rank,
                      c10::Device device) {
   TORCH_CHECK(cp_size > 1, "build_cp_context requires cp_size > 1");
+  TORCH_CHECK(q_seq_lens.size() == kv_seq_lens.size(),
+              "query and KV sequence lengths must have the same size");
 
   const int64_t num_chunks = cp_size * 2;
   // The two chunk ids this rank owns: an early one and its mirror.
@@ -333,18 +338,27 @@ build_cp_context_npu(const std::vector<int64_t>& seq_lens,
   std::vector<int64_t> q_cu_seqlens;
   std::vector<int64_t> kv_gather_index;
   std::vector<int64_t> kv_cu_seqlens;
+  std::vector<int64_t> segment_seq_indices;
+  std::vector<int64_t> segment_kv_seq_lens;
   // restore_index needs the per-seq local segment offset (same on every rank)
   // and the ownership map, so accumulate it in a second pass below.
   std::vector<int64_t> chunk_lens;
   std::vector<int64_t> local_seg_offsets;
-  chunk_lens.reserve(seq_lens.size());
-  local_seg_offsets.reserve(seq_lens.size());
+  chunk_lens.reserve(q_seq_lens.size());
+  local_seg_offsets.reserve(q_seq_lens.size());
+  segment_seq_indices.reserve(q_seq_lens.size() * 2);
+  segment_kv_seq_lens.reserve(q_seq_lens.size() * 2);
 
   int64_t global_offset = 0;
   int64_t local_offset = 0;
   int64_t q_run = 0;
   int64_t kv_run = 0;
-  for (const int64_t length : seq_lens) {
+  for (size_t seq_id = 0; seq_id < q_seq_lens.size(); ++seq_id) {
+    const int64_t length = q_seq_lens[seq_id];
+    const int64_t kv_length = kv_seq_lens[seq_id];
+    TORCH_CHECK(kv_length >= length,
+                "KV sequence length must not be shorter than query length");
+    const int64_t prefix_cache_length = kv_length - length;
     const int64_t padded =
         ((length + num_chunks - 1) / num_chunks) * num_chunks;
     const int64_t chunk_len = padded / num_chunks;
@@ -372,9 +386,11 @@ build_cp_context_npu(const std::vector<int64_t>& seq_lens,
         }
       }
       if (real_count > 0) {
+        segment_seq_indices.push_back(static_cast<int64_t>(seq_id));
         // Causal prefix ends exactly at the last real query position + 1
         // = seg_start + real_count (segment is a contiguous real range).
         const int64_t prefix_len = seg_start + real_count;
+        segment_kv_seq_lens.push_back(prefix_cache_length + prefix_len);
         q_run += real_count;
         q_cu_seqlens.push_back(q_run);
         for (int64_t p = 0; p < prefix_len; ++p) {
@@ -397,8 +413,8 @@ build_cp_context_npu(const std::vector<int64_t>& seq_lens,
   // global_offset.
   std::vector<int64_t> restore_index;
   restore_index.reserve(global_offset);
-  for (size_t s = 0; s < seq_lens.size(); ++s) {
-    const int64_t length = seq_lens[s];
+  for (size_t s = 0; s < q_seq_lens.size(); ++s) {
+    const int64_t length = q_seq_lens[s];
     const int64_t chunk_len = chunk_lens[s];
     const int64_t seg_offset = local_seg_offsets[s];
     for (int64_t pos_in_seq = 0; pos_in_seq < length; ++pos_in_seq) {
@@ -423,15 +439,18 @@ build_cp_context_npu(const std::vector<int64_t>& seq_lens,
   auto gather_index =
       torch::where(valid_mask, shard_tensor, torch::zeros_like(shard_tensor));
 
-  return std::make_tuple(shard_tensor.to(device),
-                         gather_index.to(device),
-                         valid_mask.to(device),
-                         torch::tensor(restore_index, cpu_int64).to(device),
-                         torch::tensor(query_index, cpu_int64).to(device),
-                         torch::tensor(kv_gather_index, cpu_int64).to(device),
-                         q_cu_seqlens,
-                         kv_cu_seqlens,
-                         total_local);
+  return std::make_tuple(
+      shard_tensor.to(device),
+      gather_index.to(device),
+      valid_mask.to(device),
+      torch::tensor(restore_index, cpu_int64).to(device),
+      torch::tensor(query_index, cpu_int64).to(device),
+      torch::tensor(kv_gather_index, cpu_int64).to(device),
+      q_cu_seqlens,
+      kv_cu_seqlens,
+      torch::tensor(segment_seq_indices, cpu_int64).to(device),
+      segment_kv_seq_lens,
+      total_local);
 }
 
 }  // namespace
@@ -566,11 +585,12 @@ TORCH_LIBRARY(xllm_ops, m) {
       "sparse_block_size, str layout_query, str layout_kv, int sparse_mode, "
       "Tensor(a!) output) -> Tensor(a!)");
   m.def(
-      "build_cp_context(int[] seq_lens, int cp_size, int cp_rank, Device "
-      "device) -> (Tensor shard_index, Tensor shard_gather_index, Tensor "
+      "build_cp_context(int[] q_seq_lens, int[] kv_seq_lens, int cp_size, "
+      "int cp_rank, Device device) -> (Tensor shard_index, Tensor "
+      "shard_gather_index, Tensor "
       "shard_valid_mask, Tensor restore_index, Tensor query_index, Tensor "
-      "kv_gather_index, int[] q_cu_seqlens, int[] kv_cu_seqlens, int "
-      "total_local)");
+      "kv_gather_index, int[] q_cu_seqlens, int[] kv_cu_seqlens, Tensor "
+      "segment_seq_indices, int[] segment_kv_seq_lens, int total_local)");
   m.def(
       "mla_preprocess_v2(Tensor input, Tensor gamma0, Tensor beta0, Tensor "
       "quant_scale0, Tensor quant_offset0, Tensor wdqkv, Tensor descale0, "

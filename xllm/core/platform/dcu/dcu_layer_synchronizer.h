@@ -31,11 +31,13 @@ class DCULayerSynchronizerImpl final {
 
   bool synchronize_layer(int64_t layer_index);
   bool record_current(int64_t layer_index, int32_t device_index);
+  void abort();
   uint32_t get_event_size() const;
 
  private:
   std::vector<hipEvent_t> events_;
   std::vector<std::atomic<bool>> event_record_flags_;
+  std::atomic<bool> aborted_{false};
   int32_t timeout_ms_;
 };
 

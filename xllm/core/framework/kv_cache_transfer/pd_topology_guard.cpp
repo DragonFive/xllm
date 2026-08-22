@@ -58,15 +58,40 @@ bool try_get_pd_topo(const InstanceInfo& info,
   }
 
   const size_t dp_size = static_cast<size_t>(info.dp_size);
-  if (cluster_num % dp_size != 0) {
-    return fail_topo("cluster_ids.size() must be divisible by dp_size", reason);
+  if (info.cp_size < 0) {
+    return fail_topo("cp_size must be greater than 0", reason);
+  }
+  if (info.cp_size == 0 && info.kv_split_size > 1) {
+    return fail_topo("cp_size is required when kv_split_size > 1", reason);
+  }
+  const int32_t effective_cp_size = info.cp_size > 0 ? info.cp_size : 1;
+  if (effective_cp_size <= 0) {
+    return fail_topo("cp_size must be greater than 0", reason);
+  }
+  if (info.kv_split_size <= 0) {
+    return fail_topo("kv_split_size must be greater than 0", reason);
+  }
+  if (info.kv_split_size > effective_cp_size) {
+    return fail_topo("kv_split_size must not exceed cp_size", reason);
+  }
+  if (effective_cp_size % info.kv_split_size != 0) {
+    return fail_topo("cp_size must be divisible by kv_split_size", reason);
+  }
+  const size_t cp_size = static_cast<size_t>(effective_cp_size);
+  if (dp_size > std::numeric_limits<size_t>::max() / cp_size) {
+    return fail_topo("dp_size * cp_size overflows", reason);
+  }
+  const size_t replica_size = dp_size * cp_size;
+  if (cluster_num % replica_size != 0) {
+    return fail_topo(
+        "cluster_ids.size() must be divisible by dp_size * cp_size", reason);
   }
   if (cluster_num > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
     return fail_topo("cluster_ids.size() exceeds int32_t range", reason);
   }
 
   topo->dp_size = info.dp_size;
-  topo->tp_size = static_cast<int32_t>(cluster_num / dp_size);
+  topo->tp_size = static_cast<int32_t>(cluster_num / replica_size);
   if (reason != nullptr) {
     reason->clear();
   }

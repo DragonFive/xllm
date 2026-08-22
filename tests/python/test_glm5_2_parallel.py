@@ -163,10 +163,21 @@ class _RecordingLoader:
     def load_w8a8_a(self, prefix: str, proj: str, _shard_dims: dict | None = None) -> None:
         self.loaded.append(prefix + proj)
 
-    def load_w8a8_b(self, prefix: str) -> None:
+    def load_w8a8_b(
+        self,
+        prefix: str,
+        shard_world: int | None = None,
+        shard_rank: int | None = None,
+    ) -> None:
         self.loaded.append(prefix)
         if ".shared_experts." in prefix:
-            self.shared_shards.append((prefix, self.tp_size, self.tp_rank))
+            self.shared_shards.append(
+                (
+                    prefix,
+                    self.tp_size if shard_world is None else shard_world,
+                    self.tp_rank if shard_rank is None else shard_rank,
+                )
+            )
 
 
 def test_glm_weight_loader_reads_only_local_ep_experts(monkeypatch) -> None:

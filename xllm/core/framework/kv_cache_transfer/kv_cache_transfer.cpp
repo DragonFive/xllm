@@ -22,6 +22,7 @@ limitations under the License.
 #include <unordered_set>
 
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/kv_cache_transfer/push_route.h"
 
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
@@ -53,6 +54,20 @@ bool KVCacheTransfer::validate_transfer_mappings(
     const bool validate_full_kv_split_coverage =
         kv_split_size > 1 && block_type.has_value() &&
         is_kv_split_cache_block_type(block_type.value());
+    const std::unordered_set<uint64_t> local_ids(mapping.local_ids.begin(),
+                                                 mapping.local_ids.end());
+    if (local_ids.size() != mapping.local_ids.size()) {
+      LOG(ERROR) << "Duplicate local KV cache block id, request_id="
+                 << request_id << ", group_id=" << mapping.group_id;
+      return false;
+    }
+    const std::unordered_set<uint64_t> remote_ids(mapping.remote_ids.begin(),
+                                                  mapping.remote_ids.end());
+    if (remote_ids.size() != mapping.remote_ids.size()) {
+      LOG(ERROR) << "Duplicate remote KV cache block id, request_id="
+                 << request_id << ", group_id=" << mapping.group_id;
+      return false;
+    }
     if (!validate_full_kv_split_coverage) {
       if (mapping.local_ids.size() != mapping.remote_ids.size()) {
         LOG(ERROR) << "KV cache transfer mapping size mismatch, request_id="
@@ -228,6 +243,11 @@ folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
       promise.setValue(false);
       return;
     }
+    if (!is_kv_push_representative(
+            parallel_args.cp_rank(), parallel_args.cp_size(), kv_split_size)) {
+      promise.setValue(true);
+      return;
+    }
     if (kv_split_size > 1) {
       filtered_kv_infos = filter_kv_split_infos(
           parallel_args.kv_split_rank(), kv_split_size, *kv_infos);
@@ -269,9 +289,13 @@ void KVCacheTransfer::merge_kv_blocks(
   // skip all requests for those workers.
   int32_t src_rank = parallel_args.rank();
   int32_t src_dp_size = parallel_args.dp_size();
-  int32_t src_kv_split_size = parallel_args.kv_split_size_effective();
   int32_t src_world_size = parallel_args.world_size();
-  int32_t src_tp_size = src_world_size / src_dp_size / src_kv_split_size;
+  int32_t src_cp_size = parallel_args.cp_size();
+  CHECK_GT(src_dp_size, 0);
+  CHECK_GT(src_cp_size, 0);
+  CHECK_EQ(src_world_size % (src_dp_size * src_cp_size), 0)
+      << "Invalid Prefill DP/CP topology for KV PUSH routing";
+  int32_t src_tp_size = src_world_size / src_dp_size / src_cp_size;
   int32_t src_dp_local_tp_rank = src_rank % src_tp_size;
   auto append_mappings = [](std::vector<KVTransferMapping>& dst,
                             const std::vector<KVTransferMapping>& src) {

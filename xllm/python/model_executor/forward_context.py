@@ -39,7 +39,7 @@ class LayerSynchronizer(Protocol):
     forward to finish.
     """
 
-    def record_event(self, layer_id: int) -> None: ...
+    def record_event(self, layer_id: int) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +99,8 @@ def get_forward_context() -> ForwardContext:
 def record_layer_event(layer_id: int) -> None:
     ctx = _current_context.get()
     if ctx is not None and ctx.layer_synchronizer is not None:
-        ctx.layer_synchronizer.record_event(layer_id)
+        if not ctx.layer_synchronizer.record_event(layer_id):
+            raise RuntimeError(f"failed to record layer completion event for layer {layer_id}")
 
 
 def get_execution_buffer(key: tuple[object, ...], factory: Callable[[], torch.Tensor]) -> torch.Tensor:

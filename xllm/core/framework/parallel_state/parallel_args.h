@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include "core/common/macros.h"
+#include "core/framework/parallel_state/kv_split_topology.h"
 #include "core/framework/parallel_state/process_group.h"
 
 #if defined(USE_NPU)
@@ -179,7 +180,10 @@ struct ParallelArgs {
     if (kv <= 1) {
       return 0;
     }
-    return rank_ / (world_size_ / kv);
+    // A dcp_group_ is authoritative when one exists. The fallback is also
+    // used by transfer-only callers that do not populate cp_size_, so the
+    // world/K split-major relation is the only validation available here.
+    return parallel_state::compute_kv_split_rank(rank_, world_size_, kv);
   }
 
   // tp size
