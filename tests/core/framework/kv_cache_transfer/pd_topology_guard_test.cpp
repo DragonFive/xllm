@@ -204,15 +204,14 @@ TEST(PdTopologyGuardTest, TryGetPdTopoRejectNegativeCpSize) {
   EXPECT_EQ(reason, "cp_size must be greater than 0");
 }
 
-TEST(PdTopologyGuardTest, TryGetPdTopoRejectNonPositiveEffectiveCpSize) {
+TEST(PdTopologyGuardTest, TryGetPdTopoRejectNonPositiveKvSplitSize) {
   InstanceInfo info = make_info(1, {0, 1, 2, 3});
-  info.cp_size = 0;
   info.kv_split_size = 0;
 
   PdTopo topo;
   std::string reason;
   EXPECT_FALSE(try_get_pd_topo(info, &topo, &reason));
-  EXPECT_EQ(reason, "cp_size must be greater than 0");
+  EXPECT_EQ(reason, "kv_split_size must be greater than 0");
 }
 
 TEST(PdTopologyGuardTest, TryGetPdTopoRejectKvSplitLargerThanCpSize) {
