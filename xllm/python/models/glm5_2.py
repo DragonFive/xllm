@@ -412,11 +412,17 @@ class Glm52MLAAttention(Attention):
         k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
 
         attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
-        v_full = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(0, 1)
+        v_full = kernels.batch_matmul_transpose(
+            attn_out.transpose(0, 1),
+            self.W_UV,
+        )
         v_full = v_full.reshape(num_tokens, self.num_heads_local * self.v_head_dim)
         o = self.o_proj(v_full)
         if self.cfg.tp_size > 1:
+            output_dtype = o.dtype
+            o = o.to(torch.float32)
             distributed.all_reduce_(o)
+            o = o.to(output_dtype)
         return o, topk
 
 
@@ -521,7 +527,13 @@ class Glm52DecoderLayer(nn.Module):
             else ("dense" if layer_id < cfg.first_k_dense_replace else "sparse")
         )
         if mlp_type == "dense":
-            self.mlp = Glm52MLP(cfg, cfg.intermediate_size, dtype, device)
+            self.mlp = Glm52MLP(
+                cfg,
+                cfg.intermediate_size,
+                dtype,
+                device,
+                tp_reduce_in_fp32=True,
+            )
         else:
             self.mlp = Glm52MoE(cfg, layer_id, dtype, device)
 

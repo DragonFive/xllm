@@ -71,6 +71,11 @@ class WorkerClient {
                               std::string& addr,
                               uint16_t& port);
 
+  virtual KVCacheLayoutQueryResult get_kv_cache_layout();
+
+  virtual KVTransferNotificationDrainResult drain_kv_transfer_notifications(
+      size_t max_notifications);
+
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
                             const std::vector<uint16_t>& ports);

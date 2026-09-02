@@ -300,9 +300,15 @@ struct KVTransferMapping {
   int32_t group_id = 0;
   std::vector<uint64_t> local_ids;
   std::vector<uint64_t> remote_ids;
-  // Number of leading blocks D already has from its own device-side prefix
-  // cache under this group. P uses this to compress its per-group transfer
-  // cursor to the first block D actually needs (no shared -> zero, no-op).
+  // Request-logical metadata aligned with remote_ids. receipt_remote_ids is a
+  // subset that became final in the current Prefill step and may therefore
+  // produce receiver-visible receipts.
+  std::vector<uint64_t> logical_block_ordinals;
+  std::vector<uint32_t> valid_tokens;
+  std::vector<uint64_t> receipt_remote_ids;
+  // Number of leading destination physical blocks D already has from its own
+  // device-side prefix cache. In KV-split mode this is not a source logical
+  // block count; P advances its source cursor only past fully shared groups.
   uint32_t remote_shared_num = 0;
 };
 
@@ -310,6 +316,11 @@ struct TransferKVInfo {
   std::string request_id;
   int32_t dp_rank = 0;
   InstanceInfo remote_instance_info;
+  // Serialized DecodeKVExpectedManifest owned by the Decode allocation.
+  // Empty preserves the legacy single-owner handoff behavior.
+  std::string decode_kv_manifest;
+  uint64_t attempt_epoch = 0;
+  uint64_t allocation_generation = 0;
 
   // XTensor mode: destination offsets from D-node (per-layer)
   // Only populated when KVCacheConfig::enable_xtensor is true.

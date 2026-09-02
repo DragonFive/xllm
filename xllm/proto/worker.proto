@@ -176,6 +176,9 @@ message TransferKVInfo {
   // Each XTensorLayerOffsets contains K/V offsets for all blocks at one layer
   repeated XTensorLayerOffsets dst_xtensor_layer_offsets = 6;
   repeated KVTransferMapping mappings = 22;
+  bytes decode_kv_manifest = 23;
+  uint64 attempt_epoch = 24;
+  uint64 allocation_generation = 25;
 }
 
 message KVTransferMapping {
@@ -183,6 +186,26 @@ message KVTransferMapping {
   reserved 2;
   repeated uint64 local_ids = 3;
   repeated uint64 remote_ids = 4;
+  repeated uint64 logical_block_ordinals = 5;
+  repeated uint32 valid_tokens = 6;
+  repeated uint64 receipt_remote_ids = 7;
+}
+
+message DrainKVTransferNotificationsRequest {
+  uint32 max_notifications = 1;
+}
+
+message DrainKVTransferNotificationsResponse {
+  bool ok = 1;
+  bool supported = 2;
+  bool more_available = 3;
+  repeated bytes payloads = 4;
+}
+
+message KVCacheLayoutResponse {
+  bool ok = 1;
+  bool supported = 2;
+  bytes serialized_manifest = 3;
 }
 
 message EplbInfo {
@@ -409,6 +432,9 @@ service DistributeWorker {
   rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}
   rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
   rpc GetCacheInfo(Empty) returns (CacheInfo) {}
+  rpc GetKVCacheLayout(Empty) returns (KVCacheLayoutResponse) {}
+  rpc DrainKVTransferNotifications(DrainKVTransferNotificationsRequest)
+      returns (DrainKVTransferNotificationsResponse) {}
   rpc LinkCluster(ClusterInfo) returns (Status) {}
   rpc UnlinkCluster(ClusterInfo) returns (Status) {}
   rpc LinkP2P(P2PLinkWorkerRequest) returns (Status) {}

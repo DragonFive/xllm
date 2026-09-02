@@ -35,6 +35,7 @@ limitations under the License.
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 #include "core/framework/block/block_utils.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
@@ -1041,6 +1042,11 @@ uint32_t MTPWorkerImpl::transfer_kv_blocks(
 #if defined(USE_NPU) || defined(USE_MLU)
 bool MTPWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
+  if (DisaggPDConfig::get_instance().kv_cache_transfer_type() ==
+      "LlmDataDist") {
+    LOG(ERROR) << "LlmDataDist does not support MTP draft KV cache transfer.";
+    return false;
+  }
   const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
   CHECK(impl_ != nullptr);
   CHECK(draft_impl_ != nullptr);

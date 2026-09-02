@@ -59,6 +59,7 @@ cc_library(
     glog::glog
     proto::xllm_proto
     absl::flat_hash_set
+    :decode_kv_readiness
     :parallel_state
     $<$<BOOL:${USE_NPU}>:xllm_atb_layers>
     $<$<BOOL:${USE_NPU}>:unified_dlog>

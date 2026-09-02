@@ -64,6 +64,7 @@ if(USE_NPU)
     SRCS
       npu_cp_capability_test.cpp
     DEPS
+      distributed_runtime
       models
       parallel_state
       GTest::gtest_main

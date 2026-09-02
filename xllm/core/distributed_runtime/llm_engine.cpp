@@ -29,6 +29,8 @@ limitations under the License.
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <utility>
 
 #include "common/device_monitor.h"
 #include "common/interruption_bus.h"
@@ -85,6 +87,181 @@ bool contains_graph_warmup(const std::vector<Batch>& batches) {
 }
 
 }  // namespace
+
+namespace detail {
+
+bool DecodeKVReadinessCoordinator::contains(
+    const std::string& request_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledgers_.find(request_id) != ledgers_.end();
+}
+
+bool DecodeKVReadinessCoordinator::register_ledger(
+    std::shared_ptr<DecodeKVReadinessLedger> ledger) {
+  CHECK(ledger != nullptr);
+  const std::string request_id = ledger->request_id();
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledgers_.emplace(request_id, LedgerEntry{std::move(ledger), false})
+      .second;
+}
+
+std::shared_ptr<DecodeKVReadinessLedger>
+DecodeKVReadinessCoordinator::find_ledger(const std::string& request_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto entry = ledgers_.find(request_id);
+  return entry == ledgers_.end() ? nullptr : entry->second.ledger;
+}
+
+DecodeKVReadinessPollResult DecodeKVReadinessCoordinator::poll(
+    size_t worker_count,
+    const DrainWorkerFn& drain_worker) {
+  DecodeKVReadinessPollResult result;
+  std::vector<std::pair<std::string, std::shared_ptr<DecodeKVReadinessLedger>>>
+      poll_targets;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    poll_targets.reserve(ledgers_.size());
+    for (auto& entry : ledgers_) {
+      entry.second.completed_receiver_poll = false;
+      poll_targets.emplace_back(entry.first, entry.second.ledger);
+    }
+  }
+  const auto poison_poll_targets = [&poll_targets](const std::string& reason) {
+    for (const auto& poll_target : poll_targets) {
+      poll_target.second->mark_poisoned(reason);
+    }
+  };
+
+  std::vector<KVTransferNotificationDrainResult> drains;
+  drains.reserve(worker_count);
+  for (size_t worker_rank = 0; worker_rank < worker_count; ++worker_rank) {
+    drains.emplace_back(drain_worker(worker_rank));
+  }
+
+  bool all_receivers_drained = true;
+  bool receiver_poll_failed = false;
+  for (size_t worker_rank = 0; worker_rank < drains.size(); ++worker_rank) {
+    const KVTransferNotificationDrainResult& drain = drains[worker_rank];
+    if (!drain.ok || !drain.supported) {
+      all_receivers_drained = false;
+      receiver_poll_failed = true;
+      if (result.error.empty()) {
+        result.error = "Decode worker " + std::to_string(worker_rank) +
+                       " failed to drain KV transfer notifications";
+      }
+    }
+    if (drain.more_available) {
+      all_receivers_drained = false;
+    }
+  }
+  if (receiver_poll_failed) {
+    poison_poll_targets(result.error);
+  }
+
+  bool payloads_valid = true;
+  for (const KVTransferNotificationDrainResult& drain : drains) {
+    for (const std::string& payload : drain.payloads) {
+      MooncakeDecodeKVNotification notification;
+      std::string error;
+      const DecodeKVPayloadResult payload_result =
+          deserialize_mooncake_decode_kv_notification(
+              payload, &notification, &error);
+      if (payload_result != DecodeKVPayloadResult::OK) {
+        payloads_valid = false;
+        if (result.error.empty()) {
+          result.error = error;
+        }
+        std::set<std::string> referenced_requests;
+        for (const DecodeKVReceipt& receipt : notification.receipts) {
+          if (!receipt.request_id.empty()) {
+            referenced_requests.emplace(receipt.request_id);
+          }
+        }
+        if (referenced_requests.empty()) {
+          poison_poll_targets(error);
+        } else {
+          for (const std::string& referenced_request : referenced_requests) {
+            const std::shared_ptr<DecodeKVReadinessLedger> ledger =
+                find_ledger(referenced_request);
+            if (ledger != nullptr) {
+              ledger->mark_poisoned(error);
+            }
+          }
+        }
+        continue;
+      }
+
+      for (const DecodeKVReceipt& receipt : notification.receipts) {
+        const std::shared_ptr<DecodeKVReadinessLedger> ledger =
+            find_ledger(receipt.request_id);
+        if (ledger == nullptr) {
+          VLOG(1) << "Ignore delayed Decode KV receipt for inactive request, "
+                  << "request_id=" << receipt.request_id;
+          continue;
+        }
+        ledger->record(receipt);
+      }
+    }
+  }
+
+  result.ok = result.error.empty() && payloads_valid;
+  result.complete = result.ok && all_receivers_drained;
+  if (result.complete) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& poll_target : poll_targets) {
+      auto entry = ledgers_.find(poll_target.first);
+      if (entry != ledgers_.end() &&
+          entry->second.ledger == poll_target.second) {
+        entry->second.completed_receiver_poll = true;
+      }
+    }
+  }
+  return result;
+}
+
+DecodeKVReadinessSnapshot DecodeKVReadinessCoordinator::snapshot(
+    const std::string& request_id) const {
+  DecodeKVReadinessSnapshot snapshot;
+  std::shared_ptr<DecodeKVReadinessLedger> ledger;
+  bool completed_receiver_poll = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto entry = ledgers_.find(request_id);
+    if (entry == ledgers_.end()) {
+      return snapshot;
+    }
+    ledger = entry->second.ledger;
+    completed_receiver_poll = entry->second.completed_receiver_poll;
+  }
+  snapshot.found = true;
+  snapshot.ready = completed_receiver_poll && ledger->is_ready();
+  snapshot.poisoned = ledger->is_poisoned();
+  snapshot.published = ledger->was_published();
+  snapshot.attempt_epoch = ledger->attempt_epoch();
+  snapshot.allocation_generation = ledger->allocation_generation();
+  snapshot.failure_reason = ledger->failure_reason();
+  return snapshot;
+}
+
+bool DecodeKVReadinessCoordinator::try_publish(const std::string& request_id) {
+  std::shared_ptr<DecodeKVReadinessLedger> ledger;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto entry = ledgers_.find(request_id);
+    if (entry == ledgers_.end() || !entry->second.completed_receiver_poll) {
+      return false;
+    }
+    ledger = entry->second.ledger;
+  }
+  return ledger->try_publish();
+}
+
+bool DecodeKVReadinessCoordinator::discard(const std::string& request_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledgers_.erase(request_id) > 0;
+}
+
+}  // namespace detail
 
 // Extra weight pages reserved for mapping/alignment overhead.
 constexpr size_t kXTensorWeightPageSafetyMargin = 20;
@@ -882,6 +1059,127 @@ void LLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
     addrs.emplace_back(std::move(addr));
     ports.emplace_back(port);
   }
+}
+
+DecodeKVReadinessPrepareResult LLMEngine::prepare_decode_kv_readiness(
+    const std::string& request_id,
+    const DecodeKVSourceTopology& source_topology,
+    int32_t destination_dp_rank,
+    const std::vector<KVTransferMapping>& mappings) {
+  DecodeKVReadinessPrepareResult result;
+  if (request_id.empty()) {
+    result.error = "Decode KV readiness request_id must not be empty";
+    return result;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(decode_kv_readiness_generation_mutex_);
+    if (decode_kv_readiness_coordinator_.contains(request_id)) {
+      result.error = "Decode KV readiness request is already active";
+      return result;
+    }
+    if (next_decode_kv_attempt_epoch_ == std::numeric_limits<uint64_t>::max() ||
+        next_decode_kv_allocation_generation_ ==
+            std::numeric_limits<uint64_t>::max()) {
+      result.error = "Decode KV readiness generation counter exhausted";
+      return result;
+    }
+    result.attempt_epoch = next_decode_kv_attempt_epoch_++;
+    result.allocation_generation = next_decode_kv_allocation_generation_++;
+  }
+
+  std::vector<DecodeKVWorkerLayout> destination_layouts;
+  destination_layouts.reserve(worker_clients_.size());
+  for (size_t worker_rank = 0; worker_rank < worker_clients_.size();
+       ++worker_rank) {
+    const KVCacheLayoutQueryResult query =
+        worker_clients_[worker_rank]->get_kv_cache_layout();
+    if (!query.ok || !query.supported || query.serialized_manifest.empty()) {
+      result.error = "Decode worker " + std::to_string(worker_rank) +
+                     " does not expose a usable KV cache layout";
+      return result;
+    }
+
+    proto::WorkerCacheLayoutManifest proto_manifest;
+    if (!proto_manifest.ParseFromString(query.serialized_manifest)) {
+      result.error = "Decode worker " + std::to_string(worker_rank) +
+                     " returned a malformed KV cache layout";
+      return result;
+    }
+    DecodeKVWorkerLayout worker_layout;
+    worker_layout.worker_rank = static_cast<int32_t>(worker_rank);
+    const Status layout_status =
+        cache_layout_from_proto(proto_manifest, &worker_layout.manifest);
+    if (!layout_status.ok()) {
+      result.error =
+          "Decode worker " + std::to_string(worker_rank) +
+          " returned an invalid KV cache layout: " + layout_status.message();
+      return result;
+    }
+    destination_layouts.emplace_back(std::move(worker_layout));
+  }
+
+  DecodeKVExpectedManifest manifest;
+  manifest.request_id = request_id;
+  manifest.attempt_epoch = result.attempt_epoch;
+  manifest.allocation_generation = result.allocation_generation;
+  const Status contribution_status =
+      build_decode_kv_expected_contributions(source_topology,
+                                             destination_dp_rank,
+                                             mappings,
+                                             destination_layouts,
+                                             &manifest.contributions);
+  if (!contribution_status.ok()) {
+    result.error = contribution_status.message();
+    return result;
+  }
+  if (!serialize_decode_kv_expected_manifest(
+          manifest, &result.serialized_manifest, &result.error)) {
+    return result;
+  }
+
+  auto ledger = std::make_shared<DecodeKVReadinessLedger>(std::move(manifest));
+  if (ledger->is_poisoned()) {
+    result.error = ledger->failure_reason();
+    result.serialized_manifest.clear();
+    return result;
+  }
+  if (!decode_kv_readiness_coordinator_.register_ledger(std::move(ledger))) {
+    result.error = "Decode KV readiness request became active concurrently";
+    result.serialized_manifest.clear();
+    return result;
+  }
+  result.ok = true;
+  return result;
+}
+
+DecodeKVReadinessPollResult LLMEngine::poll_decode_kv_readiness(
+    size_t max_notifications_per_worker) {
+  DecodeKVReadinessPollResult result;
+  if (max_notifications_per_worker == 0) {
+    result.error = "Decode KV readiness poll limit must be positive";
+    return result;
+  }
+
+  return decode_kv_readiness_coordinator_.poll(
+      worker_clients_.size(),
+      [this, max_notifications_per_worker](size_t worker_rank) {
+        return worker_clients_[worker_rank]->drain_kv_transfer_notifications(
+            max_notifications_per_worker);
+      });
+}
+
+DecodeKVReadinessSnapshot LLMEngine::get_decode_kv_readiness(
+    const std::string& request_id) const {
+  return decode_kv_readiness_coordinator_.snapshot(request_id);
+}
+
+bool LLMEngine::try_publish_decode_kv_readiness(const std::string& request_id) {
+  return decode_kv_readiness_coordinator_.try_publish(request_id);
+}
+
+void LLMEngine::discard_decode_kv_readiness(const std::string& request_id) {
+  decode_kv_readiness_coordinator_.discard(request_id);
 }
 
 void LLMEngine::get_xtensor_info(

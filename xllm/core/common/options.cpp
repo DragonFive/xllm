@@ -65,6 +65,7 @@ std::string Options::to_string() const {
      << ", master_node_addr: " << master_node_addr().value_or("null")
      << ", instance_role: " << instance_role().to_string()
      << ", transfer_listen_port: " << transfer_listen_port()
+     << ", decode_kv_readiness_timeout_ms: " << decode_kv_readiness_timeout_ms()
      << ", nnodes: " << nnodes() << ", node_rank: " << node_rank()
      << ", enable_schedule_overlap: " << enable_schedule_overlap()
      << ", enable_disagg_pd: " << enable_disagg_pd()

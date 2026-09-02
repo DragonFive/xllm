@@ -20,6 +20,7 @@ limitations under the License.
 #include <brpc/server.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <limits>
 #include <random>
 
@@ -45,11 +46,45 @@ limitations under the License.
 #include "util/env_var.h"
 #include "util/timer.h"
 #include "util/utils.h"
+#include "util/verbose_trace_logger.h"
 
 namespace xllm {
+namespace {
+
+constexpr std::chrono::seconds kQuarantineNotificationDrainGracePeriod{30};
+
+bool kv_transfer_mapping_equal(const KVTransferMapping& lhs,
+                               const KVTransferMapping& rhs) {
+  return lhs.group_id == rhs.group_id && lhs.local_ids == rhs.local_ids &&
+         lhs.remote_ids == rhs.remote_ids &&
+         lhs.logical_block_ordinals == rhs.logical_block_ordinals &&
+         lhs.valid_tokens == rhs.valid_tokens &&
+         lhs.receipt_remote_ids == rhs.receipt_remote_ids &&
+         lhs.remote_shared_num == rhs.remote_shared_num;
+}
+
+bool kv_transfer_mappings_equal(const std::vector<KVTransferMapping>& lhs,
+                                const std::vector<KVTransferMapping>& rhs) {
+  return lhs.size() == rhs.size() &&
+         std::equal(
+             lhs.begin(), lhs.end(), rhs.begin(), kv_transfer_mapping_equal);
+}
+
+bool tensors_equal(const torch::Tensor& lhs, const torch::Tensor& rhs) {
+  if (lhs.defined() != rhs.defined()) {
+    return false;
+  }
+  if (!lhs.defined()) {
+    return true;
+  }
+  return lhs.device() == rhs.device() && torch::equal(lhs, rhs);
+}
+
+}  // namespace
 
 bool is_permanent_rejection(int32_t status_code) {
-  return status_code == kDecodeAddNewPromptTooLongStatusCode;
+  return status_code != kDecodeAddNewRequestSuccessStatusCode &&
+         status_code != kDecodeAddNewTemporaryCapacityStatusCode;
 }
 
 bool exceeds_decode_capacity(size_t num_prompt_tokens,
@@ -68,6 +103,8 @@ DisaggPDScheduler::DisaggPDScheduler(Engine* engine, const Options& options)
   if (!options_.instance_role().has_value()) {
     LOG(FATAL) << "Instance type is not set in disagg pd mode.";
   }
+  CHECK_GE(options_.decode_kv_readiness_timeout_ms(), 0)
+      << "Decode KV readiness timeout must be non-negative.";
 
   // Only initialize for non-OOC mode
   // OOC mode (PDOOCScheduler) will handle initialization in its own constructor
@@ -302,6 +339,9 @@ void DisaggPDScheduler::start_rpc_server() {
 }
 
 void DisaggPDScheduler::step(const absl::Duration& timeout) {
+  if (options_.instance_role() == InstanceRole::DECODE) {
+    poll_decode_kv_readiness();
+  }
   ContinuousScheduler::step(timeout);
   // Send first generation token to decode instance.
   // Always check (not gated on last_step_prefill_) because chunked prefill
@@ -315,6 +355,16 @@ void DisaggPDScheduler::step(const absl::Duration& timeout) {
 
 bool DisaggPDScheduler::enqueue_ready_request(
     std::shared_ptr<Request> request) {
+  // Decode admission precedes Prefill KV allocation, so a fresh Sequence still
+  // carries the unassigned DP-rank sentinel here. Single-DP topology has only
+  // one valid source rank; pin it before dispatch serializes source_dp_rank.
+  if (options_.dp_size() == 1) {
+    for (const std::unique_ptr<Sequence>& sequence : request->sequences()) {
+      if (sequence->dp_rank() < 0) {
+        sequence->set_dp_rank(0);
+      }
+    }
+  }
   if (request->offline()) {
     prefill_request_queue_offline_.enqueue(std::move(request));
     return true;
@@ -477,6 +527,7 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_json_object(requests[i]->state().sampling_param.json_object);
       req->set_json_reasoning_enabled(
           requests[i]->state().json_reasoning_enabled);
+      req->set_source_dp_rank(requests[i]->sequences()[0]->dp_rank());
       //*reqs.mutable_reqs()->Add() = req;
     }
     reqs.mutable_cluster_infos()->mutable_cluster_ids()->Add(
@@ -486,6 +537,9 @@ void DisaggPDScheduler::dispatch_requests() {
     reqs.mutable_cluster_infos()->mutable_ports()->Add(
         instance_info_.ports.begin(), instance_info_.ports.end());
     reqs.mutable_cluster_infos()->set_dp_size(options_.dp_size());
+    reqs.mutable_cluster_infos()->set_cp_size(options_.cp_size());
+    reqs.mutable_cluster_infos()->set_kv_split_size(
+        ::xllm::ParallelConfig::get_instance().kv_split_size_effective());
     const double allocation_prepare_seconds =
         decode_allocation_timer.elapsed_seconds();
 
@@ -522,13 +576,10 @@ void DisaggPDScheduler::dispatch_requests() {
       linked_instance_.emplace(selected_instance);
     }
     for (size_t i = 0; i < requests.size(); ++i) {
-      if (resps.resps()[i].status_code() != 200) {
-        if (is_permanent_rejection(resps.resps()[i].status_code())) {
-          LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
-                     << requests[i]->request_id() << ", prompt_tokens="
-                     << requests[i]->state().prompt_tokens.size()
-                     << ", selected_instance=" << selected_instance;
-          do_permanent_rejection(requests[i]);
+      const int32_t status_code = resps.resps()[i].status_code();
+      if (status_code != kDecodeAddNewRequestSuccessStatusCode) {
+        if (is_permanent_rejection(status_code)) {
+          do_permanent_rejection(requests[i], status_code);
           continue;
         }
         // push back to prefill_request_queue_
@@ -550,9 +601,17 @@ void DisaggPDScheduler::dispatch_requests() {
             mapping.remote_ids.assign(proto_group.ids().begin(),
                                       proto_group.ids().end());
             mapping.remote_shared_num = proto_group.remote_shared_num();
+            mapping.logical_block_ordinals.assign(
+                proto_group.logical_block_ordinals().begin(),
+                proto_group.logical_block_ordinals().end());
+            mapping.valid_tokens.assign(proto_group.valid_tokens().begin(),
+                                        proto_group.valid_tokens().end());
             info.mappings.emplace_back(std::move(mapping));
           }
           info.dp_rank = resps.resps()[i].dp_rank();
+          info.decode_kv_manifest = resp.decode_kv_manifest();
+          info.attempt_epoch = resp.attempt_epoch();
+          info.allocation_generation = resp.allocation_generation();
           // TODO: remote_instances_info_ is not multi-thread safe.
           info.remote_instance_info = remote_instances_info_[selected_instance];
 
@@ -575,14 +634,16 @@ void DisaggPDScheduler::dispatch_requests() {
 
           sequence->kv_state().set_transfer_kv_info(std::move(info));
 
-          // Compress per-group transfer cursors to the D-side shared count.
-          // advance_group_transfer_block_idx is monotonic max, so this is a
-          // no-op if the group's remote_shared_num is 0 (SWA / LINEAR under
-          // DECODE, or D that got no prefix cache hit); when it is >0, P
-          // starts pushing at the first block D actually needs, skipping the
-          // shared prefix without touching P's own local shared_num.
+          // Compress per-group transfer cursors to the D-side shared prefix.
+          // Decode reports block-scoped shared counts in destination physical
+          // blocks. KV-split source cursors use wider logical blocks, so only
+          // fully shared source blocks advance the cursor; an odd physical
+          // count leaves the partially shared source block eligible to PUSH.
           const auto& mappings =
               sequence->kv_state().transfer_kv_info()->mappings;
+          const int32_t kv_split_size =
+              ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
+          CHECK_GT(kv_split_size, 0);
           for (const KVTransferMapping& mapping : mappings) {
             if (mapping.remote_shared_num == 0) {
               continue;
@@ -594,13 +655,17 @@ void DisaggPDScheduler::dispatch_requests() {
                          << mapping.group_id;
               continue;
             }
+            size_t shared_source_blocks =
+                static_cast<size_t>(mapping.remote_shared_num);
+            if (is_kv_split_cache_block_type(block_type.value())) {
+              shared_source_blocks /= static_cast<size_t>(kv_split_size);
+            }
             if (block_type.value() == BlockType::KV) {
               sequence->kv_state().advance_transfer_block_idx(
-                  static_cast<size_t>(mapping.remote_shared_num));
+                  shared_source_blocks);
             } else {
               sequence->kv_state().advance_group_transfer_block_idx(
-                  block_type.value(),
-                  static_cast<size_t>(mapping.remote_shared_num));
+                  block_type.value(), shared_source_blocks);
             }
           }
         }
@@ -710,6 +775,12 @@ void DisaggPDScheduler::prefill_send_first_generation() {
             request->sequences()[0]->first_token().value().token_top_logprobs);
       }
       gen->set_kv_cache_transfer_mode(options_.kv_cache_transfer_mode());
+      const std::optional<TransferKVInfo>& transfer_info =
+          request->sequences()[0]->kv_state().transfer_kv_info();
+      if (transfer_info.has_value()) {
+        gen->set_attempt_epoch(transfer_info->attempt_epoch);
+        gen->set_allocation_generation(transfer_info->allocation_generation);
+      }
       // PUSH is completed before FirstGeneration. Only native PULL needs
       // source cache metadata in this request.
       if (options_.kv_cache_transfer_mode() == "PULL") {
@@ -823,6 +894,8 @@ bool DisaggPDScheduler::decode_schedule(
     const std::string& prefill_instance_name) {
   CHECK(request != nullptr);
   CHECK(!request->sequences().empty());
+  const DecodeKVReadinessSnapshot readiness =
+      engine_->get_decode_kv_readiness(request->request_id());
 
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
@@ -833,10 +906,27 @@ bool DisaggPDScheduler::decode_schedule(
       kv_cache_manager_->deallocate(request.get());
       return false;
     }
+    if (quarantined_requests_.find(request->request_id()) !=
+        quarantined_requests_.end()) {
+      LOG(ERROR) << "Decode reject request_id retained in KV quarantine: "
+                 << request->request_id();
+      kv_cache_manager_->deallocate(request.get());
+      return false;
+    }
     received_request_map_[request->request_id()] = request;
     instance_to_received_requests_map_[prefill_instance_name].insert(
         request->request_id());
     request_to_instance_map_[request->request_id()] = prefill_instance_name;
+    if (readiness.found) {
+      StrictDecodePendingState state;
+      state.attempt_epoch = readiness.attempt_epoch;
+      state.allocation_generation = readiness.allocation_generation;
+      state.deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(options_.decode_kv_readiness_timeout_ms());
+      strict_decode_pending_states_.emplace(request->request_id(),
+                                            std::move(state));
+    }
   }
 
   return true;
@@ -857,10 +947,30 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     int32_t src_dp_size,
     int32_t src_dp_rank,
     torch::Tensor mtp_bootstrap_embedding,
-    int32_t num_cached_tokens) {
-  Timer receive_timer;
-  // push to request_queue_, and will be executed by engine.
+    int32_t num_cached_tokens,
+    uint64_t attempt_epoch,
+    uint64_t allocation_generation) {
+  DecodeFirstGeneration first_generation;
+  first_generation.token_id = token_id;
+  first_generation.has_logprob = has_logprob;
+  first_generation.logprob = logprob;
+  first_generation.time_to_first_token_latency_seconds =
+      time_to_first_token_latency_seconds;
+  first_generation.top_tokens = std::move(top_tokens);
+  first_generation.top_logprobs = std::move(top_logprobs);
+  first_generation.kv_cache_transfer_mode = kv_cache_transfer_mode;
+  first_generation.src_cluster_ids = std::move(src_cluster_ids);
+  first_generation.src_addrs = std::move(src_addrs);
+  first_generation.source_mappings = std::move(source_mappings);
+  first_generation.src_dp_size = src_dp_size;
+  first_generation.src_dp_rank = src_dp_rank;
+  first_generation.mtp_bootstrap_embedding = std::move(mtp_bootstrap_embedding);
+  first_generation.num_cached_tokens = num_cached_tokens;
+  first_generation.attempt_epoch = attempt_epoch;
+  first_generation.allocation_generation = allocation_generation;
+
   std::shared_ptr<Request> request = nullptr;
+  std::string quarantine_reason;
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
     auto it = received_request_map_.find(req_id);
@@ -868,68 +978,149 @@ bool DisaggPDScheduler::decode_recv_first_generation(
       LOG(ERROR) << "Failed to find request, request id: " << req_id;
       return false;
     }
-    request = it->second;
-    received_request_map_.erase(it);
+    auto strict_it = strict_decode_pending_states_.find(req_id);
+    if (strict_it != strict_decode_pending_states_.end()) {
+      StrictDecodePendingState& pending = strict_it->second;
+      if (first_generation.kv_cache_transfer_mode != "PUSH" ||
+          attempt_epoch != pending.attempt_epoch ||
+          allocation_generation != pending.allocation_generation) {
+        quarantine_reason =
+            "FirstGeneration identity does not match strict Decode KV "
+            "readiness";
+      } else if (pending.first_generation.has_value()) {
+        const DecodeFirstGeneration& previous = *pending.first_generation;
+        const bool identical =
+            previous.token_id == first_generation.token_id &&
+            previous.has_logprob == first_generation.has_logprob &&
+            previous.logprob == first_generation.logprob &&
+            previous.time_to_first_token_latency_seconds ==
+                first_generation.time_to_first_token_latency_seconds &&
+            previous.top_tokens == first_generation.top_tokens &&
+            previous.top_logprobs == first_generation.top_logprobs &&
+            previous.kv_cache_transfer_mode ==
+                first_generation.kv_cache_transfer_mode &&
+            previous.src_cluster_ids == first_generation.src_cluster_ids &&
+            previous.src_addrs == first_generation.src_addrs &&
+            kv_transfer_mappings_equal(previous.source_mappings,
+                                       first_generation.source_mappings) &&
+            previous.src_dp_size == first_generation.src_dp_size &&
+            previous.src_dp_rank == first_generation.src_dp_rank &&
+            tensors_equal(previous.mtp_bootstrap_embedding,
+                          first_generation.mtp_bootstrap_embedding) &&
+            previous.num_cached_tokens == first_generation.num_cached_tokens &&
+            previous.attempt_epoch == first_generation.attempt_epoch &&
+            previous.allocation_generation ==
+                first_generation.allocation_generation;
+        if (identical) {
+          return true;
+        }
+        quarantine_reason =
+            "Conflicting duplicate FirstGeneration for strict Decode KV "
+            "readiness";
+      } else {
+        pending.first_generation.emplace(std::move(first_generation));
+        return true;
+      }
+    }
+    if (!quarantine_reason.empty()) {
+      // Keep the request linked until quarantine_decode_request() moves it to
+      // the non-reusable quarantine map after releasing this mutex.
+    } else {
+      request = it->second;
+      received_request_map_.erase(it);
 
-    auto inst_it = request_to_instance_map_.find(req_id);
-    if (inst_it != request_to_instance_map_.end()) {
-      instance_to_received_requests_map_[inst_it->second].erase(req_id);
-      request_to_instance_map_.erase(inst_it);
+      auto inst_it = request_to_instance_map_.find(req_id);
+      if (inst_it != request_to_instance_map_.end()) {
+        instance_to_received_requests_map_[inst_it->second].erase(req_id);
+        request_to_instance_map_.erase(inst_it);
+      }
     }
   }
+
+  if (!quarantine_reason.empty()) {
+    quarantine_decode_request(req_id, quarantine_reason);
+    engine_->discard_decode_kv_readiness(req_id);
+    return false;
+  }
+  return complete_decode_first_generation(
+      request,
+      std::move(first_generation),
+      /*release_allocation_on_failure=*/true);
+}
+
+bool DisaggPDScheduler::complete_decode_first_generation(
+    const std::shared_ptr<Request>& request,
+    DecodeFirstGeneration first_generation,
+    bool release_allocation_on_failure) {
+  CHECK(request != nullptr);
+  Timer receive_timer;
+  const std::string& req_id = request->request_id();
   auto& sequences = request->sequences();
   if (sequences.empty() || sequences[0] == nullptr) {
     LOG(ERROR) << "Request has no valid sequences, request_id: " << req_id;
-    for (auto& sequence : sequences) {
-      if (sequence != nullptr) {
-        kv_cache_manager_->deallocate(sequence.get());
+    if (release_allocation_on_failure) {
+      for (auto& sequence : sequences) {
+        if (sequence != nullptr) {
+          kv_cache_manager_->deallocate(sequence.get());
+        }
       }
     }
     return false;
   }
   Sequence* sequence = request->sequences()[0].get();
-  if (num_cached_tokens < 0 ||
-      static_cast<size_t>(num_cached_tokens) > sequence->num_prompt_tokens()) {
+  if (first_generation.num_cached_tokens < 0 ||
+      static_cast<size_t>(first_generation.num_cached_tokens) >
+          sequence->num_prompt_tokens()) {
     LOG(WARNING) << "Invalid num_cached_tokens from prefill, request_id: "
-                 << req_id << ", num_cached_tokens: " << num_cached_tokens
+                 << req_id << ", num_cached_tokens: "
+                 << first_generation.num_cached_tokens
                  << ", num_prompt_tokens: " << sequence->num_prompt_tokens()
                  << ". Falling back to 0.";
-    num_cached_tokens = 0;
+    first_generation.num_cached_tokens = 0;
   }
   request->record_num_prefix_cache_tokens(
-      static_cast<size_t>(num_cached_tokens));
+      static_cast<size_t>(first_generation.num_cached_tokens));
   const bool need_mtp_bootstrap = options_.num_speculative_tokens() > 0;
   if (need_mtp_bootstrap) {
     const int32_t slot_id = sequence->get_embedding_block_id();
     if (slot_id < 0) {
       LOG(ERROR) << "Invalid MTP bootstrap slot, request_id: " << req_id;
-      kv_cache_manager_->deallocate(request.get());
+      if (release_allocation_on_failure) {
+        kv_cache_manager_->deallocate(request.get());
+      }
       return false;
     }
-    if (token_id < 0 ||
-        token_id > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    if (first_generation.token_id < 0 ||
+        first_generation.token_id >
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
       LOG(ERROR) << "Invalid MTP bootstrap token, request_id: " << req_id
-                 << ", token_id: " << token_id;
-      kv_cache_manager_->deallocate(request.get());
+                 << ", token_id: " << first_generation.token_id;
+      if (release_allocation_on_failure) {
+        kv_cache_manager_->deallocate(request.get());
+      }
       return false;
     }
-    if (!mtp_bootstrap_embedding.defined()) {
+    if (!first_generation.mtp_bootstrap_embedding.defined()) {
       LOG(ERROR) << "Missing MTP bootstrap embedding, request_id: " << req_id;
-      kv_cache_manager_->deallocate(request.get());
+      if (release_allocation_on_failure) {
+        kv_cache_manager_->deallocate(request.get());
+      }
       return false;
     }
 
-    sequence->update_mtp_bootstrap_embedding(mtp_bootstrap_embedding);
+    sequence->update_mtp_bootstrap_embedding(
+        first_generation.mtp_bootstrap_embedding);
   }
 
-  Token first_token(token_id);
-  if (has_logprob) {
-    first_token.logprob = logprob;
-    if (!top_tokens.empty() && !top_logprobs.empty()) {
+  Token first_token(first_generation.token_id);
+  if (first_generation.has_logprob) {
+    first_token.logprob = first_generation.logprob;
+    if (!first_generation.top_tokens.empty() &&
+        !first_generation.top_logprobs.empty()) {
       // NOTE: slice vector here, to avoid copy
       // so we need keep the vector `top_tokens` and `top_logprobs` lifetime
-      first_token.top_tokens = top_tokens;
-      first_token.top_logprobs = top_logprobs;
+      first_token.top_tokens = first_generation.top_tokens;
+      first_token.top_logprobs = first_generation.top_logprobs;
     }
   }
   // Enable checking whether to skip the prefill token
@@ -939,7 +1130,7 @@ bool DisaggPDScheduler::decode_recv_first_generation(
 
   // update latency metrics
   sequence->set_time_to_first_token_latency_seconds(
-      time_to_first_token_latency_seconds);
+      first_generation.time_to_first_token_latency_seconds);
   // Rebase the ITL clock to the moment Decode receives the first token. The
   // prefill->decode transfer cost is attributed to TTFT, not ITL;
   // reconstructing prefill's first-token timestamp would require cross-machine
@@ -962,15 +1153,17 @@ bool DisaggPDScheduler::decode_recv_first_generation(
 
   // Pull KV cache only in native PULL mode. Heterogeneous PUSH writes directly
   // into the final destination tensors before FirstGeneration is sent.
-  if (kv_cache_transfer_mode == "PULL") {
+  if (first_generation.kv_cache_transfer_mode == "PULL") {
     Timer pull_timer;
-    for (KVTransferMapping& mapping : source_mappings) {
+    for (KVTransferMapping& mapping : first_generation.source_mappings) {
       const std::optional<BlockType> block_type =
           block_type_from_cache_group_id(mapping.group_id);
       if (!block_type.has_value()) {
         LOG(ERROR) << "Unknown source KV transfer group, request_id=" << req_id
                    << ", group_id=" << mapping.group_id;
-        kv_cache_manager_->deallocate(request.get());
+        if (release_allocation_on_failure) {
+          kv_cache_manager_->deallocate(request.get());
+        }
         return false;
       }
 
@@ -1003,21 +1196,26 @@ bool DisaggPDScheduler::decode_recv_first_generation(
                    << ", group_id=" << mapping.group_id
                    << ", local=" << mapping.local_ids.size()
                    << ", remote=" << mapping.remote_ids.size();
-        kv_cache_manager_->deallocate(request.get());
+        if (release_allocation_on_failure) {
+          kv_cache_manager_->deallocate(request.get());
+        }
         return false;
       }
     }
 
     const int32_t dst_dp_rank = sequence->dp_rank();
-    const bool pulled = engine_->pull_kv_blocks(src_dp_size,
-                                                src_dp_rank,
-                                                src_cluster_ids,
-                                                src_addrs,
-                                                dst_dp_rank,
-                                                source_mappings);
+    const bool pulled =
+        engine_->pull_kv_blocks(first_generation.src_dp_size,
+                                first_generation.src_dp_rank,
+                                first_generation.src_cluster_ids,
+                                first_generation.src_addrs,
+                                dst_dp_rank,
+                                first_generation.source_mappings);
     if (!pulled) {
       LOG(ERROR) << "Failed to pull KV blocks, request_id: " << req_id;
-      kv_cache_manager_->deallocate(request.get());
+      if (release_allocation_on_failure) {
+        kv_cache_manager_->deallocate(request.get());
+      }
       return false;
     }
     VLOG(1) << "Decode KV restore request_id=" << req_id
@@ -1027,14 +1225,180 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   Timer enqueue_timer;
   if (!request_queue_.write(request)) {
     LOG(ERROR) << "Failed to enqueue decode request, request_id: " << req_id;
-    kv_cache_manager_->deallocate(request.get());
+    if (release_allocation_on_failure) {
+      kv_cache_manager_->deallocate(request.get());
+    }
     return false;
   }
+  XLLM_VERBOSE_TRACE()
+      << "event=decode_request_enqueued request-id=" << req_id
+      << " transfer-mode=" << first_generation.kv_cache_transfer_mode
+      << " handoff-source="
+      << (first_generation.kv_cache_transfer_mode == "PULL"
+              ? "decode-pull-completion"
+          : release_allocation_on_failure ? "prefill-first-generation"
+                                          : "receiver-visible-receipts")
+      << " receiver-coverage-verified=" << !release_allocation_on_failure
+      << " source-metadata-count="
+      << static_cast<uint64_t>(first_generation.src_cluster_ids.size())
+      << " cache-group-count="
+      << static_cast<uint64_t>(first_generation.source_mappings.size());
   VLOG(1) << "Decode first-generation request_id=" << req_id
           << ", prepare_ms=" << prepare_seconds * 1000.0
           << ", enqueue_ms=" << enqueue_timer.elapsed_seconds() * 1000.0
           << ", total_ms=" << receive_timer.elapsed_seconds() * 1000.0;
   return true;
+}
+
+void DisaggPDScheduler::quarantine_decode_request(const std::string& request_id,
+                                                  const std::string& reason) {
+  std::shared_ptr<Request> request;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    const auto request_it = received_request_map_.find(request_id);
+    if (request_it == received_request_map_.end()) {
+      return;
+    }
+    request = std::move(request_it->second);
+    received_request_map_.erase(request_it);
+    strict_decode_pending_states_.erase(request_id);
+
+    const auto instance_it = request_to_instance_map_.find(request_id);
+    if (instance_it != request_to_instance_map_.end()) {
+      instance_to_received_requests_map_[instance_it->second].erase(request_id);
+      request_to_instance_map_.erase(instance_it);
+    }
+    quarantined_requests_[request_id] = request;
+    quarantine_drain_deadline_ = std::chrono::steady_clock::now() +
+                                 kQuarantineNotificationDrainGracePeriod;
+  }
+  LOG(ERROR) << "Quarantine strict Decode KV request, request_id=" << request_id
+             << ": " << reason;
+  response_processor_->process_failed_request(request,
+                                              {StatusCode::UNKNOWN, reason});
+}
+
+void DisaggPDScheduler::poll_decode_kv_readiness() {
+  std::vector<std::string> request_ids;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    const std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    const bool drain_quarantined_notifications =
+        quarantine_drain_deadline_.has_value() &&
+        now < *quarantine_drain_deadline_;
+    if (strict_decode_pending_states_.empty() &&
+        !drain_quarantined_notifications) {
+      quarantine_drain_deadline_.reset();
+      return;
+    }
+    request_ids.reserve(strict_decode_pending_states_.size());
+    for (const auto& state : strict_decode_pending_states_) {
+      request_ids.emplace_back(state.first);
+    }
+  }
+
+  constexpr size_t kMaxNotificationsPerWorker = 256;
+  const DecodeKVReadinessPollResult poll =
+      engine_->poll_decode_kv_readiness(kMaxNotificationsPerWorker);
+  if (!poll.ok) {
+    VLOG(1) << "Decode KV readiness poll did not complete: " << poll.error;
+  }
+
+  for (const std::string& request_id : request_ids) {
+    const DecodeKVReadinessSnapshot readiness =
+        engine_->get_decode_kv_readiness(request_id);
+    if (!readiness.found) {
+      quarantine_decode_request(
+          request_id, "Strict Decode KV readiness ledger disappeared");
+      continue;
+    }
+    if (readiness.poisoned) {
+      quarantine_decode_request(request_id, readiness.failure_reason);
+      engine_->discard_decode_kv_readiness(request_id);
+      continue;
+    }
+
+    std::shared_ptr<Request> request;
+    DecodeFirstGeneration first_generation;
+    std::string timeout_reason;
+    {
+      std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+      const auto state_it = strict_decode_pending_states_.find(request_id);
+      const auto request_it = received_request_map_.find(request_id);
+      if (state_it == strict_decode_pending_states_.end() ||
+          request_it == received_request_map_.end()) {
+        continue;
+      }
+      StrictDecodePendingState& pending = state_it->second;
+      const bool has_first_generation = pending.first_generation.has_value();
+      const bool timed_out =
+          std::chrono::steady_clock::now() >= pending.deadline;
+      if (!poll.complete || !readiness.ready || !has_first_generation) {
+        if (!timed_out) {
+          continue;
+        }
+        if (!poll.complete) {
+          timeout_reason =
+              "Timed out draining strict Decode KV receiver notifications";
+        } else if (!readiness.ready && !has_first_generation) {
+          timeout_reason =
+              "Timed out waiting for strict Decode KV receiver receipts and "
+              "FirstGeneration";
+        } else if (!readiness.ready) {
+          timeout_reason =
+              "Timed out waiting for strict Decode KV receiver receipts";
+        } else {
+          timeout_reason =
+              "Timed out waiting for strict Decode FirstGeneration";
+        }
+      } else if (!engine_->try_publish_decode_kv_readiness(request_id)) {
+        if (timed_out) {
+          timeout_reason = "Timed out publishing strict Decode KV readiness";
+        } else {
+          continue;
+        }
+      } else {
+        request = std::move(request_it->second);
+        first_generation = std::move(*pending.first_generation);
+        received_request_map_.erase(request_it);
+        strict_decode_pending_states_.erase(state_it);
+
+        const auto instance_it = request_to_instance_map_.find(request_id);
+        if (instance_it != request_to_instance_map_.end()) {
+          instance_to_received_requests_map_[instance_it->second].erase(
+              request_id);
+          request_to_instance_map_.erase(instance_it);
+        }
+      }
+    }
+    if (!timeout_reason.empty()) {
+      quarantine_decode_request(request_id, timeout_reason);
+      engine_->discard_decode_kv_readiness(request_id);
+      continue;
+    }
+    if (request == nullptr) {
+      continue;
+    }
+
+    const bool completed = complete_decode_first_generation(
+        request,
+        std::move(first_generation),
+        /*release_allocation_on_failure=*/false);
+    if (!completed) {
+      {
+        std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+        quarantined_requests_[request_id] = request;
+        quarantine_drain_deadline_ = std::chrono::steady_clock::now() +
+                                     kQuarantineNotificationDrainGracePeriod;
+      }
+      response_processor_->process_failed_request(
+          request,
+          {StatusCode::UNKNOWN,
+           "Failed to materialize strict Decode FirstGeneration"});
+    }
+    engine_->discard_decode_kv_readiness(request_id);
+  }
 }
 
 bool DisaggPDScheduler::try_allocate(Sequence* sequence) {
@@ -1067,12 +1431,26 @@ bool DisaggPDScheduler::exceeds_decode_capacity(Sequence* sequence) const {
 }
 
 void DisaggPDScheduler::do_permanent_rejection(
-    const std::shared_ptr<Request>& request) {
+    const std::shared_ptr<Request>& request,
+    int32_t status_code) {
   CHECK(request != nullptr);
-  response_processor_->process_failed_request(
-      request,
-      {StatusCode::RESOURCE_EXHAUSTED,
-       "Request prompt exceeds decode KV cache capacity"});
+  if (status_code == kDecodeAddNewPromptTooLongStatusCode) {
+    LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
+               << request->request_id()
+               << ", prompt_tokens=" << request->state().prompt_tokens.size()
+               << ", status_code=" << status_code;
+    response_processor_->process_failed_request(
+        request,
+        {StatusCode::RESOURCE_EXHAUSTED,
+         "Request prompt exceeds decode KV cache capacity"});
+  } else {
+    const std::string message =
+        "Decode rejected request during admission, status_code=" +
+        std::to_string(status_code);
+    LOG(ERROR) << message << ", request_id=" << request->request_id();
+    response_processor_->process_failed_request(request,
+                                                {StatusCode::UNKNOWN, message});
+  }
   kv_cache_manager_->deallocate(request.get());
   std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
   req_to_channel_map_.erase(request->request_id());
@@ -1149,16 +1527,34 @@ bool DisaggPDScheduler::unlink_instance(
     const int32_t dp_size,
     const int32_t src_kv_split_size) {
   // Clear received requests from this instance
+  std::vector<std::pair<std::string, std::shared_ptr<Request>>> strict_requests;
   {
     std::lock_guard<std::mutex> lock(received_request_map_mutex_);
     auto it = instance_to_received_requests_map_.find(instance_name);
     if (it != instance_to_received_requests_map_.end()) {
       for (const auto& req_id : it->second) {
+        auto request_it = received_request_map_.find(req_id);
+        if (request_it != received_request_map_.end() &&
+            strict_decode_pending_states_.erase(req_id) > 0) {
+          std::shared_ptr<Request> request = std::move(request_it->second);
+          quarantined_requests_[req_id] = request;
+          quarantine_drain_deadline_ = std::chrono::steady_clock::now() +
+                                       kQuarantineNotificationDrainGracePeriod;
+          strict_requests.emplace_back(req_id, std::move(request));
+        }
         received_request_map_.erase(req_id);
         request_to_instance_map_.erase(req_id);
       }
       instance_to_received_requests_map_.erase(it);
     }
+  }
+  for (const auto& strict_request : strict_requests) {
+    engine_->discard_decode_kv_readiness(strict_request.first);
+    response_processor_->process_failed_request(
+        strict_request.second,
+        {StatusCode::UNKNOWN,
+         "Prefill instance unlinked before strict Decode KV readiness "
+         "completed"});
   }
 
   std::lock_guard<std::mutex> lock(linked_instances_mutex_);

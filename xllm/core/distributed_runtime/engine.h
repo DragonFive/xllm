@@ -22,6 +22,7 @@ limitations under the License.
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/kv_cache_transfer/decode_kv_readiness.h"
 #include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -113,6 +114,35 @@ class Engine {
                               std::vector<uint16_t>& ports) {
     NOT_IMPLEMENTED();
   };
+
+  virtual DecodeKVReadinessPrepareResult prepare_decode_kv_readiness(
+      const std::string& /*request_id*/,
+      const DecodeKVSourceTopology& /*source_topology*/,
+      int32_t /*destination_dp_rank*/,
+      const std::vector<KVTransferMapping>& /*mappings*/) {
+    DecodeKVReadinessPrepareResult result;
+    result.error = "Decode KV readiness is not supported by this engine";
+    return result;
+  }
+
+  virtual DecodeKVReadinessPollResult poll_decode_kv_readiness(
+      size_t /*max_notifications_per_worker*/) {
+    DecodeKVReadinessPollResult result;
+    result.error = "Decode KV readiness is not supported by this engine";
+    return result;
+  }
+
+  virtual DecodeKVReadinessSnapshot get_decode_kv_readiness(
+      const std::string& /*request_id*/) const {
+    return {};
+  }
+
+  virtual bool try_publish_decode_kv_readiness(
+      const std::string& /*request_id*/) {
+    return false;
+  }
+
+  virtual void discard_decode_kv_readiness(const std::string& /*request_id*/) {}
 
   // Get XTensor info for etcd registration (from dp group 0)
   // worker_free_phy_pages: free pages per worker

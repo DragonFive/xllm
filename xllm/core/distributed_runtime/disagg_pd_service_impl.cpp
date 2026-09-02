@@ -17,8 +17,11 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
+
 #include "common/global_flags.h"
 #include "common/types.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "distributed_runtime/llm_engine.h"
@@ -200,21 +203,10 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         resp->set_status_code(kDecodeAddNewPromptTooLongStatusCode);
       } else {
         // Current cache pressure can be relieved, so Prefill may retry.
-        resp->set_status_code(404);
+        resp->set_status_code(kDecodeAddNewTemporaryCapacityStatusCode);
       }
     } else {
-      // push the request to scheduler request buffer
-      bool success =
-          scheduler_->decode_schedule(new_request, request->prefill_name());
-      if (!success) {
-        LOG(ERROR) << "Failed to schedule new decode instance request: "
-                   << req.req_id();
-        // request and blocks are released in scheduler
-        resp->set_status_code(500);
-        continue;
-      }
-
-      auto dp_rank = sequence->dp_rank();
+      const int32_t dp_rank = sequence->dp_rank();
       resp->set_dp_rank(dp_rank);
 
       std::vector<int32_t> block_ids;
@@ -232,7 +224,17 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
           group->set_remote_shared_num(static_cast<uint32_t>(
               sequence->kv_state().shared_blocks_num(block_type)));
           group->mutable_ids()->Reserve(blocks_ptr->size());
-          for (const auto& block : *blocks_ptr) {
+          group->mutable_logical_block_ordinals()->Reserve(blocks_ptr->size());
+          group->mutable_valid_tokens()->Reserve(blocks_ptr->size());
+          uint32_t block_size = 0;
+          for (const Block& block : *blocks_ptr) {
+            if (block.is_valid()) {
+              block_size = block.size();
+              break;
+            }
+          }
+          size_t logical_ordinal = 0;
+          for (const Block& block : *blocks_ptr) {
             // Invalid placeholders are legitimate for SWA: the sliding
             // window release loop leaves moved-from Blocks in place so
             // positional indexing stays stable, and both P and D produce
@@ -250,6 +252,18 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
                   << "non-SWA leaf, group_id=" << cache_group_id(block_type);
             }
             group->mutable_ids()->Add(static_cast<uint64_t>(block_id));
+            group->add_logical_block_ordinals(logical_ordinal);
+            uint32_t valid_tokens = 0;
+            if (block.is_valid() && block_size > 0) {
+              const size_t token_begin = logical_ordinal * block_size;
+              if (token_begin < sequence->num_prompt_tokens()) {
+                valid_tokens = static_cast<uint32_t>(
+                    std::min(static_cast<size_t>(block_size),
+                             sequence->num_prompt_tokens() - token_begin));
+              }
+            }
+            group->add_valid_tokens(valid_tokens);
+            ++logical_ordinal;
           }
         }
       } else {
@@ -263,9 +277,20 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         group->set_group_id(cache_group_id(BlockType::KV));
         group->set_remote_shared_num(static_cast<uint32_t>(shared_num));
         group->mutable_ids()->Reserve(blocks.size() - shared_num);
+        group->mutable_logical_block_ordinals()->Reserve(blocks.size() -
+                                                         shared_num);
+        group->mutable_valid_tokens()->Reserve(blocks.size() - shared_num);
         for (size_t i = shared_num; i < blocks.size(); i++) {
-          int32_t block_id = blocks[i].id();
+          const int32_t block_id = blocks[i].id();
           group->mutable_ids()->Add(block_id);
+          group->add_logical_block_ordinals(i);
+          const size_t token_begin = i * blocks[i].size();
+          const size_t valid_tokens =
+              token_begin < sequence->num_prompt_tokens()
+                  ? std::min(static_cast<size_t>(blocks[i].size()),
+                             sequence->num_prompt_tokens() - token_begin)
+                  : 0;
+          group->add_valid_tokens(static_cast<uint32_t>(valid_tokens));
           block_ids.push_back(block_id);
         }
       }
@@ -303,7 +328,73 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
         }
       }
 
-      resp->set_status_code(200);
+      const bool strict_readiness_enabled =
+          ::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_mode() ==
+              "PUSH" &&
+          request->cluster_infos().kv_split_size() > 1;
+      bool strict_readiness = false;
+      if (strict_readiness_enabled) {
+        DecodeKVSourceTopology source_topology;
+        source_topology.world_size =
+            request->cluster_infos().cluster_ids_size();
+        source_topology.dp_size = request->cluster_infos().dp_size();
+        source_topology.cp_size = request->cluster_infos().cp_size();
+        source_topology.kv_split_size =
+            request->cluster_infos().kv_split_size();
+        source_topology.dp_rank = req.source_dp_rank();
+
+        std::vector<KVTransferMapping> mappings;
+        mappings.reserve(resp->groups_size());
+        for (const proto::KVTransferGroup& proto_group : resp->groups()) {
+          KVTransferMapping mapping;
+          mapping.group_id = proto_group.group_id();
+          mapping.remote_ids.assign(proto_group.ids().begin(),
+                                    proto_group.ids().end());
+          mapping.logical_block_ordinals.assign(
+              proto_group.logical_block_ordinals().begin(),
+              proto_group.logical_block_ordinals().end());
+          mapping.valid_tokens.assign(proto_group.valid_tokens().begin(),
+                                      proto_group.valid_tokens().end());
+          mapping.remote_shared_num = proto_group.remote_shared_num();
+          mappings.emplace_back(std::move(mapping));
+        }
+        strict_readiness = has_decode_kv_receiver_contributions(mappings);
+        if (!strict_readiness) {
+          VLOG(5) << "Decode allocation requires no remote KV contributions, "
+                  << "request_id=" << req.req_id();
+        }
+        if (strict_readiness) {
+          const DecodeKVReadinessPrepareResult prepare =
+              engine_->prepare_decode_kv_readiness(
+                  req.req_id(), source_topology, dp_rank, mappings);
+          if (!prepare.ok) {
+            LOG(ERROR) << "Failed to prepare strict Decode KV readiness, "
+                       << "request_id=" << req.req_id() << ": "
+                       << prepare.error;
+            engine_->block_manager_pool()->deallocate(new_request.get());
+            resp->set_status_code(500);
+            continue;
+          }
+          resp->set_decode_kv_manifest(prepare.serialized_manifest);
+          resp->set_attempt_epoch(prepare.attempt_epoch);
+          resp->set_allocation_generation(prepare.allocation_generation);
+        }
+      }
+
+      const bool success =
+          scheduler_->decode_schedule(new_request, request->prefill_name());
+      if (!success) {
+        LOG(ERROR) << "Failed to schedule new decode instance request: "
+                   << req.req_id();
+        if (strict_readiness) {
+          engine_->discard_decode_kv_readiness(req.req_id());
+        }
+        // Duplicate scheduling releases the request and blocks in scheduler.
+        resp->set_status_code(500);
+        continue;
+      }
+
+      resp->set_status_code(kDecodeAddNewRequestSuccessStatusCode);
     }
   }
 }
@@ -358,7 +449,9 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         gen.dp_size(),
         gen.dp_rank(),
         mtp_bootstrap_embedding,
-        gen.num_cached_tokens());
+        gen.num_cached_tokens(),
+        gen.attempt_epoch(),
+        gen.allocation_generation());
     if (!success) {
       response->set_ok(false);
       return;

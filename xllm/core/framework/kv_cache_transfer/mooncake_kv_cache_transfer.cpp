@@ -18,9 +18,12 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 
 #include "common/global_flags.h"
 #include "core/framework/config/disagg_pd_config.h"
@@ -32,10 +35,49 @@ limitations under the License.
 #include "framework/xtensor/xtensor_allocator.h"
 #include "util/net.h"
 #include "util/uuid.h"
+#include "util/verbose_trace_logger.h"
 
 namespace xllm {
 
 namespace {
+
+struct DecodeKVReceiptLookupKey final {
+  int32_t source_worker_rank = 0;
+  int32_t destination_worker_rank = 0;
+  int32_t group_id = 0;
+  uint64_t logical_block_ordinal = 0;
+  uint64_t destination_physical_block_id = 0;
+};
+
+bool operator==(const DecodeKVReceiptLookupKey& lhs,
+                const DecodeKVReceiptLookupKey& rhs) {
+  return lhs.source_worker_rank == rhs.source_worker_rank &&
+         lhs.destination_worker_rank == rhs.destination_worker_rank &&
+         lhs.group_id == rhs.group_id &&
+         lhs.logical_block_ordinal == rhs.logical_block_ordinal &&
+         lhs.destination_physical_block_id == rhs.destination_physical_block_id;
+}
+
+class DecodeKVReceiptLookupKeyHash final {
+ public:
+  size_t operator()(const DecodeKVReceiptLookupKey& key) const {
+    size_t seed = std::hash<int32_t>{}(key.source_worker_rank);
+    seed ^= std::hash<int32_t>{}(key.destination_worker_rank) + 0x9e3779b9 +
+            (seed << 6) + (seed >> 2);
+    seed ^= std::hash<int32_t>{}(key.group_id) + 0x9e3779b9 + (seed << 6) +
+            (seed >> 2);
+    seed ^= std::hash<uint64_t>{}(key.logical_block_ordinal) + 0x9e3779b9 +
+            (seed << 6) + (seed >> 2);
+    seed ^= std::hash<uint64_t>{}(key.destination_physical_block_id) +
+            0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+  }
+};
+
+using DecodeKVContributionIndex =
+    std::unordered_map<DecodeKVReceiptLookupKey,
+                       std::vector<const DecodeKVExpectedContribution*>,
+                       DecodeKVReceiptLookupKeyHash>;
 
 std::string get_merge_key(const uint64_t dst_cluster_id,
                           const std::string& dst_addr) {
@@ -96,6 +138,16 @@ void append_mappings(std::vector<KVTransferMapping>& dst,
     it->remote_ids.insert(it->remote_ids.end(),
                           src_mapping.remote_ids.begin(),
                           src_mapping.remote_ids.end());
+    it->logical_block_ordinals.insert(
+        it->logical_block_ordinals.end(),
+        src_mapping.logical_block_ordinals.begin(),
+        src_mapping.logical_block_ordinals.end());
+    it->valid_tokens.insert(it->valid_tokens.end(),
+                            src_mapping.valid_tokens.begin(),
+                            src_mapping.valid_tokens.end());
+    it->receipt_remote_ids.insert(it->receipt_remote_ids.end(),
+                                  src_mapping.receipt_remote_ids.begin(),
+                                  src_mapping.receipt_remote_ids.end());
   }
 }
 
@@ -103,7 +155,8 @@ void merge_kv_info(
     std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo>&
         merged_kv_infos,
     const TransferKVInfo& info,
-    const int32_t dst_rank) {
+    int32_t source_worker_rank,
+    int32_t dst_rank) {
   uint64_t dst_cluster_id = info.remote_instance_info.cluster_ids[dst_rank];
   const std::string& dst_addr = info.remote_instance_info.addrs[dst_rank];
   std::string key = get_merge_key(dst_cluster_id, dst_addr);
@@ -113,19 +166,176 @@ void merge_kv_info(
     KVCacheTransfer::KVCacheInfo kv_info;
     kv_info.dst_cluster_id = dst_cluster_id;
     kv_info.dst_addr = dst_addr;
+    kv_info.source_worker_rank = source_worker_rank;
+    kv_info.destination_worker_rank = dst_rank;
     append_mappings(kv_info.mappings, info.mappings);
+    if (!info.decode_kv_manifest.empty()) {
+      kv_info.receipt_infos.emplace_back(info);
+    }
     merge_xtensor_offsets(kv_info.dst_xtensor_layer_offsets,
                           info.dst_xtensor_layer_offsets);
+    if (VerboseTraceLogger::get_instance().enabled()) {
+      detail::append_kv_transfer_trace_request(&kv_info.trace_requests, info);
+    }
     merged_kv_infos.emplace(key, std::move(kv_info));
     return;
   }
 
+  CHECK_EQ(it->second.source_worker_rank, source_worker_rank);
+  CHECK_EQ(it->second.destination_worker_rank, dst_rank);
   append_mappings(it->second.mappings, info.mappings);
+  if (!info.decode_kv_manifest.empty()) {
+    it->second.receipt_infos.emplace_back(info);
+  }
   merge_xtensor_offsets(it->second.dst_xtensor_layer_offsets,
                         info.dst_xtensor_layer_offsets);
+  if (VerboseTraceLogger::get_instance().enabled()) {
+    detail::append_kv_transfer_trace_request(&it->second.trace_requests, info);
+  }
 }
 
 }  // namespace
+
+namespace detail {
+
+bool prepare_mooncake_decode_kv_notifications(
+    const KVCacheTransfer::KVCacheInfo& kv_info,
+    int64_t num_layers,
+    PreparedMooncakeDecodeKVNotifications* prepared,
+    std::string* error) {
+  if (prepared == nullptr || error == nullptr || num_layers <= 0) {
+    return false;
+  }
+
+  PreparedMooncakeDecodeKVNotifications candidate;
+  candidate.receipts_by_layer.resize(static_cast<size_t>(num_layers));
+  for (const TransferKVInfo& info : kv_info.receipt_infos) {
+    DecodeKVExpectedManifest manifest;
+    const DecodeKVPayloadResult result =
+        deserialize_decode_kv_expected_manifest(
+            info.decode_kv_manifest, &manifest, error);
+    if (result != DecodeKVPayloadResult::OK) {
+      *error = "Invalid Decode KV manifest for request " + info.request_id +
+               ": " + *error;
+      return false;
+    }
+    if (manifest.request_id != info.request_id ||
+        manifest.attempt_epoch != info.attempt_epoch ||
+        manifest.allocation_generation != info.allocation_generation) {
+      *error =
+          "Decode KV manifest identity changed for request " + info.request_id;
+      return false;
+    }
+
+    DecodeKVContributionIndex contributions_by_block;
+    contributions_by_block.reserve(manifest.contributions.size());
+    for (const DecodeKVExpectedContribution& contribution :
+         manifest.contributions) {
+      const DecodeKVContributionKey& key = contribution.key;
+      DecodeKVReceiptLookupKey lookup_key;
+      lookup_key.source_worker_rank = key.source_worker_rank;
+      lookup_key.destination_worker_rank = key.destination_worker_rank;
+      lookup_key.group_id = key.group_id;
+      lookup_key.logical_block_ordinal = key.logical_block_ordinal;
+      lookup_key.destination_physical_block_id =
+          key.destination_physical_block_id;
+      contributions_by_block[lookup_key].emplace_back(&contribution);
+    }
+
+    for (const KVTransferMapping& mapping : info.mappings) {
+      if (mapping.remote_ids.size() != mapping.logical_block_ordinals.size() ||
+          mapping.remote_ids.size() != mapping.valid_tokens.size()) {
+        *error = "Decode KV receipt metadata is not aligned for request " +
+                 info.request_id + ", group " +
+                 std::to_string(mapping.group_id);
+        return false;
+      }
+
+      std::unordered_map<uint64_t, size_t> first_remote_indices;
+      first_remote_indices.reserve(mapping.remote_ids.size());
+      for (size_t index = 0; index < mapping.remote_ids.size(); ++index) {
+        first_remote_indices.try_emplace(mapping.remote_ids[index], index);
+      }
+
+      for (uint64_t receipt_remote_id : mapping.receipt_remote_ids) {
+        const auto remote_it = first_remote_indices.find(receipt_remote_id);
+        if (remote_it == first_remote_indices.end()) {
+          *error =
+              "Decode KV receipt block is not in the transfer mapping "
+              "for request " +
+              info.request_id + ", group " + std::to_string(mapping.group_id);
+          return false;
+        }
+        const size_t mapping_index = remote_it->second;
+        const uint64_t logical_block_ordinal =
+            mapping.logical_block_ordinals[mapping_index];
+        const uint32_t valid_tokens = mapping.valid_tokens[mapping_index];
+
+        DecodeKVReceiptLookupKey lookup_key;
+        lookup_key.source_worker_rank = kv_info.source_worker_rank;
+        lookup_key.destination_worker_rank = kv_info.destination_worker_rank;
+        lookup_key.group_id = mapping.group_id;
+        lookup_key.logical_block_ordinal = logical_block_ordinal;
+        lookup_key.destination_physical_block_id = receipt_remote_id;
+        const auto contributions_it = contributions_by_block.find(lookup_key);
+        if (contributions_it == contributions_by_block.end()) {
+          *error =
+              "Decode KV receipt block has no matching manifest "
+              "contribution for request " +
+              info.request_id + ", group " + std::to_string(mapping.group_id);
+          return false;
+        }
+
+        std::vector<bool> matched_layers(static_cast<size_t>(num_layers),
+                                         false);
+        for (const DecodeKVExpectedContribution* contribution :
+             contributions_it->second) {
+          const int64_t layer_id = contribution->key.layer_id;
+          if (layer_id < 0 || layer_id >= num_layers) {
+            *error =
+                "Decode KV manifest contribution layer is out of range "
+                "for request " +
+                info.request_id;
+            return false;
+          }
+          if (contribution->valid_tokens != valid_tokens) {
+            *error =
+                "Decode KV receipt valid-token count disagrees with the "
+                "manifest for request " +
+                info.request_id + ", layer " + std::to_string(layer_id) +
+                ", group " + std::to_string(mapping.group_id);
+            return false;
+          }
+
+          DecodeKVReceipt receipt;
+          receipt.request_id = info.request_id;
+          receipt.key = contribution->key;
+          receipt.attempt_epoch = info.attempt_epoch;
+          receipt.allocation_generation = info.allocation_generation;
+          receipt.valid_tokens = valid_tokens;
+          receipt.completion_level = DecodeKVCompletionLevel::REMOTE_VISIBLE;
+          candidate.receipts_by_layer[static_cast<size_t>(layer_id)]
+              .emplace_back(std::move(receipt));
+          matched_layers[static_cast<size_t>(layer_id)] = true;
+        }
+        if (std::find(matched_layers.begin(), matched_layers.end(), false) !=
+            matched_layers.end()) {
+          *error =
+              "Decode KV receipt block has no matching contribution for "
+              "every layer of request " +
+              info.request_id + ", group " + std::to_string(mapping.group_id);
+          return false;
+        }
+      }
+    }
+  }
+
+  *prepared = std::move(candidate);
+  error->clear();
+  return true;
+}
+
+}  // namespace detail
 
 // ============================================================================
 // MooncakeKVCacheTransferBase
@@ -227,6 +437,39 @@ void MooncakeKVCacheTransferBase::get_cache_info(uint64_t& cluster_id,
 
   LOG(INFO) << "get_cache_info success, cluster_id=" << cluster_id_
             << ", addr=" << addr_;
+}
+
+KVCacheLayoutQueryResult MooncakeKVCacheTransferBase::get_kv_cache_layout() {
+  KVCacheLayoutQueryResult result;
+  result.supported = true;
+  const Status status = validate_worker_cache_layout(local_cache_layout_);
+  if (!status.ok()) {
+    LOG(ERROR) << "Local MoonCake cache layout is unavailable: "
+               << status.message();
+    result.ok = false;
+    return result;
+  }
+
+  proto::WorkerCacheLayoutManifest proto_manifest;
+  cache_layout_to_proto(local_cache_layout_, &proto_manifest);
+  if (!proto_manifest.SerializeToString(&result.serialized_manifest)) {
+    LOG(ERROR) << "Failed to serialize local MoonCake cache layout";
+    result.ok = false;
+  }
+  return result;
+}
+
+KVTransferNotificationDrainResult
+MooncakeKVCacheTransferBase::drain_kv_transfer_notifications(
+    size_t max_notifications) {
+  KVTransferNotificationDrainResult result;
+  result.supported = true;
+  result.ok =
+      mooncake_te_->drain_notifications(kMooncakeDecodeKVNotificationName,
+                                        max_notifications,
+                                        &result.payloads,
+                                        &result.more_available);
+  return result;
 }
 
 bool MooncakeKVCacheTransferBase::link_clusters(
@@ -636,7 +879,6 @@ void MooncakeKVCacheTransferBase::merge_kv_blocks(
     std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
     const std::vector<TransferKVInfo>& transfer_kv_infos,
     const ParallelArgs& parallel_args) {
-  (void)parallel_args;
   for (const TransferKVInfo& info : transfer_kv_infos) {
     const int32_t dst_dp_size = info.remote_instance_info.dp_size;
     const int32_t dst_world_size =
@@ -652,6 +894,7 @@ void MooncakeKVCacheTransferBase::merge_kv_blocks(
     const int32_t dst_tp_size = dst_world_size / dst_dp_size;
     const int32_t begin = info.dp_rank * dst_tp_size;
     const int32_t end = begin + dst_tp_size;
+    const bool strict_readiness = !info.decode_kv_manifest.empty();
     const bool has_negotiated_plan =
         std::any_of(info.remote_instance_info.addrs.begin() + begin,
                     info.remote_instance_info.addrs.begin() + end,
@@ -659,12 +902,18 @@ void MooncakeKVCacheTransferBase::merge_kv_blocks(
                       return mooncake_te_->has_reshard_plan(remote_addr);
                     });
     for (int32_t dst_rank = begin; dst_rank < end; ++dst_rank) {
-      if (has_negotiated_plan &&
-          !mooncake_te_->has_reshard_plan(
-              info.remote_instance_info.addrs[dst_rank])) {
-        continue;
+      if (has_negotiated_plan) {
+        const std::string& remote_addr =
+            info.remote_instance_info.addrs[dst_rank];
+        const bool has_destination_plan =
+            strict_readiness ? mooncake_te_->has_outgoing_plan(
+                                   remote_addr, CacheNamespace::MAIN)
+                             : mooncake_te_->has_reshard_plan(remote_addr);
+        if (!has_destination_plan) {
+          continue;
+        }
       }
-      merge_kv_info(merged_kv_infos, info, dst_rank);
+      merge_kv_info(merged_kv_infos, info, parallel_args.rank(), dst_rank);
     }
   }
 }
@@ -688,6 +937,37 @@ bool MooncakeKVCacheTransferDefault::push_kv_blocks(
     keys = rotate_dst_rank(keys, kv_split_rank);
   }
 
+  std::unordered_map<std::string, detail::PreparedMooncakeDecodeKVNotifications>
+      prepared_notifications;
+  prepared_notifications.reserve(keys.size());
+  for (const std::string& key : keys) {
+    const KVCacheInfo& kv_info = merged_kv_infos.at(key);
+    if (kv_info.receipt_infos.empty()) {
+      continue;
+    }
+    if (is_spec_draft) {
+      LOG(ERROR) << "Strict Decode KV readiness does not support speculative "
+                    "draft cache PUSH";
+      return false;
+    }
+    if (!mooncake_te_->has_reshard_plan(kv_info.dst_addr)) {
+      LOG(ERROR) << "Strict Decode KV readiness requires a negotiated "
+                    "MoonCake cache layout, destination="
+                 << kv_info.dst_addr;
+      return false;
+    }
+
+    detail::PreparedMooncakeDecodeKVNotifications prepared;
+    std::string error;
+    if (!detail::prepare_mooncake_decode_kv_notifications(
+            kv_info, num_layers, &prepared, &error)) {
+      LOG(ERROR) << "Prepare Decode KV notifications failed, destination="
+                 << kv_info.dst_addr << ": " << error;
+      return false;
+    }
+    prepared_notifications.emplace(key, std::move(prepared));
+  }
+
   bool result = true;
   const CacheNamespace cache_namespace =
       is_spec_draft ? CacheNamespace::SPEC_DRAFT : CacheNamespace::MAIN;
@@ -701,7 +981,11 @@ bool MooncakeKVCacheTransferDefault::push_kv_blocks(
 
     for (const std::string& key : keys) {
       const KVCacheInfo& kv_info = merged_kv_infos.at(key);
-      if (mooncake_te_->has_reshard_plan(kv_info.dst_addr)) {
+      const bool has_reshard_plan =
+          mooncake_te_->has_reshard_plan(kv_info.dst_addr);
+      const auto prepared_it = prepared_notifications.find(key);
+      const bool strict_readiness = prepared_it != prepared_notifications.end();
+      if (has_reshard_plan) {
         std::vector<ByteRegion> regions;
         const Status bind_status =
             mooncake_te_->bind_outgoing_regions(kv_info.dst_addr,
@@ -716,41 +1000,94 @@ bool MooncakeKVCacheTransferDefault::push_kv_blocks(
           result = false;
           continue;
         }
+        std::optional<MooncakeDecodeKVNotification> notification;
+        if (strict_readiness) {
+          notification.emplace();
+          ShortUUID uuid;
+          notification->submission_id = uuid.random();
+          notification->receipts =
+              prepared_it->second
+                  .receipts_by_layer[static_cast<size_t>(layer_index)];
+        }
         if (regions.empty()) {
+          if (notification.has_value() && !notification->receipts.empty()) {
+            LOG(ERROR) << "Decode KV receipts were selected without MoonCake "
+                          "transfer regions, layer="
+                       << layer_index << ", destination=" << kv_info.dst_addr;
+            result = false;
+          }
           continue;
         }
         const bool success = mooncake_te_->move_memory_regions(
             kv_info.dst_addr,
             regions,
-            MooncakeTransferEngine::MoveOpcode::WRITE);
+            MooncakeTransferEngine::MoveOpcode::WRITE,
+            notification);
         if (!success) {
           LOG(ERROR) << "Push KV byte regions failed, layer=" << layer_index
                      << ", destination=" << kv_info.dst_addr;
           result = false;
+          continue;
         }
-        continue;
+      } else {
+        // Compatibility path for callers that have not performed LinkInstance
+        // layout negotiation (principally existing component tests).
+        // Production linked peers always use the byte-region plan above.
+        std::vector<MooncakeTransferEngine::BufferTransferMapping>
+            buffer_mappings;
+        if (!append_buffer_mappings(
+                layout, layer_ids, kv_info.mappings, &buffer_mappings)) {
+          result = false;
+          continue;
+        }
+
+        const bool success = mooncake_te_->move_memory_groups(
+            kv_info.dst_addr,
+            buffer_mappings,
+            MooncakeTransferEngine::MoveOpcode::WRITE);
+        if (!success) {
+          LOG(ERROR) << "Push kv blocks failed, layer = " << layer_index
+                     << ", destination=" << kv_info.dst_addr;
+          result = false;
+          continue;
+        }
       }
 
-      // Compatibility path for callers that have not performed LinkInstance
-      // layout negotiation (principally existing component tests). Production
-      // linked peers always use the byte-region plan above.
-      std::vector<MooncakeTransferEngine::BufferTransferMapping>
-          buffer_mappings;
-      if (!append_buffer_mappings(
-              layout, layer_ids, kv_info.mappings, &buffer_mappings)) {
-        result = false;
-        continue;
+#if defined(USE_NPU)
+      const LayerSynchronizerTraceContext& trace_context =
+          layer_synchronizer->trace_context();
+      const std::vector<RegisteredBufferDesc>& layer_buffers =
+          layout.layers[static_cast<size_t>(layer_index)];
+      for (const detail::KVTransferTraceRequest& request :
+           kv_info.trace_requests) {
+        for (const detail::KVTransferTraceGroup& group : request.groups) {
+          for (const RegisteredBufferDesc& buffer : layer_buffers) {
+            if (buffer.group_id != group.group_id) {
+              continue;
+            }
+            XLLM_VERBOSE_TRACE()
+                << "event=kv_cache_role_push_complete request-id="
+                << request.request_id << " layer=" << layer_index
+                << " source-rank=" << trace_context.source_rank
+                << " cp-rank=" << trace_context.cp_rank
+                << " kv-shard=" << trace_context.kv_split_rank
+                << " kv-split-size=" << trace_context.kv_split_size
+                << " cache-group=" << group.group_id
+                << " cache-role=" << buffer.role.to_string()
+                << " cache-namespace="
+                << (is_spec_draft ? "spec-draft" : "main")
+                << " local-block-count="
+                << static_cast<uint64_t>(group.local_block_count)
+                << " remote-block-count="
+                << static_cast<uint64_t>(group.remote_block_count)
+                << " transfer-path="
+                << (has_reshard_plan ? "negotiated" : "legacy")
+                << " destination-cluster-id=" << kv_info.dst_cluster_id
+                << " destination=" << kv_info.dst_addr;
+          }
+        }
       }
-
-      const bool success = mooncake_te_->move_memory_groups(
-          kv_info.dst_addr,
-          buffer_mappings,
-          MooncakeTransferEngine::MoveOpcode::WRITE);
-      if (!success) {
-        LOG(ERROR) << "Push kv blocks failed, layer = " << layer_index
-                   << ", destination=" << kv_info.dst_addr;
-        result = false;
-      }
+#endif
     }
   }
   VLOG(1) << "[Mooncake][PDTransfer] direction=push, destinations="

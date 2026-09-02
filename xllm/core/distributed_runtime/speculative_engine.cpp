@@ -296,6 +296,35 @@ void SpeculativeEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
   engine_->get_cache_info(cluster_ids, addrs, ports);
 };
 
+DecodeKVReadinessPrepareResult SpeculativeEngine::prepare_decode_kv_readiness(
+    const std::string& request_id,
+    const DecodeKVSourceTopology& source_topology,
+    int32_t destination_dp_rank,
+    const std::vector<KVTransferMapping>& mappings) {
+  return engine_->prepare_decode_kv_readiness(
+      request_id, source_topology, destination_dp_rank, mappings);
+}
+
+DecodeKVReadinessPollResult SpeculativeEngine::poll_decode_kv_readiness(
+    size_t max_notifications_per_worker) {
+  return engine_->poll_decode_kv_readiness(max_notifications_per_worker);
+}
+
+DecodeKVReadinessSnapshot SpeculativeEngine::get_decode_kv_readiness(
+    const std::string& request_id) const {
+  return engine_->get_decode_kv_readiness(request_id);
+}
+
+bool SpeculativeEngine::try_publish_decode_kv_readiness(
+    const std::string& request_id) {
+  return engine_->try_publish_decode_kv_readiness(request_id);
+}
+
+void SpeculativeEngine::discard_decode_kv_readiness(
+    const std::string& request_id) {
+  engine_->discard_decode_kv_readiness(request_id);
+}
+
 bool SpeculativeEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
                                      const std::vector<std::string>& addrs,
                                      const std::vector<uint16_t>& ports,

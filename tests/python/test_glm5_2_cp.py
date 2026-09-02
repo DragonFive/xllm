@@ -251,6 +251,183 @@ def test_cp_ep_moe_materializes_global_rows_before_expert_reduction() -> None:
     torch.testing.assert_close(output, torch.tensor([[130.0], [110.0]]))
 
 
+def test_glm_dense_mlp_enables_fp32_tp_reduction() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=4,
+        intermediate_size=8,
+        n_layers=1,
+        tp_size=2,
+        world_size=2,
+        mlp_layer_types=["dense"],
+    )
+
+    with patch.object(
+        glm5_2,
+        "Glm52MLAAttention",
+        return_value=nn.Identity(),
+    ):
+        layer = glm5_2.Glm52DecoderLayer(
+            cfg,
+            layer_id=0,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+
+    assert isinstance(layer.mlp, glm5_2.Glm52MLP)
+    assert layer.mlp.tp_reduce_in_fp32
+
+
+def test_glm_attention_uses_transposed_bmm_kernel_for_value_projection() -> None:
+    attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
+    nn.Module.__init__(attention)
+    attention.q_a_proj = nn.Identity()
+    attention.q_a_layernorm = nn.Identity()
+    attention.q_b_proj = nn.Identity()
+    attention.kv_a_proj_with_mqa = nn.Identity()
+    attention.kv_a_layernorm = nn.Identity()
+    attention.o_proj = nn.Identity()
+    attention.indexer = None
+    attention.num_heads_local = 1
+    attention.qk_nope_head_dim = 1
+    attention.qk_rope_head_dim = 1
+    attention.kv_lora_rank = 1
+    attention.v_head_dim = 2
+    attention.cfg = SimpleNamespace(tp_size=1)
+    attention.W_UK = torch.ones(1, 1, 1)
+    attention.W_UV = torch.ones(1, 1, 2)
+
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    positions = torch.tensor([0, 1])
+    previous_topk = torch.tensor([[0], [1]])
+    attention_output = torch.tensor([[[5.0]], [[7.0]]])
+    projected = torch.tensor([[[11.0, 13.0]], [[17.0, 19.0]]])
+    backend = MagicMock()
+    backend.execute_mla.return_value = attention_output
+
+    with (
+        patch.object(
+            glm5_2,
+            "get_forward_context",
+            return_value=SimpleNamespace(attention_backend=backend),
+        ),
+        patch.object(
+            glm5_2,
+            "_gather_interleave_cos_sin",
+            return_value=(torch.empty(0), torch.empty(0)),
+        ),
+        patch.object(
+            glm5_2,
+            "_interleave_rope_with",
+            side_effect=lambda value, *_args: value,
+        ),
+        patch.object(
+            glm5_2.kernels,
+            "batch_matmul_transpose",
+            return_value=projected,
+            create=True,
+        ) as project,
+        patch.object(glm5_2.distributed, "all_reduce_", create=True) as reduce,
+    ):
+        output, topk = attention(
+            hidden,
+            positions,
+            torch.empty(0),
+            previous_topk,
+        )
+
+    project.assert_called_once()
+    projected_input, projected_weight = project.call_args.args
+    torch.testing.assert_close(projected_input, attention_output.transpose(0, 1))
+    assert projected_weight is attention.W_UV
+    reduce.assert_not_called()
+    torch.testing.assert_close(output, projected.reshape(2, 2))
+    assert topk is previous_topk
+
+
+def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> None:
+    attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
+    nn.Module.__init__(attention)
+    attention.q_a_proj = nn.Identity()
+    attention.q_a_layernorm = nn.Identity()
+    attention.q_b_proj = nn.Identity()
+    attention.kv_a_proj_with_mqa = nn.Identity()
+    attention.kv_a_layernorm = nn.Identity()
+    attention.o_proj = nn.Identity()
+    attention.indexer = None
+    attention.num_heads_local = 1
+    attention.qk_nope_head_dim = 1
+    attention.qk_rope_head_dim = 1
+    attention.kv_lora_rank = 1
+    attention.v_head_dim = 2
+    attention.cfg = SimpleNamespace(tp_size=2)
+    attention.W_UK = torch.ones(1, 1, 1)
+    attention.W_UV = torch.ones(1, 1, 2)
+
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    positions = torch.tensor([0, 1])
+    previous_topk = torch.tensor([[0], [1]])
+    attention_output = torch.tensor([[[5.0]], [[7.0]]])
+    projected = torch.tensor(
+        [[[11.0, 13.0]], [[17.0, 19.0]]],
+        dtype=torch.bfloat16,
+    )
+    reduction_delta = torch.tensor(
+        [[0.125, -0.25], [0.5, -0.75]],
+        dtype=torch.float32,
+    )
+    backend = MagicMock()
+    backend.execute_mla.return_value = attention_output
+
+    def reduce_output(output: torch.Tensor) -> None:
+        assert output.dtype == torch.float32
+        output.add_(reduction_delta)
+
+    with (
+        patch.object(
+            glm5_2,
+            "get_forward_context",
+            return_value=SimpleNamespace(attention_backend=backend),
+        ),
+        patch.object(
+            glm5_2,
+            "_gather_interleave_cos_sin",
+            return_value=(torch.empty(0), torch.empty(0)),
+        ),
+        patch.object(
+            glm5_2,
+            "_interleave_rope_with",
+            side_effect=lambda value, *_args: value,
+        ),
+        patch.object(
+            glm5_2.kernels,
+            "batch_matmul_transpose",
+            return_value=projected,
+            create=True,
+        ),
+        patch.object(
+            glm5_2.distributed,
+            "all_reduce_",
+            side_effect=reduce_output,
+            create=True,
+        ) as reduce,
+    ):
+        output, topk = attention(
+            hidden,
+            positions,
+            torch.empty(0),
+            previous_topk,
+        )
+
+    reduce.assert_called_once()
+    assert reduce.call_args.args[0].dtype == torch.float32
+    assert output.dtype == projected.dtype
+    torch.testing.assert_close(
+        output,
+        (projected.reshape(2, 2).float() + reduction_delta).to(projected.dtype),
+    )
+    assert topk is previous_topk
+
+
 class _FakeStateDict:
     def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
         self._tensors = tensors

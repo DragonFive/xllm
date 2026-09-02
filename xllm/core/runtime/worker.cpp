@@ -109,6 +109,15 @@ void Worker::get_cache_info(uint64_t& cluster_id,
   impl_->get_cache_info(cluster_id, addr, port);
 }
 
+KVCacheLayoutQueryResult Worker::get_kv_cache_layout() {
+  return impl_->get_kv_cache_layout();
+}
+
+KVTransferNotificationDrainResult Worker::drain_kv_transfer_notifications(
+    size_t max_notifications) {
+  return impl_->drain_kv_transfer_notifications(max_notifications);
+}
+
 bool Worker::link_cluster(const std::vector<uint64_t>& cluster_ids,
                           const std::vector<std::string>& addrs,
                           const std::vector<uint16_t>& ports) {

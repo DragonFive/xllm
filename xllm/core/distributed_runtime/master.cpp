@@ -36,6 +36,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/common/xllm_build_info.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
@@ -120,6 +121,17 @@ void validate_layerwise_split_size_startup_config(const Options& options,
       << "layerwise_split_size > 1 does not support KV split.";
 }
 
+bool is_python_graph_backend_enabled(std::string_view graph_backend) {
+  std::string normalized_backend(graph_backend);
+  boost::algorithm::to_lower(normalized_backend);
+  return !normalized_backend.empty() && normalized_backend != "off" &&
+         normalized_backend != "none" && normalized_backend != "0";
+}
+
+}  // namespace
+
+namespace detail {
+
 std::optional<std::string> validate_model_cp(const Options& options,
                                              EngineType engine_type,
                                              const std::string& model_type,
@@ -183,15 +195,13 @@ std::optional<std::string> validate_model_cp(const Options& options,
             options.speculative_algorithm())) {
       return "Current model-side CP does not support aux-hidden-capture "
              "speculative algorithms (Eagle3/DFlash); disable CP or disable "
-             "the speculative algorithm. MTP and Suffix are supported.";
+             "the speculative algorithm. MTP and Suffix use separate "
+             "capability gates.";
     }
-    // enable_graph is compatible with CP because the two are phase-disjoint:
-    // CP only engages on batch_forward_type.no_decode() (both the model-owned
-    // split in deepseek_v4 and NpuCpPlan::prepare return early on decode),
-    // while ACL graph only captures/replays pure decode -- AclGraphExecutorImpl
-    // ::run() falls back to eager for anything else, and params.enable_graph is
-    // set only by the decode capture path. Graph-mode decode therefore runs
-    // with CP inactive, which is the same non-CP decode CP already relies on.
+    // Native model-side CP is compatible with graph mode because the two are
+    // phase-disjoint: CP only engages on batch_forward_type.no_decode(), while
+    // ACL graph captures/replays pure decode. The Python CP path has a stricter
+    // eager-only contract and rejects graph mode below.
     //
     // The one batch that satisfies both gates is spec-verify chunked prefill.
     // The graph executor only takes it for hybrid-linear-attention models, and
@@ -229,6 +239,19 @@ std::optional<std::string> validate_model_cp(const Options& options,
           kPythonCpCapableModels.end()) {
         return "Python model-side CP does not support model_type=" +
                model_type + "; supported models are qwen3 and glm_moe_dsa.";
+      }
+      if (engine_type == EngineType::SSM &&
+          SpeculativeConfig::is_mtp_algorithm(
+              options.speculative_algorithm())) {
+        return "Python model-side CP does not support MTP speculative "
+               "verification; run MTP on a cp_size=1 Decode instance";
+      }
+      if (options.enable_graph() ||
+          is_python_graph_backend_enabled(
+              ExecutionConfig::get_instance().python_graph_backend())) {
+        return "Python model-side CP supports eager Prefill only; disable "
+               "graph mode with --enable_graph=false and "
+               "--python_graph_backend=off";
       }
       if (options.dp_size() != 1) {
         return "Python CP requires dp_size == 1";
@@ -300,6 +323,10 @@ std::optional<std::string> validate_model_cp(const Options& options,
   return "cp_size > 1 is only supported on platforms with model-side CP "
          "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
 }
+
+}  // namespace detail
+
+namespace {
 
 void print_startup_banner(const std::filesystem::path& model_path,
                           const std::string& backend,
@@ -431,7 +458,7 @@ Master::Master(const Options& options, EngineType type)
           options_.num_speculative_tokens());
   CHECK(!speculative_error.has_value()) << speculative_error.value();
   const std::optional<std::string> cp_error =
-      validate_model_cp(options_, type, model_type, global_world_size);
+      detail::validate_model_cp(options_, type, model_type, global_world_size);
   CHECK(!cp_error.has_value()) << cp_error.value();
   options_.enable_mla(util::should_enable_mla(model_path, options_.backend()));
   print_startup_banner(model_path, options_.backend(), options_.node_rank());

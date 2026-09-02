@@ -188,6 +188,8 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .instance_role(InstanceRole(disagg_pd_config.instance_role()))
       .transfer_listen_port(
           static_cast<uint16_t>(disagg_pd_config.transfer_listen_port()))
+      .decode_kv_readiness_timeout_ms(
+          disagg_pd_config.decode_kv_readiness_timeout_ms())
       .nnodes(distributed_config.nnodes())
       .node_rank(distributed_config.node_rank())
       .dp_size(parallel_config.dp_size())

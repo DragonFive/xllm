@@ -169,6 +169,8 @@ class Options {
 
   PROPERTY(uint16_t, transfer_listen_port) = 26000;
 
+  PROPERTY(int64_t, decode_kv_readiness_timeout_ms) = 30000;
+
   PROPERTY(std::optional<std::string>, etcd_addr);
 
   PROPERTY(std::optional<std::string>, etcd_namespace);

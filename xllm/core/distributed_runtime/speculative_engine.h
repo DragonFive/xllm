@@ -75,6 +75,22 @@ class SpeculativeEngine : public Engine {
                       std::vector<std::string>& addrs,
                       std::vector<uint16_t>& ports) override;
 
+  DecodeKVReadinessPrepareResult prepare_decode_kv_readiness(
+      const std::string& request_id,
+      const DecodeKVSourceTopology& source_topology,
+      int32_t destination_dp_rank,
+      const std::vector<KVTransferMapping>& mappings) override;
+
+  DecodeKVReadinessPollResult poll_decode_kv_readiness(
+      size_t max_notifications_per_worker) override;
+
+  DecodeKVReadinessSnapshot get_decode_kv_readiness(
+      const std::string& request_id) const override;
+
+  bool try_publish_decode_kv_readiness(const std::string& request_id) override;
+
+  void discard_decode_kv_readiness(const std::string& request_id) override;
+
   bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                     const std::vector<std::string>& addrs,
                     const std::vector<uint16_t>& ports,

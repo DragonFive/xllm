@@ -22,10 +22,19 @@ limitations under the License.
 #include <atomic>
 #include <cstddef>
 #include <future>
+#include <limits>
 
 #include "common/global_flags.h"
 
 namespace xllm {
+namespace {
+
+// These synchronous RPCs run on the Decode scheduler's readiness path. They
+// are issued serially across workers, so 500 ms keeps the 16-worker worst case
+// below the default 30-second request-level readiness deadline.
+constexpr int32_t kDecodeKVReadinessRpcTimeoutMs = 500;
+
+}  // namespace
 
 bool CommChannel::init_brpc(const std::string& server_address) {
   options_.connection_type = "pooled";
@@ -129,6 +138,52 @@ bool CommChannel::get_cache_info(uint64_t& cluster_id,
   addr = resp.addr();
   port = static_cast<uint16_t>(resp.listen_port());
   return true;
+}
+
+KVCacheLayoutQueryResult CommChannel::get_kv_cache_layout() {
+  proto::Empty request;
+  proto::KVCacheLayoutResponse response;
+  brpc::Controller controller;
+  controller.set_timeout_ms(kDecodeKVReadinessRpcTimeoutMs);
+  stub_->GetKVCacheLayout(&controller, &request, &response, nullptr);
+
+  KVCacheLayoutQueryResult result;
+  if (controller.Failed()) {
+    LOG(ERROR) << "GetKVCacheLayout failed: " << controller.ErrorText();
+    result.ok = false;
+    return result;
+  }
+  result.ok = response.ok();
+  result.supported = response.supported();
+  result.serialized_manifest = response.serialized_manifest();
+  return result;
+}
+
+KVTransferNotificationDrainResult CommChannel::drain_kv_transfer_notifications(
+    size_t max_notifications) {
+  proto::DrainKVTransferNotificationsRequest request;
+  request.set_max_notifications(static_cast<uint32_t>(
+      std::min(max_notifications,
+               static_cast<size_t>(std::numeric_limits<uint32_t>::max()))));
+  proto::DrainKVTransferNotificationsResponse response;
+  brpc::Controller controller;
+  controller.set_timeout_ms(kDecodeKVReadinessRpcTimeoutMs);
+  stub_->DrainKVTransferNotifications(
+      &controller, &request, &response, nullptr);
+
+  KVTransferNotificationDrainResult result;
+  if (controller.Failed()) {
+    LOG(ERROR) << "DrainKVTransferNotifications failed: "
+               << controller.ErrorText();
+    result.ok = false;
+    return result;
+  }
+  result.ok = response.ok();
+  result.supported = response.supported();
+  result.more_available = response.more_available();
+  result.payloads.assign(response.payloads().begin(),
+                         response.payloads().end());
+  return result;
 }
 
 bool CommChannel::link_cluster(const std::vector<uint64_t>& cluster_ids,

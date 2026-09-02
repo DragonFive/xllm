@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/metrics.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
@@ -470,6 +471,12 @@ bool DFlashWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
 #if defined(USE_NPU) || defined(USE_MLU)
 bool DFlashWorkerImpl::allocate_kv_cache_with_transfer(
     const KVCacheShape& kv_cache_shape) {
+  if (DisaggPDConfig::get_instance().kv_cache_transfer_type() ==
+      "LlmDataDist") {
+    LOG(ERROR)
+        << "LlmDataDist does not support speculative draft KV cache transfer.";
+    return false;
+  }
   const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
 
   if (kv_cache_transfer_ == nullptr) {

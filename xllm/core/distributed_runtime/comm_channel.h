@@ -26,6 +26,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/kv_cache_transfer/prefetch_result.h"
 #include "framework/xtensor/xtensor.h"
 #include "runtime/forward_params.h"
@@ -51,6 +52,11 @@ class CommChannel {
   virtual bool get_cache_info(uint64_t& cluster_id,
                               std::string& addr,
                               uint16_t& port);
+
+  virtual KVCacheLayoutQueryResult get_kv_cache_layout();
+
+  virtual KVTransferNotificationDrainResult drain_kv_transfer_notifications(
+      size_t max_notifications);
 
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,

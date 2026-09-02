@@ -15,8 +15,14 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 
+#include "core/distributed_runtime/master.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -68,6 +74,61 @@ TEST(NpuCpCapabilityTest, RegistrationIsIdempotent) {
     EXPECT_TRUE(is_npu_model_cp_capable("deepseek_v32"));
     EXPECT_FALSE(is_npu_model_cp_capable("deepseek_v3_mtp"));
   }
+}
+
+TEST(NpuCpCapabilityTest, PythonCpRejectsGraphAndMtpVerification) {
+  ExecutionConfig& execution_config = ExecutionConfig::get_instance();
+  ModelConfig& model_config = ModelConfig::get_instance();
+  ParallelConfig& parallel_config = ParallelConfig::get_instance();
+  const std::string original_python_graph_backend =
+      execution_config.python_graph_backend();
+  const std::string original_model_impl = model_config.model_impl();
+  const int32_t original_kv_split_size = parallel_config.kv_split_size();
+  execution_config.python_graph_backend("off");
+  model_config.model_impl("python");
+  parallel_config.kv_split_size(1);
+
+  Options options;
+  options.task_type("generate")
+      .cp_size(4)
+      .dp_size(1)
+      .instance_role(InstanceRole::PREFILL)
+      .speculative_algorithm("MTP")
+      .enable_graph(true);
+  const std::optional<std::string> graph_error = detail::validate_model_cp(
+      options, EngineType::LLM, "glm_moe_dsa", /*global_world_size=*/16);
+  EXPECT_EQ(graph_error,
+            std::optional<std::string>(
+                "Python model-side CP supports eager Prefill only; disable "
+                "graph mode with --enable_graph=false and "
+                "--python_graph_backend=off"));
+
+  options.enable_graph(false);
+  execution_config.python_graph_backend("aclgraph");
+  EXPECT_EQ(detail::validate_model_cp(options,
+                                      EngineType::LLM,
+                                      "glm_moe_dsa",
+                                      /*global_world_size=*/16),
+            graph_error);
+
+  execution_config.python_graph_backend("off");
+  EXPECT_EQ(detail::validate_model_cp(options,
+                                      EngineType::SSM,
+                                      "glm_moe_dsa",
+                                      /*global_world_size=*/16),
+            std::optional<std::string>(
+                "Python model-side CP does not support MTP speculative "
+                "verification; run MTP on a cp_size=1 Decode instance"));
+
+  EXPECT_FALSE(detail::validate_model_cp(options,
+                                         EngineType::LLM,
+                                         "glm_moe_dsa",
+                                         /*global_world_size=*/16)
+                   .has_value());
+
+  parallel_config.kv_split_size(original_kv_split_size);
+  model_config.model_impl(original_model_impl);
+  execution_config.python_graph_backend(original_python_graph_backend);
 }
 
 }  // namespace

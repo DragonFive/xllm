@@ -27,6 +27,8 @@ message ClusterInfos {
   repeated uint32 ports = 3;
   int32 dp_size = 4;
   repeated string addrs = 5;
+  int32 cp_size = 6;
+  int32 kv_split_size = 7;
 }
 
 // request from prefill to decode.
@@ -88,6 +90,7 @@ message DisaggRequest {
   bool include_stop_str_in_output = 39;
   bool json_object = 40;
   bool json_reasoning_enabled = 41;
+  int32 source_dp_rank = 42;
 
 }
 
@@ -113,6 +116,11 @@ message DisaggResponse {
   // Group-aware block allocation. group_id is defined by the cache layout and
   // is opaque to the PD protocol.
   repeated KVTransferGroup groups = 20;
+  // Decode-owned transfer contract. Non-empty only when strict receiver-side
+  // readiness is required for a sharded PUSH request.
+  bytes decode_kv_manifest = 22;
+  uint64 attempt_epoch = 23;
+  uint64 allocation_generation = 24;
 }
 
 // XTensor mode: offsets for one layer
@@ -132,6 +140,53 @@ message KVTransferGroup {
   // starts pushing at the first block that D actually needs. Zero when D
   // has no shared prefix (e.g. DECODE-side SWA prefix cache is off by role).
   uint32 remote_shared_num = 4;
+  // Metadata aligned with ids. These fields preserve request-logical block
+  // identity and the valid length of a partial final block.
+  repeated uint64 logical_block_ordinals = 5;
+  repeated uint32 valid_tokens = 6;
+}
+
+message DecodeKVContributionKey {
+  int32 source_worker_rank = 1;
+  int32 destination_worker_rank = 2;
+  int64 layer_id = 3;
+  int32 group_id = 4;
+  int32 cache_role = 5;
+  uint64 logical_block_ordinal = 6;
+  uint64 destination_physical_block_id = 7;
+}
+
+message DecodeKVExpectedContribution {
+  DecodeKVContributionKey key = 1;
+  uint32 valid_tokens = 2;
+}
+
+message DecodeKVExpectedManifest {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  uint64 attempt_epoch = 3;
+  uint64 allocation_generation = 4;
+  repeated DecodeKVExpectedContribution contributions = 5;
+}
+
+message DecodeKVReceipt {
+  string request_id = 1;
+  DecodeKVContributionKey key = 2;
+  uint64 attempt_epoch = 3;
+  uint64 allocation_generation = 4;
+  uint32 valid_tokens = 5;
+}
+
+// Mooncake sends this payload only from the destination after the associated
+// transfer batch has become visible there. Earlier batches may carry an empty
+// receipt list; the final batch carries contributions completed by the whole
+// sequential submission.
+message MooncakeKVNotification {
+  uint32 schema_version = 1;
+  string submission_id = 2;
+  uint32 batch_index = 3;
+  uint32 batch_count = 4;
+  repeated DecodeKVReceipt receipts = 5;
 }
 
 // Deprecated: Use DisaggGenerationsRequest instead
@@ -262,6 +317,8 @@ message DisaggGenerationsRequest {
   // Number of prompt tokens served from the prefill prefix cache.
   int32 num_cached_tokens = 15;
   repeated KVTransferGroup source_groups = 20;
+  uint64 attempt_epoch = 21;
+  uint64 allocation_generation = 22;
 }
 
 message DisaggGenerationsRequests {

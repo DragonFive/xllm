@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/distributed_runtime/pd_ooc_service.h"
 #include "core/framework/block/block.h"
 #include "core/framework/config/disagg_pd_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/engine.h"
@@ -246,6 +247,10 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
       0,                  // decode overhead
       10 * 1e9            // net
       ));
+
+  CHECK_EQ(::xllm::ParallelConfig::get_instance().kv_split_size_effective(), 1)
+      << "PD-OOC does not support kv_split_size > 1 because it does not "
+         "implement receiver-visible Decode KV readiness.";
 
   linear_saturation_bs_ = llm_flops_.linear_saturation_bs();
 
@@ -1464,13 +1469,10 @@ void PDOOCScheduler::dispatch_requests() {
     CHECK_EQ(requests.size(), resps.resps().size());
     for (size_t i = 0; i < requests.size(); ++i) {
       CHECK(!requests[i]->offline());
-      if (resps.resps()[i].status_code() != 200) {
-        if (is_permanent_rejection(resps.resps()[i].status_code())) {
-          LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
-                     << requests[i]->request_id() << ", prompt_tokens="
-                     << requests[i]->state().prompt_tokens.size()
-                     << ", selected_instance=" << selected_instance;
-          do_permanent_rejection(requests[i]);
+      const int32_t status_code = resps.resps()[i].status_code();
+      if (status_code != kDecodeAddNewRequestSuccessStatusCode) {
+        if (is_permanent_rejection(status_code)) {
+          do_permanent_rejection(requests[i], status_code);
           continue;
         }
         // push back to prefill_request_queue_
@@ -1949,19 +1951,16 @@ void PDOOCScheduler::dispatch_offline_requests() {
     stub->AddNewRequests(&cntl, &reqs, &resps, nullptr);
 
     // Check response and handle accordingly
-    const bool prompt_too_long =
-        !cntl.Failed() && !resps.resps().empty() &&
-        is_permanent_rejection(resps.resps()[0].status_code());
-    if (prompt_too_long) {
-      LOG(ERROR) << "Decode rejected an oversized offline prompt, request_id="
-                 << request->request_id()
-                 << ", prompt_tokens=" << request->state().prompt_tokens.size()
-                 << ", target_instance=" << target_instance;
-      do_permanent_rejection(request);
-      continue;
+    const bool has_response = !cntl.Failed() && !resps.resps().empty();
+    if (has_response) {
+      const int32_t status_code = resps.resps()[0].status_code();
+      if (is_permanent_rejection(status_code)) {
+        do_permanent_rejection(request, status_code);
+        continue;
+      }
     }
-    if (cntl.Failed() || resps.resps().empty() ||
-        resps.resps()[0].status_code() != 200) {
+    if (!has_response || resps.resps()[0].status_code() !=
+                             kDecodeAddNewRequestSuccessStatusCode) {
       LOG(ERROR) << "Failed to dispatch offline request "
                  << request->request_id() << " to " << target_instance
                  << ". Status: "

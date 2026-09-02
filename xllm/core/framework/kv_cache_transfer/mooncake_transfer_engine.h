@@ -19,7 +19,9 @@ limitations under the License.
 #include <brpc/channel.h>
 #include <brpc/server.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -27,6 +29,7 @@ limitations under the License.
 #include <vector>
 
 #include "framework/kv_cache_transfer/cache_layout.h"
+#include "framework/kv_cache_transfer/decode_kv_readiness.h"
 #include "framework/kv_cache_transfer/reshard_planner.h"
 #include "mooncake_transfer_engine.pb.h"
 #include "platform/device.h"
@@ -34,6 +37,35 @@ limitations under the License.
 namespace xllm {
 
 using namespace mooncake;
+
+namespace detail {
+
+inline constexpr size_t kMooncakeMaxRegionsPerBatch = 4096;
+inline constexpr char kMooncakeDecodeKVNotificationFramePrefix[] =
+    "xllm.decode-kv-notification.v1:";
+
+size_t mooncake_transfer_batch_count(size_t region_count);
+
+MooncakeDecodeKVNotification make_mooncake_batch_notification(
+    const MooncakeDecodeKVNotification& notification,
+    uint32_t batch_index,
+    uint32_t batch_count);
+
+std::string frame_mooncake_notification_payload(const std::string& payload);
+
+bool unframe_mooncake_notification_payload(const std::string& framed_payload,
+                                           std::string* payload,
+                                           std::string* error);
+
+bool drain_mooncake_pending_notifications(
+    std::deque<TransferMetadata::NotifyDesc>* pending_notifications,
+    const std::string& notification_name,
+    size_t max_notifications,
+    std::vector<std::string>* payloads,
+    bool* more_available,
+    std::string* error);
+
+}  // namespace detail
 
 class MooncakeTransferEngineService;
 
@@ -80,6 +112,11 @@ class MooncakeTransferEngineCore {
       int64_t layer_id,
       std::vector<ByteRegion>* regions) const;
 
+  bool drain_notifications(const std::string& notification_name,
+                           size_t max_notifications,
+                           std::vector<std::string>* payloads,
+                           bool* more_available);
+
   // Lazily create and cache the RPC stub for a remote cluster.
   proto::MooncakeTransferEngineService_Stub* get_or_create_stub(
       uint64_t cluster_id);
@@ -118,6 +155,8 @@ class MooncakeTransferEngineCore {
   std::unordered_map<std::string, ReshardPlanTemplate> outgoing_plans_;
   std::unordered_map<uint64_t, proto::MooncakeTransferEngineService_Stub*>
       stub_map_;
+  std::mutex notification_mutex_;
+  std::deque<TransferMetadata::NotifyDesc> pending_notifications_;
 };
 
 class MooncakeTransferEngine {
@@ -151,17 +190,25 @@ class MooncakeTransferEngine {
       const std::vector<BufferTransferMapping>& mappings,
       MoveOpcode move_opcode);
 
-  virtual bool move_memory_regions(const std::string& remote_addr,
-                                   const std::vector<ByteRegion>& regions,
-                                   MoveOpcode move_opcode);
+  virtual bool move_memory_regions(
+      const std::string& remote_addr,
+      const std::vector<ByteRegion>& regions,
+      MoveOpcode move_opcode,
+      const std::optional<MooncakeDecodeKVNotification>& notification =
+          std::nullopt);
+
+  virtual bool drain_notifications(const std::string& notification_name,
+                                   size_t max_notifications,
+                                   std::vector<std::string>* payloads,
+                                   bool* more_available);
 
   bool link_sessions(const std::vector<uint64_t>& cluster_ids,
                      const std::vector<std::string>& remote_addrs);
 
   Status set_local_cache_layout(const WorkerCacheLayoutManifest& manifest);
 
-  bool has_outgoing_plan(const std::string& remote_addr,
-                         CacheNamespace cache_namespace) const;
+  virtual bool has_outgoing_plan(const std::string& remote_addr,
+                                 CacheNamespace cache_namespace) const;
   virtual bool has_reshard_plan(const std::string& remote_addr) const;
 
   Status bind_outgoing_regions(const std::string& remote_addr,

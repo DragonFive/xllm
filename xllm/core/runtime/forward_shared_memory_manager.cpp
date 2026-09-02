@@ -220,7 +220,10 @@ inline size_t get_kv_transfer_mappings_size(
   size_t total = type_size<uint64_t>;
   for (const KVTransferMapping& mapping : mappings) {
     total += type_size<int32_t> + get_vector_size(mapping.local_ids) +
-             get_vector_size(mapping.remote_ids);
+             get_vector_size(mapping.remote_ids) +
+             get_vector_size(mapping.logical_block_ordinals) +
+             get_vector_size(mapping.valid_tokens) +
+             get_vector_size(mapping.receipt_remote_ids) + type_size<uint32_t>;
   }
   return total;
 }
@@ -228,6 +231,9 @@ inline size_t get_kv_transfer_mappings_size(
 inline size_t get_transfer_kv_info_size(const TransferKVInfo& info) {
   return get_string_size(info.request_id) + type_size<int32_t>  // dp_rank
          + get_instance_info_size(info.remote_instance_info) +
+         get_string_size(info.decode_kv_manifest) +
+         type_size<uint64_t> +  // attempt_epoch
+         type_size<uint64_t> +  // allocation_generation
          get_xtensor_layer_offsets_size(info.dst_xtensor_layer_offsets) +
          get_kv_transfer_mappings_size(info.mappings);
 }
@@ -800,6 +806,10 @@ inline void write_kv_transfer_mappings(
     write_data(buffer, mapping.group_id);
     write_vector(buffer, mapping.local_ids);
     write_vector(buffer, mapping.remote_ids);
+    write_vector(buffer, mapping.logical_block_ordinals);
+    write_vector(buffer, mapping.valid_tokens);
+    write_vector(buffer, mapping.receipt_remote_ids);
+    write_data(buffer, mapping.remote_shared_num);
   }
 }
 
@@ -811,6 +821,10 @@ inline void write_kv_transfer_mappings(
     write_data(context.descriptor, mapping.group_id);
     write_vector(context.descriptor, mapping.local_ids);
     write_vector(context.descriptor, mapping.remote_ids);
+    write_vector(context.descriptor, mapping.logical_block_ordinals);
+    write_vector(context.descriptor, mapping.valid_tokens);
+    write_vector(context.descriptor, mapping.receipt_remote_ids);
+    write_data(context.descriptor, mapping.remote_shared_num);
   }
 }
 
@@ -828,6 +842,9 @@ inline void write_transfer_kv_info(char*& buffer, const TransferKVInfo& info) {
   write_string(buffer, info.request_id);
   write_data(buffer, info.dp_rank);
   write_instance_info(buffer, info.remote_instance_info);
+  write_string(buffer, info.decode_kv_manifest);
+  write_data(buffer, info.attempt_epoch);
+  write_data(buffer, info.allocation_generation);
   write_xtensor_layer_offsets(buffer, info.dst_xtensor_layer_offsets);
   write_kv_transfer_mappings(buffer, info.mappings);
 }
@@ -837,6 +854,9 @@ inline void write_transfer_kv_info(RawInputSerializeContext& context,
   write_string(context.descriptor, info.request_id);
   write_data(context.descriptor, info.dp_rank);
   write_instance_info(context, info.remote_instance_info);
+  write_string(context.descriptor, info.decode_kv_manifest);
+  write_data(context.descriptor, info.attempt_epoch);
+  write_data(context.descriptor, info.allocation_generation);
   write_xtensor_layer_offsets(context, info.dst_xtensor_layer_offsets);
   write_kv_transfer_mappings(context, info.mappings);
 }
@@ -1743,6 +1763,10 @@ inline void read_kv_transfer_mappings(
     read_data(buffer, mapping.group_id);
     read_vector(buffer, mapping.local_ids);
     read_vector(buffer, mapping.remote_ids);
+    read_vector(buffer, mapping.logical_block_ordinals);
+    read_vector(buffer, mapping.valid_tokens);
+    read_vector(buffer, mapping.receipt_remote_ids);
+    read_data(buffer, mapping.remote_shared_num);
   }
 }
 
@@ -1756,6 +1780,10 @@ inline void read_kv_transfer_mappings(
     read_data(context, mapping.group_id);
     read_vector(context, mapping.local_ids);
     read_vector(context, mapping.remote_ids);
+    read_vector(context, mapping.logical_block_ordinals);
+    read_vector(context, mapping.valid_tokens);
+    read_vector(context, mapping.receipt_remote_ids);
+    read_data(context, mapping.remote_shared_num);
   }
 }
 
@@ -1775,6 +1803,9 @@ inline void read_transfer_kv_info(const char*& buffer, TransferKVInfo& info) {
   read_string(buffer, info.request_id);
   read_data(buffer, info.dp_rank);
   read_instance_info(buffer, info.remote_instance_info);
+  read_string(buffer, info.decode_kv_manifest);
+  read_data(buffer, info.attempt_epoch);
+  read_data(buffer, info.allocation_generation);
   read_xtensor_layer_offsets(buffer, info.dst_xtensor_layer_offsets);
   read_kv_transfer_mappings(buffer, info.mappings);
 }
@@ -1783,6 +1814,9 @@ inline void read_transfer_kv_info(ReadContext& context, TransferKVInfo& info) {
   read_string(context, info.request_id);
   read_data(context, info.dp_rank);
   read_instance_info(context, info.remote_instance_info);
+  read_string(context, info.decode_kv_manifest);
+  read_data(context, info.attempt_epoch);
+  read_data(context, info.allocation_generation);
   read_xtensor_layer_offsets(context, info.dst_xtensor_layer_offsets);
   read_kv_transfer_mappings(context, info.mappings);
 }

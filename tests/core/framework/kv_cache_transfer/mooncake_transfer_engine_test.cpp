@@ -20,17 +20,23 @@ limitations under the License.
 
 #if defined(USE_NPU)
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -54,6 +60,47 @@ namespace xllm {
 namespace {
 
 constexpr size_t kScaleBlockBytes = 96 * sizeof(float);
+
+#if defined(USE_NPU)
+constexpr std::chrono::seconds kTransferCompletionTimeout{5};
+
+bool round_trip_legacy_mooncake_notification(
+    const TransferMetadata::NotifyDesc& sent,
+    TransferMetadata::NotifyDesc* received) {
+  Json::Value outbound;
+  outbound["name"] = sent.name;
+  outbound["notify_msg"] = sent.notify_msg;
+  const std::string json = Json::FastWriter{}.write(outbound);
+
+  int sockets[2] = {-1, -1};
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+    return false;
+  }
+  const int32_t write_result = mooncake::writeString(
+      sockets[0], mooncake::HandShakeRequestType::Notify, json);
+  const auto [request_type, received_json] = mooncake::readString(sockets[1]);
+  close(sockets[0]);
+  close(sockets[1]);
+  if (write_result != 0 ||
+      request_type != mooncake::HandShakeRequestType::Notify) {
+    return false;
+  }
+
+  Json::CharReaderBuilder builder;
+  std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+  Json::Value inbound;
+  std::string error;
+  if (!reader->parse(received_json.data(),
+                     received_json.data() + received_json.size(),
+                     &inbound,
+                     &error)) {
+    return false;
+  }
+  received->name = inbound["name"].asString();
+  received->notify_msg = inbound["notify_msg"].asString();
+  return true;
+}
+#endif
 
 TransferKVInfo make_info(int32_t dst_dp_size,
                          int32_t dst_tp_size,
@@ -82,6 +129,598 @@ ParallelArgs make_args(int32_t rank, int32_t world_size, int32_t dp_size) {
   return ParallelArgs(rank, world_size, dp_size, nullptr);
 }
 
+class GenericKVCacheTransferForTest final : public KVCacheTransfer {
+ public:
+  void get_cache_info(uint64_t& cluster_id, std::string& addr) override {
+    cluster_id = 0;
+    addr.clear();
+  }
+
+  bool link_clusters(const std::vector<uint64_t>& cluster_ids,
+                     const std::vector<std::string>& remote_addrs,
+                     const std::vector<uint16_t>& ports) override {
+    return cluster_ids.size() == remote_addrs.size() &&
+           cluster_ids.size() == ports.size();
+  }
+
+  bool unlink_cluster(const uint64_t& cluster_id,
+                      const std::string& remote_addr,
+                      uint16_t port,
+                      bool force_flag) override {
+    return cluster_id == 0 && remote_addr.empty() && port == 0 && force_flag;
+  }
+
+  bool pull_kv_blocks(const uint64_t src_cluster_id,
+                      const std::string& src_addr,
+                      const std::vector<KVTransferMapping>& mappings) override {
+    return src_cluster_id == 0 && src_addr.empty() && mappings.empty();
+  }
+
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  bool push_kv_blocks(
+      std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
+      std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,
+      bool is_spec_draft,
+      int32_t kv_split_rank,
+      int32_t kv_split_size) override {
+    return merged_kv_infos.empty() && layer_synchronizer == nullptr &&
+           !is_spec_draft && kv_split_rank == 0 && kv_split_size == 1;
+  }
+#endif
+};
+
+DecodeKVExpectedContribution make_expected_contribution(
+    int32_t source_worker_rank,
+    int32_t destination_worker_rank,
+    int64_t layer_id,
+    int32_t group_id,
+    KVCacheTensorRole::Value cache_role,
+    uint64_t logical_block_ordinal,
+    uint64_t destination_physical_block_id,
+    uint32_t valid_tokens) {
+  DecodeKVExpectedContribution contribution;
+  contribution.key.source_worker_rank = source_worker_rank;
+  contribution.key.destination_worker_rank = destination_worker_rank;
+  contribution.key.layer_id = layer_id;
+  contribution.key.group_id = group_id;
+  contribution.key.cache_role = cache_role;
+  contribution.key.logical_block_ordinal = logical_block_ordinal;
+  contribution.key.destination_physical_block_id =
+      destination_physical_block_id;
+  contribution.valid_tokens = valid_tokens;
+  return contribution;
+}
+
+TransferKVInfo make_strict_receipt_info(
+    const std::string& request_id,
+    uint64_t attempt_epoch,
+    uint64_t allocation_generation,
+    std::vector<KVTransferMapping> mappings,
+    std::vector<DecodeKVExpectedContribution> contributions) {
+  DecodeKVExpectedManifest manifest;
+  manifest.request_id = request_id;
+  manifest.attempt_epoch = attempt_epoch;
+  manifest.allocation_generation = allocation_generation;
+  manifest.contributions = std::move(contributions);
+
+  TransferKVInfo info;
+  info.request_id = request_id;
+  info.attempt_epoch = attempt_epoch;
+  info.allocation_generation = allocation_generation;
+  info.mappings = std::move(mappings);
+  std::string error;
+  EXPECT_TRUE(serialize_decode_kv_expected_manifest(
+      manifest, &info.decode_kv_manifest, &error))
+      << error;
+  return info;
+}
+
+TEST(MooncakeTransferEngineTest,
+     PreparesLayerReceiptsOnceWithAllCacheRolesAndIdentity) {
+  constexpr int32_t kSourceWorkerRank = 2;
+  constexpr int32_t kDestinationWorkerRank = 3;
+  constexpr int32_t kGroupId = 17;
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+
+  KVTransferMapping mapping;
+  mapping.group_id = kGroupId;
+  mapping.remote_ids = {41, 42};
+  mapping.logical_block_ordinals = {5, 6};
+  mapping.valid_tokens = {16, 3};
+  mapping.receipt_remote_ids = {42};
+
+  std::vector<DecodeKVExpectedContribution> contributions;
+  for (int64_t layer_id = 0; layer_id < 2; ++layer_id) {
+    contributions.emplace_back(
+        make_expected_contribution(kSourceWorkerRank,
+                                   kDestinationWorkerRank,
+                                   layer_id,
+                                   kGroupId,
+                                   KVCacheTensorRole::KEY,
+                                   /*logical_block_ordinal=*/5,
+                                   /*destination_physical_block_id=*/41,
+                                   /*valid_tokens=*/16));
+    contributions.emplace_back(
+        make_expected_contribution(kSourceWorkerRank,
+                                   kDestinationWorkerRank,
+                                   layer_id,
+                                   kGroupId,
+                                   KVCacheTensorRole::KEY,
+                                   /*logical_block_ordinal=*/6,
+                                   /*destination_physical_block_id=*/42,
+                                   /*valid_tokens=*/3));
+    contributions.emplace_back(
+        make_expected_contribution(kSourceWorkerRank,
+                                   kDestinationWorkerRank,
+                                   layer_id,
+                                   kGroupId,
+                                   KVCacheTensorRole::VALUE,
+                                   /*logical_block_ordinal=*/6,
+                                   /*destination_physical_block_id=*/42,
+                                   /*valid_tokens=*/3));
+  }
+
+  KVCacheTransfer::KVCacheInfo kv_info;
+  kv_info.source_worker_rank = kSourceWorkerRank;
+  kv_info.destination_worker_rank = kDestinationWorkerRank;
+  kv_info.receipt_infos.emplace_back(
+      make_strict_receipt_info("request-a",
+                               kAttemptEpoch,
+                               kAllocationGeneration,
+                               {mapping},
+                               std::move(contributions)));
+
+  detail::PreparedMooncakeDecodeKVNotifications prepared;
+  std::string error;
+  ASSERT_TRUE(detail::prepare_mooncake_decode_kv_notifications(
+      kv_info, /*num_layers=*/2, &prepared, &error))
+      << error;
+  ASSERT_EQ(prepared.receipts_by_layer.size(), 2u);
+  for (int64_t layer_id = 0; layer_id < 2; ++layer_id) {
+    const std::vector<DecodeKVReceipt>& receipts =
+        prepared.receipts_by_layer[static_cast<size_t>(layer_id)];
+    ASSERT_EQ(receipts.size(), 2u);
+    EXPECT_EQ(receipts[0].request_id, "request-a");
+    EXPECT_EQ(receipts[0].attempt_epoch, kAttemptEpoch);
+    EXPECT_EQ(receipts[0].allocation_generation, kAllocationGeneration);
+    EXPECT_EQ(receipts[0].key.layer_id, layer_id);
+    EXPECT_EQ(receipts[0].key.cache_role, KVCacheTensorRole::KEY);
+    EXPECT_EQ(receipts[1].key.cache_role, KVCacheTensorRole::VALUE);
+    for (const DecodeKVReceipt& receipt : receipts) {
+      EXPECT_EQ(receipt.key.logical_block_ordinal, 6u);
+      EXPECT_EQ(receipt.key.destination_physical_block_id, 42u);
+      EXPECT_EQ(receipt.valid_tokens, 3u);
+      EXPECT_EQ(receipt.completion_level,
+                DecodeKVCompletionLevel::REMOTE_VISIBLE);
+    }
+  }
+}
+
+TEST(MooncakeTransferEngineTest,
+     PreparedReceiptsPreserveFirstDuplicateRemoteMapping) {
+  constexpr int32_t kGroupId = 17;
+  KVTransferMapping mapping;
+  mapping.group_id = kGroupId;
+  mapping.remote_ids = {42, 42};
+  mapping.logical_block_ordinals = {7, 8};
+  mapping.valid_tokens = {16, 4};
+  mapping.receipt_remote_ids = {42};
+
+  std::vector<DecodeKVExpectedContribution> contributions;
+  for (int64_t layer_id = 0; layer_id < 2; ++layer_id) {
+    contributions.emplace_back(make_expected_contribution(
+        /*source_worker_rank=*/2,
+        /*destination_worker_rank=*/3,
+        layer_id,
+        kGroupId,
+        KVCacheTensorRole::KEY,
+        /*logical_block_ordinal=*/7,
+        /*destination_physical_block_id=*/42,
+        /*valid_tokens=*/16));
+  }
+
+  KVCacheTransfer::KVCacheInfo kv_info;
+  kv_info.source_worker_rank = 2;
+  kv_info.destination_worker_rank = 3;
+  kv_info.receipt_infos.emplace_back(
+      make_strict_receipt_info("request-a",
+                               /*attempt_epoch=*/7,
+                               /*allocation_generation=*/11,
+                               {mapping},
+                               std::move(contributions)));
+
+  detail::PreparedMooncakeDecodeKVNotifications prepared;
+  std::string error;
+  ASSERT_TRUE(detail::prepare_mooncake_decode_kv_notifications(
+      kv_info, /*num_layers=*/2, &prepared, &error))
+      << error;
+  ASSERT_EQ(prepared.receipts_by_layer.size(), 2u);
+  for (const std::vector<DecodeKVReceipt>& receipts :
+       prepared.receipts_by_layer) {
+    ASSERT_EQ(receipts.size(), 1u);
+    EXPECT_EQ(receipts[0].key.logical_block_ordinal, 7u);
+    EXPECT_EQ(receipts[0].valid_tokens, 16u);
+  }
+}
+
+TEST(MooncakeTransferEngineTest, PreparedReceiptsRejectIdentityAndTokenDrift) {
+  constexpr int32_t kGroupId = 17;
+  KVTransferMapping mapping;
+  mapping.group_id = kGroupId;
+  mapping.remote_ids = {42};
+  mapping.logical_block_ordinals = {7};
+  mapping.valid_tokens = {16};
+  mapping.receipt_remote_ids = {42};
+  std::vector<DecodeKVExpectedContribution> contributions = {
+      make_expected_contribution(/*source_worker_rank=*/2,
+                                 /*destination_worker_rank=*/3,
+                                 /*layer_id=*/0,
+                                 kGroupId,
+                                 KVCacheTensorRole::KEY,
+                                 /*logical_block_ordinal=*/7,
+                                 /*destination_physical_block_id=*/42,
+                                 /*valid_tokens=*/16)};
+
+  KVCacheTransfer::KVCacheInfo kv_info;
+  kv_info.source_worker_rank = 2;
+  kv_info.destination_worker_rank = 3;
+  kv_info.receipt_infos.emplace_back(
+      make_strict_receipt_info("request-a",
+                               /*attempt_epoch=*/7,
+                               /*allocation_generation=*/11,
+                               {mapping},
+                               contributions));
+
+  detail::PreparedMooncakeDecodeKVNotifications prepared;
+  std::string error;
+  kv_info.receipt_infos[0].attempt_epoch = 8;
+  EXPECT_FALSE(detail::prepare_mooncake_decode_kv_notifications(
+      kv_info, /*num_layers=*/1, &prepared, &error));
+  EXPECT_NE(error.find("identity"), std::string::npos);
+
+  kv_info.receipt_infos[0].attempt_epoch = 7;
+  kv_info.receipt_infos[0].mappings[0].valid_tokens[0] = 15;
+  EXPECT_FALSE(detail::prepare_mooncake_decode_kv_notifications(
+      kv_info, /*num_layers=*/1, &prepared, &error));
+  EXPECT_NE(error.find("valid-token"), std::string::npos);
+}
+
+TEST(MooncakeTransferEngineTest,
+     RegionBatchingPublishesReceiptsOnlyOnFinalBatch) {
+  EXPECT_EQ(detail::mooncake_transfer_batch_count(/*region_count=*/0), 0u);
+  EXPECT_EQ(detail::mooncake_transfer_batch_count(/*region_count=*/4096), 1u);
+  EXPECT_EQ(detail::mooncake_transfer_batch_count(/*region_count=*/4097), 2u);
+
+  MooncakeDecodeKVNotification notification;
+  notification.submission_id = "submission-a";
+  DecodeKVReceipt receipt;
+  receipt.request_id = "request-a";
+  receipt.attempt_epoch = 7;
+  receipt.allocation_generation = 11;
+  receipt.valid_tokens = 3;
+  receipt.completion_level = DecodeKVCompletionLevel::REMOTE_VISIBLE;
+  notification.receipts.emplace_back(std::move(receipt));
+
+  const MooncakeDecodeKVNotification first_batch =
+      detail::make_mooncake_batch_notification(
+          notification, /*batch_index=*/0, /*batch_count=*/2);
+  EXPECT_EQ(first_batch.batch_index, 0u);
+  EXPECT_EQ(first_batch.batch_count, 2u);
+  EXPECT_TRUE(first_batch.receipts.empty());
+
+  const MooncakeDecodeKVNotification final_batch =
+      detail::make_mooncake_batch_notification(
+          notification, /*batch_index=*/1, /*batch_count=*/2);
+  EXPECT_EQ(final_batch.batch_index, 1u);
+  EXPECT_EQ(final_batch.batch_count, 2u);
+  ASSERT_EQ(final_batch.receipts.size(), 1u);
+  EXPECT_EQ(final_batch.receipts.front().request_id, "request-a");
+}
+
+TEST(MooncakeTransferEngineTest, PendingNotificationDrainIsBoundedAndFiltered) {
+  const std::string first =
+      detail::frame_mooncake_notification_payload("first");
+  const std::string second =
+      detail::frame_mooncake_notification_payload("second");
+  const std::string third =
+      detail::frame_mooncake_notification_payload("third");
+  std::deque<TransferMetadata::NotifyDesc> pending = {
+      {"other", "unrelated"},
+      {kMooncakeDecodeKVNotificationName, first},
+      {kMooncakeDecodeKVNotificationName, second},
+      {kMooncakeDecodeKVNotificationName, third}};
+  std::vector<std::string> payloads;
+  bool more_available = false;
+  std::string error;
+
+  ASSERT_TRUE(detail::drain_mooncake_pending_notifications(
+      &pending,
+      kMooncakeDecodeKVNotificationName,
+      /*max_notifications=*/2,
+      &payloads,
+      &more_available,
+      &error))
+      << error;
+  EXPECT_EQ(payloads, (std::vector<std::string>{"first", "second"}));
+  EXPECT_TRUE(more_available);
+  ASSERT_EQ(pending.size(), 2u);
+  EXPECT_EQ(pending.front().name, "other");
+
+  ASSERT_TRUE(detail::drain_mooncake_pending_notifications(
+      &pending,
+      kMooncakeDecodeKVNotificationName,
+      /*max_notifications=*/2,
+      &payloads,
+      &more_available,
+      &error))
+      << error;
+  EXPECT_EQ(payloads, (std::vector<std::string>{"third"}));
+  EXPECT_FALSE(more_available);
+  ASSERT_EQ(pending.size(), 1u);
+  EXPECT_EQ(pending.front().notify_msg, "unrelated");
+}
+
+TEST(MooncakeTransferEngineTest,
+     NotificationCarrierFramePreservesEmptyReceiptPayload) {
+  MooncakeDecodeKVNotification notification;
+  notification.submission_id = "submission-empty";
+
+  std::string serialized;
+  std::string error;
+  ASSERT_TRUE(serialize_mooncake_decode_kv_notification(
+      notification, &serialized, &error))
+      << error;
+
+  std::string decoded;
+  ASSERT_TRUE(detail::unframe_mooncake_notification_payload(
+      serialized, &decoded, &error))
+      << error;
+  EXPECT_EQ(decoded, serialized);
+
+  const std::string framed =
+      detail::frame_mooncake_notification_payload(serialized);
+  EXPECT_TRUE(std::all_of(framed.begin(), framed.end(), [](char byte) {
+    return static_cast<unsigned char>(byte) < 0x80;
+  }));
+
+  decoded.clear();
+  ASSERT_TRUE(
+      detail::unframe_mooncake_notification_payload(framed, &decoded, &error))
+      << error;
+  EXPECT_EQ(decoded, serialized);
+
+  MooncakeDecodeKVNotification parsed;
+  ASSERT_EQ(
+      deserialize_mooncake_decode_kv_notification(decoded, &parsed, &error),
+      DecodeKVPayloadResult::OK)
+      << error;
+  EXPECT_EQ(parsed.submission_id, notification.submission_id);
+  EXPECT_TRUE(parsed.receipts.empty());
+}
+
+TEST(MooncakeTransferEngineTest,
+     NotificationCarrierFrameRejectsMalformedInputsAndPartialDrain) {
+  std::string decoded = "stale";
+  std::string error;
+  ASSERT_TRUE(detail::unframe_mooncake_notification_payload(
+      "legacy-raw-payload", &decoded, &error));
+  EXPECT_EQ(decoded, "legacy-raw-payload");
+
+  decoded = "stale";
+  error.clear();
+  EXPECT_FALSE(detail::unframe_mooncake_notification_payload(
+      std::string(detail::kMooncakeDecodeKVNotificationFramePrefix) + "1:%",
+      &decoded,
+      &error));
+  EXPECT_TRUE(decoded.empty());
+  EXPECT_NE(error.find("Base64"), std::string::npos);
+
+  decoded = "stale";
+  error.clear();
+  const std::string length_mismatch =
+      std::string(detail::kMooncakeDecodeKVNotificationFramePrefix) + "2:YQ==";
+  EXPECT_FALSE(detail::unframe_mooncake_notification_payload(
+      length_mismatch, &decoded, &error));
+  EXPECT_TRUE(decoded.empty());
+  EXPECT_NE(error.find("length mismatch"), std::string::npos);
+
+  std::deque<TransferMetadata::NotifyDesc> pending = {
+      {kMooncakeDecodeKVNotificationName,
+       detail::frame_mooncake_notification_payload("valid")},
+      {kMooncakeDecodeKVNotificationName, length_mismatch}};
+  std::vector<std::string> payloads = {"stale"};
+  bool more_available = true;
+  error.clear();
+  EXPECT_FALSE(detail::drain_mooncake_pending_notifications(
+      &pending,
+      kMooncakeDecodeKVNotificationName,
+      /*max_notifications=*/2,
+      &payloads,
+      &more_available,
+      &error));
+  EXPECT_TRUE(payloads.empty());
+  EXPECT_FALSE(more_available);
+  EXPECT_NE(error.find("length mismatch"), std::string::npos);
+}
+
+#if defined(USE_NPU)
+TEST(MooncakeTransferEngineTest,
+     FramedCarrierPreservesMultiReceiptProtobufPayload) {
+  MooncakeDecodeKVNotification notification;
+  notification.submission_id = "submission-b38";
+  for (uint64_t logical_block_ordinal = 0; logical_block_ordinal < 3;
+       ++logical_block_ordinal) {
+    for (KVCacheTensorRole::Value cache_role :
+         {KVCacheTensorRole::KEY,
+          KVCacheTensorRole::INDEX,
+          KVCacheTensorRole::INDEX_SCALE}) {
+      DecodeKVReceipt receipt;
+      receipt.request_id =
+          "chatcmpl-17447825819546509822-6MTPgjcwuPrzo4DDYZwuzm";
+      receipt.key.source_worker_rank = 0;
+      receipt.key.destination_worker_rank = 0;
+      receipt.key.layer_id = 0;
+      receipt.key.group_id = cache_group_id(BlockType::KV);
+      receipt.key.cache_role = cache_role;
+      receipt.key.logical_block_ordinal = logical_block_ordinal;
+      receipt.key.destination_physical_block_id = 128 + logical_block_ordinal;
+      receipt.attempt_epoch = 1788014343;
+      receipt.allocation_generation = 1;
+      receipt.valid_tokens = logical_block_ordinal == 2 ? 37 : 128;
+      receipt.completion_level = DecodeKVCompletionLevel::REMOTE_VISIBLE;
+      notification.receipts.emplace_back(std::move(receipt));
+    }
+  }
+
+  std::string serialized;
+  std::string error;
+  ASSERT_TRUE(serialize_mooncake_decode_kv_notification(
+      notification, &serialized, &error))
+      << error;
+  ASSERT_TRUE(std::any_of(serialized.begin(), serialized.end(), [](char byte) {
+    return static_cast<unsigned char>(byte) >= 0x80;
+  }));
+
+  TransferMetadata::NotifyDesc raw_sent{kMooncakeDecodeKVNotificationName,
+                                        serialized};
+  TransferMetadata::NotifyDesc raw_received;
+  ASSERT_TRUE(round_trip_legacy_mooncake_notification(raw_sent, &raw_received));
+  EXPECT_NE(raw_received.notify_msg, serialized);
+  MooncakeDecodeKVNotification corrupted;
+  EXPECT_EQ(deserialize_mooncake_decode_kv_notification(
+                raw_received.notify_msg, &corrupted, &error),
+            DecodeKVPayloadResult::MALFORMED);
+
+  const std::string framed =
+      detail::frame_mooncake_notification_payload(serialized);
+  ASSERT_TRUE(std::all_of(framed.begin(), framed.end(), [](char byte) {
+    return static_cast<unsigned char>(byte) < 0x80;
+  }));
+  TransferMetadata::NotifyDesc sent{kMooncakeDecodeKVNotificationName, framed};
+  TransferMetadata::NotifyDesc received;
+  ASSERT_TRUE(round_trip_legacy_mooncake_notification(sent, &received));
+  ASSERT_EQ(received.name, sent.name);
+
+  std::deque<TransferMetadata::NotifyDesc> pending = {std::move(received)};
+  std::vector<std::string> payloads;
+  bool more_available = false;
+  ASSERT_TRUE(detail::drain_mooncake_pending_notifications(
+      &pending,
+      kMooncakeDecodeKVNotificationName,
+      /*max_notifications=*/1,
+      &payloads,
+      &more_available,
+      &error))
+      << error;
+  ASSERT_EQ(payloads.size(), 1u);
+  EXPECT_EQ(payloads.front(), serialized);
+
+  MooncakeDecodeKVNotification parsed;
+  ASSERT_EQ(deserialize_mooncake_decode_kv_notification(
+                payloads.front(), &parsed, &error),
+            DecodeKVPayloadResult::OK)
+      << error;
+  EXPECT_EQ(parsed.submission_id, notification.submission_id);
+  EXPECT_EQ(parsed.receipts.size(), notification.receipts.size());
+}
+#endif
+
+TEST(KVTransferObservabilityTest, AggregatesBlockCountsByRequestAndGroup) {
+  TransferKVInfo first;
+  first.request_id = "request-a";
+
+  KVTransferMapping kv_mapping;
+  kv_mapping.group_id = cache_group_id(BlockType::KV);
+  kv_mapping.local_ids = {1, 2};
+  kv_mapping.remote_ids = {11, 12};
+  first.mappings.emplace_back(std::move(kv_mapping));
+
+  KVTransferMapping linear_mapping;
+  linear_mapping.group_id = cache_group_id(BlockType::LINEAR);
+  linear_mapping.local_ids = {3};
+  linear_mapping.remote_ids = {13};
+  first.mappings.emplace_back(std::move(linear_mapping));
+
+  TransferKVInfo second = first;
+  second.mappings.resize(1);
+  second.mappings[0].local_ids = {4};
+  second.mappings[0].remote_ids = {14};
+
+  TransferKVInfo third = second;
+  third.request_id = "request-b";
+
+  std::vector<detail::KVTransferTraceRequest> requests;
+  detail::append_kv_transfer_trace_request(&requests, first);
+  detail::append_kv_transfer_trace_request(&requests, second);
+  detail::append_kv_transfer_trace_request(&requests, third);
+
+  ASSERT_EQ(requests.size(), 2U);
+  EXPECT_EQ(requests[0].request_id, "request-a");
+  ASSERT_EQ(requests[0].groups.size(), 2U);
+  EXPECT_EQ(requests[0].groups[0].group_id, cache_group_id(BlockType::KV));
+  EXPECT_EQ(requests[0].groups[0].local_block_count, 3U);
+  EXPECT_EQ(requests[0].groups[0].remote_block_count, 3U);
+  EXPECT_EQ(requests[0].groups[0].local_block_ids,
+            (std::vector<uint64_t>{1, 2, 4}));
+  EXPECT_EQ(requests[0].groups[0].remote_block_ids,
+            (std::vector<uint64_t>{11, 12, 14}));
+  EXPECT_EQ(requests[0].groups[1].group_id, cache_group_id(BlockType::LINEAR));
+  EXPECT_EQ(requests[0].groups[1].local_block_count, 1U);
+  EXPECT_EQ(requests[0].groups[1].remote_block_count, 1U);
+  EXPECT_EQ(requests[0].groups[1].local_block_ids, (std::vector<uint64_t>{3}));
+  EXPECT_EQ(requests[0].groups[1].remote_block_ids,
+            (std::vector<uint64_t>{13}));
+
+  EXPECT_EQ(requests[1].request_id, "request-b");
+  ASSERT_EQ(requests[1].groups.size(), 1U);
+  EXPECT_EQ(requests[1].groups[0].group_id, cache_group_id(BlockType::KV));
+  EXPECT_EQ(requests[1].groups[0].local_block_count, 1U);
+  EXPECT_EQ(requests[1].groups[0].remote_block_count, 1U);
+  EXPECT_EQ(requests[1].groups[0].local_block_ids, (std::vector<uint64_t>{4}));
+  EXPECT_EQ(requests[1].groups[0].remote_block_ids,
+            (std::vector<uint64_t>{14}));
+}
+
+TEST(KVTransferObservabilityTest, AggregatesFilteredPartialTailOwnerCounts) {
+  TransferKVInfo info;
+  info.request_id = "partial-tail";
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.local_ids = {1, 2};
+  mapping.remote_ids = {11, 12, 13};
+  info.mappings.emplace_back(std::move(mapping));
+
+  const std::vector<TransferKVInfo> owner_zero =
+      filter_kv_split_infos(/*kv_split_rank=*/0, /*kv_split_size=*/2, {info});
+  const std::vector<TransferKVInfo> owner_one =
+      filter_kv_split_infos(/*kv_split_rank=*/1, /*kv_split_size=*/2, {info});
+  ASSERT_EQ(owner_zero.size(), 1U);
+  ASSERT_EQ(owner_one.size(), 1U);
+
+  std::vector<detail::KVTransferTraceRequest> owner_zero_trace;
+  std::vector<detail::KVTransferTraceRequest> owner_one_trace;
+  detail::append_kv_transfer_trace_request(&owner_zero_trace, owner_zero[0]);
+  detail::append_kv_transfer_trace_request(&owner_one_trace, owner_one[0]);
+
+  ASSERT_EQ(owner_zero_trace.size(), 1U);
+  ASSERT_EQ(owner_zero_trace[0].groups.size(), 1U);
+  EXPECT_EQ(owner_zero_trace[0].groups[0].local_block_count, 2U);
+  EXPECT_EQ(owner_zero_trace[0].groups[0].remote_block_count, 2U);
+  EXPECT_EQ(owner_zero_trace[0].groups[0].local_block_ids,
+            (std::vector<uint64_t>{1, 2}));
+  EXPECT_EQ(owner_zero_trace[0].groups[0].remote_block_ids,
+            (std::vector<uint64_t>{11, 13}));
+  ASSERT_EQ(owner_one_trace.size(), 1U);
+  ASSERT_EQ(owner_one_trace[0].groups.size(), 1U);
+  EXPECT_EQ(owner_one_trace[0].groups[0].local_block_count, 1U);
+  EXPECT_EQ(owner_one_trace[0].groups[0].remote_block_count, 1U);
+  EXPECT_EQ(owner_one_trace[0].groups[0].local_block_ids,
+            (std::vector<uint64_t>{1}));
+  EXPECT_EQ(owner_one_trace[0].groups[0].remote_block_ids,
+            (std::vector<uint64_t>{12}));
+}
+
 class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
  public:
   struct MoveCall {
@@ -107,6 +746,7 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
                           const std::vector<BufferTransferMapping>& mappings,
                           MoveOpcode opcode) override {
     move_calls.emplace_back(MoveCall{remote_addr, mappings, opcode});
+    move_call_count_.fetch_add(/*arg=*/1, std::memory_order_release);
     return move_result;
   }
 
@@ -114,19 +754,44 @@ class RecordingMooncakeTransferEngine final : public MooncakeTransferEngine {
     return planned_addrs.find(remote_addr) != planned_addrs.end();
   }
 
+  bool has_outgoing_plan(const std::string& remote_addr,
+                         CacheNamespace cache_namespace) const override {
+    return cache_namespace == CacheNamespace::MAIN &&
+           outgoing_addrs.find(remote_addr) != outgoing_addrs.end();
+  }
+
   bool move_result = true;
   std::unordered_set<std::string> planned_addrs;
+  std::unordered_set<std::string> outgoing_addrs;
   std::vector<std::vector<void*>> registered_addrs;
   std::vector<std::vector<size_t>> registered_lens;
   std::vector<std::vector<uint64_t>> registered_block_bytes;
   std::vector<MoveCall> move_calls;
+  std::atomic<size_t> move_call_count_{0};
 };
+
+#if defined(USE_NPU)
+bool wait_for_exact_move_call_count(
+    const RecordingMooncakeTransferEngine& engine,
+    size_t expected_count) {
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + kTransferCompletionTimeout;
+  while (engine.move_call_count_.load(std::memory_order_acquire) <
+             expected_count &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  return engine.move_call_count_.load(std::memory_order_acquire) ==
+         expected_count;
+}
+#endif
 
 TEST(MooncakeKVCacheTransferDefaultTest,
      NegotiatedPlansFilterDestinationDpGroup) {
   auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
       /*listen_port=*/0, torch::Device(torch::kCPU));
   engine->planned_addrs = {"addr_1", "addr_3"};
+  engine->outgoing_addrs = {"addr_1", "addr_3"};
   MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
                                           /*listen_port=*/0,
                                           torch::Device(torch::kCPU),
@@ -145,6 +810,30 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   ASSERT_EQ(merged_kv_infos.size(), 2U);
   EXPECT_NE(merged_kv_infos.find("101_addr_1"), merged_kv_infos.end());
   EXPECT_NE(merged_kv_infos.find("103_addr_3"), merged_kv_infos.end());
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     NegotiatedEmptyOutgoingPlansDoNotUseLegacyFanout) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  engine->planned_addrs = {"addr_0", "addr_1", "addr_2", "addr_3"};
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                  /*dst_tp_size=*/4,
+                                  /*dst_dp_rank=*/0);
+  info.decode_kv_manifest = "strict-manifest";
+  const ParallelArgs parallel_args = make_args(/*rank=*/1,
+                                               /*world_size=*/4,
+                                               /*dp_size=*/1);
+  std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo> merged_kv_infos;
+
+  transfer.merge_kv_blocks(merged_kv_infos, {info}, parallel_args);
+
+  EXPECT_TRUE(merged_kv_infos.empty());
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
@@ -167,6 +856,66 @@ TEST(MooncakeKVCacheTransferDefaultTest,
   transfer.merge_kv_blocks(merged_kv_infos, {info}, parallel_args);
 
   EXPECT_EQ(merged_kv_infos.size(), 4U);
+}
+
+TEST(KVCacheTransferBatchMergeTest,
+     GenericMergeAllowsRequestScopedSharedPrefixLengths) {
+  GenericKVCacheTransferForTest transfer;
+  TransferKVInfo first = make_info(/*dst_dp_size=*/1,
+                                   /*dst_tp_size=*/1,
+                                   /*dst_dp_rank=*/0);
+  first.request_id = "short-prefix";
+  first.mappings[0].remote_shared_num = 1;
+  TransferKVInfo second = first;
+  second.request_id = "long-prefix";
+  second.mappings[0].local_ids = {13};
+  second.mappings[0].remote_ids = {23};
+  second.mappings[0].remote_shared_num = 2;
+  const ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                               /*world_size=*/1,
+                                               /*dp_size=*/1);
+  std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo> merged_kv_infos;
+
+  transfer.merge_kv_blocks(merged_kv_infos, {first, second}, parallel_args);
+
+  ASSERT_EQ(merged_kv_infos.size(), 1U);
+  const auto& mappings = merged_kv_infos.begin()->second.mappings;
+  ASSERT_EQ(mappings.size(), 1U);
+  EXPECT_EQ(mappings[0].local_ids, (std::vector<uint64_t>{11, 12, 13}));
+  EXPECT_EQ(mappings[0].remote_ids, (std::vector<uint64_t>{21, 22, 23}));
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     MergeAllowsRequestScopedSharedPrefixLengths) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  TransferKVInfo first = make_info(/*dst_dp_size=*/1,
+                                   /*dst_tp_size=*/1,
+                                   /*dst_dp_rank=*/0);
+  first.request_id = "short-prefix";
+  first.mappings[0].remote_shared_num = 1;
+  TransferKVInfo second = first;
+  second.request_id = "long-prefix";
+  second.mappings[0].local_ids = {13};
+  second.mappings[0].remote_ids = {23};
+  second.mappings[0].remote_shared_num = 2;
+  const ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                               /*world_size=*/1,
+                                               /*dp_size=*/1);
+  std::unordered_map<std::string, KVCacheTransfer::KVCacheInfo> merged_kv_infos;
+
+  transfer.merge_kv_blocks(merged_kv_infos, {first, second}, parallel_args);
+
+  ASSERT_EQ(merged_kv_infos.size(), 1U);
+  const auto& mappings = merged_kv_infos.begin()->second.mappings;
+  ASSERT_EQ(mappings.size(), 1U);
+  EXPECT_EQ(mappings[0].local_ids, (std::vector<uint64_t>{11, 12, 13}));
+  EXPECT_EQ(mappings[0].remote_ids, (std::vector<uint64_t>{21, 22, 23}));
 }
 
 #if defined(USE_NPU)
@@ -844,6 +1593,39 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
+     PushRejectsPartialStrictReadinessIdentityBeforeMerge) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  const ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                               /*world_size=*/1,
+                                               /*dp_size=*/1);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
+
+  TransferKVInfo attempt_only = make_info(/*dst_dp_size=*/1,
+                                          /*dst_tp_size=*/1,
+                                          /*dst_dp_rank=*/0);
+  attempt_only.attempt_epoch = 7;
+  folly::SemiFuture<bool> attempt_future = transfer.push_kv_blocks_async(
+      {attempt_only}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_FALSE(std::move(attempt_future).get());
+
+  TransferKVInfo allocation_only = make_info(/*dst_dp_size=*/1,
+                                             /*dst_tp_size=*/1,
+                                             /*dst_dp_rank=*/0);
+  allocation_only.allocation_generation = 11;
+  folly::SemiFuture<bool> allocation_future = transfer.push_kv_blocks_async(
+      {allocation_only}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_FALSE(std::move(allocation_future).get());
+  EXPECT_TRUE(engine_observer->move_calls.empty());
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
      KvSplitFilterAcceptsCompleteAndPartialFinalCoverage) {
   TransferKVInfo info = make_info(/*dst_dp_size=*/1,
                                   /*dst_tp_size=*/1,
@@ -867,6 +1649,151 @@ TEST(MooncakeKVCacheTransferDefaultTest,
             (std::vector<uint64_t>{11}));
   EXPECT_EQ(rank_one_infos[0].mappings[0].remote_ids,
             (std::vector<uint64_t>{22}));
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     KvSplitFilterUsesOrdinalsForPartialFirstAndLastBlocks) {
+  TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                  /*dst_tp_size=*/1,
+                                  /*dst_dp_rank=*/0);
+  info.mappings[0].local_ids = {31, 32, 33};
+  info.mappings[0].remote_ids = {103, 104, 105, 106};
+  info.mappings[0].logical_block_ordinals = {3, 4, 5, 6};
+  info.mappings[0].valid_tokens = {16, 16, 16, 5};
+  info.mappings[0].receipt_remote_ids = {103, 105, 106};
+  info.mappings[0].remote_shared_num = 3;
+
+  const std::vector<TransferKVInfo> rank_zero_infos = filter_kv_split_infos(
+      /*kv_split_rank=*/0, /*kv_split_size=*/2, {info});
+  ASSERT_EQ(rank_zero_infos.size(), 1U);
+  ASSERT_EQ(rank_zero_infos[0].mappings.size(), 1U);
+  EXPECT_EQ(rank_zero_infos[0].mappings[0].local_ids,
+            (std::vector<uint64_t>{32, 33}));
+  EXPECT_EQ(rank_zero_infos[0].mappings[0].remote_ids,
+            (std::vector<uint64_t>{104, 106}));
+  EXPECT_EQ(rank_zero_infos[0].mappings[0].logical_block_ordinals,
+            (std::vector<uint64_t>{4, 6}));
+  EXPECT_EQ(rank_zero_infos[0].mappings[0].valid_tokens,
+            (std::vector<uint32_t>{16, 5}));
+  EXPECT_EQ(rank_zero_infos[0].mappings[0].receipt_remote_ids,
+            (std::vector<uint64_t>{106}));
+
+  const std::vector<TransferKVInfo> rank_one_infos = filter_kv_split_infos(
+      /*kv_split_rank=*/1, /*kv_split_size=*/2, {info});
+  ASSERT_EQ(rank_one_infos.size(), 1U);
+  ASSERT_EQ(rank_one_infos[0].mappings.size(), 1U);
+  EXPECT_EQ(rank_one_infos[0].mappings[0].local_ids,
+            (std::vector<uint64_t>{31, 32}));
+  EXPECT_EQ(rank_one_infos[0].mappings[0].remote_ids,
+            (std::vector<uint64_t>{103, 105}));
+  EXPECT_EQ(rank_one_infos[0].mappings[0].logical_block_ordinals,
+            (std::vector<uint64_t>{3, 5}));
+  EXPECT_EQ(rank_one_infos[0].mappings[0].valid_tokens,
+            (std::vector<uint32_t>{16, 16}));
+  EXPECT_EQ(rank_one_infos[0].mappings[0].receipt_remote_ids,
+            (std::vector<uint64_t>{103, 105}));
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     KvSplitFilterSupportsFourOwnersWithPartialFirstAndLastBlocks) {
+  TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                  /*dst_tp_size=*/1,
+                                  /*dst_dp_rank=*/0);
+  info.mappings[0].local_ids = {31, 32, 33};
+  info.mappings[0].remote_ids = {103, 104, 105, 106, 107, 108, 109};
+  info.mappings[0].logical_block_ordinals = {3, 4, 5, 6, 7, 8, 9};
+  info.mappings[0].valid_tokens = {32, 32, 32, 32, 32, 32, 5};
+  info.mappings[0].receipt_remote_ids = {103, 105, 108, 109};
+  info.mappings[0].remote_shared_num = 3;
+
+  struct ExpectedOwnerMapping {
+    std::vector<uint64_t> local_ids;
+    std::vector<uint64_t> remote_ids;
+    std::vector<uint64_t> logical_block_ordinals;
+    std::vector<uint32_t> valid_tokens;
+    std::vector<uint64_t> receipt_remote_ids;
+  };
+  const std::vector<ExpectedOwnerMapping> expected = {
+      {{32, 33}, {104, 108}, {4, 8}, {32, 32}, {108}},
+      {{32, 33}, {105, 109}, {5, 9}, {32, 5}, {105, 109}},
+      {{32}, {106}, {6}, {32}, {}},
+      {{31, 32}, {103, 107}, {3, 7}, {32, 32}, {103}},
+  };
+
+  for (int32_t owner_rank = 0; owner_rank < 4; ++owner_rank) {
+    SCOPED_TRACE(owner_rank);
+    const std::vector<TransferKVInfo> owner_infos =
+        filter_kv_split_infos(owner_rank, /*kv_split_size=*/4, {info});
+    ASSERT_EQ(owner_infos.size(), 1U);
+    ASSERT_EQ(owner_infos[0].mappings.size(), 1U);
+    const KVTransferMapping& mapping = owner_infos[0].mappings[0];
+    const ExpectedOwnerMapping& owner_expected =
+        expected[static_cast<size_t>(owner_rank)];
+    EXPECT_EQ(mapping.local_ids, owner_expected.local_ids);
+    EXPECT_EQ(mapping.remote_ids, owner_expected.remote_ids);
+    EXPECT_EQ(mapping.logical_block_ordinals,
+              owner_expected.logical_block_ordinals);
+    EXPECT_EQ(mapping.valid_tokens, owner_expected.valid_tokens);
+    EXPECT_EQ(mapping.receipt_remote_ids, owner_expected.receipt_remote_ids);
+  }
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     KvSplitValidationAcceptsPartialEndsAndRejectsOrdinalDrift) {
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  ParallelArgs parallel_args(/*rank=*/1,
+                             /*world_size=*/4,
+                             /*dp_size=*/1,
+                             /*cp_size=*/4,
+                             /*process_group=*/nullptr,
+                             /*ep_size=*/1);
+  parallel_args.kv_split_size(2);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer;
+
+  TransferKVInfo partial_ends = make_info(/*dst_dp_size=*/1,
+                                          /*dst_tp_size=*/1,
+                                          /*dst_dp_rank=*/0);
+  partial_ends.mappings[0].local_ids = {31, 32, 33};
+  partial_ends.mappings[0].remote_ids = {103, 104, 105, 106};
+  partial_ends.mappings[0].logical_block_ordinals = {3, 4, 5, 6};
+  partial_ends.mappings[0].valid_tokens = {16, 16, 16, 5};
+  partial_ends.mappings[0].remote_shared_num = 3;
+  folly::SemiFuture<bool> accepted = transfer.push_kv_blocks_async(
+      {partial_ends}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+  EXPECT_TRUE(std::move(accepted).get());
+
+  const auto expect_rejected = [&](std::vector<uint64_t> ordinals,
+                                   std::vector<uint32_t> valid_tokens,
+                                   std::vector<uint64_t> local_ids) {
+    TransferKVInfo malformed = partial_ends;
+    malformed.mappings[0].logical_block_ordinals = std::move(ordinals);
+    malformed.mappings[0].valid_tokens = std::move(valid_tokens);
+    malformed.mappings[0].local_ids = std::move(local_ids);
+    folly::SemiFuture<bool> rejected = transfer.push_kv_blocks_async(
+        {malformed}, parallel_args, synchronizer, /*is_spec_draft=*/false);
+    EXPECT_FALSE(std::move(rejected).get());
+  };
+
+  expect_rejected(/*ordinals=*/{3, 4, 5},
+                  /*valid_tokens=*/{16, 16, 16, 5},
+                  /*local_ids=*/{31, 32});
+  expect_rejected(/*ordinals=*/{3, 3, 4, 5},
+                  /*valid_tokens=*/{16, 16, 16, 5},
+                  /*local_ids=*/{31, 32});
+  expect_rejected(/*ordinals=*/{3, 5, 6, 7},
+                  /*valid_tokens=*/{16, 16, 16, 5},
+                  /*local_ids=*/{31, 32, 33});
+  expect_rejected(/*ordinals=*/{4, 3, 5, 6},
+                  /*valid_tokens=*/{16, 16, 16, 5},
+                  /*local_ids=*/{31, 32});
+  EXPECT_TRUE(engine_observer->move_calls.empty());
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,
@@ -1247,6 +2174,124 @@ TEST(MooncakeKVCacheTransferDefaultTest,
 
   const int32_t exit_status = ::testing::Test::HasFailure() ? 1 : 0;
   _exit(exit_status);
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest, PushFutureWaitsForDelayedLayerEvent) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "NPU device is required for delayed layer event test.";
+  }
+  Device device(/*device_id=*/0);
+  device.set_device();
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  std::vector<KVCache> caches;
+  caches.reserve(2);
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+
+  const TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                        /*dst_tp_size=*/1,
+                                        /*dst_dp_rank=*/0);
+  const ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                               /*world_size=*/1,
+                                               /*dp_size=*/1);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer =
+      std::make_shared<KVPushSynchronizerImpl>(/*num_layers=*/2,
+                                               /*timeout=*/2000);
+  ASSERT_TRUE(synchronizer->record_event(/*layer_index=*/0,
+                                         /*device_index=*/0));
+
+  folly::Future<bool> future =
+      transfer
+          .push_kv_blocks_async(
+              {info}, parallel_args, synchronizer, /*is_spec_draft=*/false)
+          .toUnsafeFuture();
+  const bool first_layer_pushed =
+      wait_for_exact_move_call_count(*engine_observer, /*expected_count=*/1);
+  if (!first_layer_pushed) {
+    synchronizer->abort();
+  }
+  ASSERT_TRUE(first_layer_pushed);
+  EXPECT_FALSE(future.isReady());
+
+  const bool event_recorded =
+      synchronizer->record_event(/*layer_index=*/1, /*device_index=*/0);
+  if (!event_recorded) {
+    synchronizer->abort();
+  }
+  ASSERT_TRUE(event_recorded);
+  future.wait(kTransferCompletionTimeout);
+  ASSERT_TRUE(future.isReady());
+  EXPECT_TRUE(std::move(future).get());
+  ASSERT_EQ(engine_observer->move_calls.size(), 2U);
+  EXPECT_EQ(engine_observer->move_calls[0].opcode,
+            MooncakeTransferEngine::MoveOpcode::WRITE);
+  EXPECT_EQ(engine_observer->move_calls[1].opcode,
+            MooncakeTransferEngine::MoveOpcode::WRITE);
+}
+
+TEST(MooncakeKVCacheTransferDefaultTest,
+     PushFutureReturnsFalseWhenPendingLayerIsAborted) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "NPU device is required for pending layer abort test.";
+  }
+  Device device(/*device_id=*/0);
+  device.set_device();
+  auto engine = std::make_unique<RecordingMooncakeTransferEngine>(
+      /*listen_port=*/0, torch::Device(torch::kCPU));
+  RecordingMooncakeTransferEngine* engine_observer = engine.get();
+  MooncakeKVCacheTransferDefault transfer(/*device_id=*/0,
+                                          /*listen_port=*/0,
+                                          torch::Device(torch::kCPU),
+                                          /*model_type=*/"test",
+                                          std::move(engine));
+  std::vector<KVCache> caches;
+  caches.reserve(2);
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  caches.emplace_back(
+      KVCacheTensors{torch::zeros({4, 2}), torch::zeros({4, 2})});
+  transfer.register_kv_cache(caches, KVCacheShape(), torch::kFloat32);
+
+  const TransferKVInfo info = make_info(/*dst_dp_size=*/1,
+                                        /*dst_tp_size=*/1,
+                                        /*dst_dp_rank=*/0);
+  const ParallelArgs parallel_args = make_args(/*rank=*/0,
+                                               /*world_size=*/1,
+                                               /*dp_size=*/1);
+  std::shared_ptr<KVPushSynchronizerImpl> synchronizer =
+      std::make_shared<KVPushSynchronizerImpl>(/*num_layers=*/2,
+                                               /*timeout=*/2000);
+  ASSERT_TRUE(synchronizer->record_event(/*layer_index=*/0,
+                                         /*device_index=*/0));
+
+  folly::Future<bool> future =
+      transfer
+          .push_kv_blocks_async(
+              {info}, parallel_args, synchronizer, /*is_spec_draft=*/false)
+          .toUnsafeFuture();
+  const bool first_layer_pushed =
+      wait_for_exact_move_call_count(*engine_observer, /*expected_count=*/1);
+  if (!first_layer_pushed) {
+    synchronizer->abort();
+  }
+  ASSERT_TRUE(first_layer_pushed);
+  EXPECT_FALSE(future.isReady());
+
+  synchronizer->abort();
+  future.wait(kTransferCompletionTimeout);
+  ASSERT_TRUE(future.isReady());
+  EXPECT_FALSE(std::move(future).get());
+  EXPECT_EQ(engine_observer->move_calls.size(), 1U);
 }
 
 TEST(MooncakeKVCacheTransferDefaultTest,

@@ -15,13 +15,32 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "framework/kv_cache_transfer/cache_layout.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/kv_cache_transfer/mooncake_transfer_engine.h"
 
 namespace xllm {
+
+namespace detail {
+
+struct PreparedMooncakeDecodeKVNotifications final {
+  std::vector<std::vector<DecodeKVReceipt>> receipts_by_layer;
+};
+
+// Parse and validate every request manifest once, then group the matching
+// receiver-visible receipts by layer for the PUSH hot path.
+bool prepare_mooncake_decode_kv_notifications(
+    const KVCacheTransfer::KVCacheInfo& kv_info,
+    int64_t num_layers,
+    PreparedMooncakeDecodeKVNotifications* prepared,
+    std::string* error);
+
+}  // namespace detail
 
 // Base class for Mooncake-based KV cache transfer.
 // Default and XTensor subclasses inherit this class (single inheritance).
@@ -41,6 +60,11 @@ class MooncakeKVCacheTransferBase : public KVCacheTransfer {
                               bool is_spec_draft) override;
 
   void get_cache_info(uint64_t& cluster_id, std::string& addr) override;
+
+  KVCacheLayoutQueryResult get_kv_cache_layout() override;
+
+  KVTransferNotificationDrainResult drain_kv_transfer_notifications(
+      size_t max_notifications) override;
 
   bool link_clusters(const std::vector<uint64_t>& cluster_ids,
                      const std::vector<std::string>& remote_addrs,

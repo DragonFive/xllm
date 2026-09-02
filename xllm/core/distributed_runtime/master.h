@@ -17,8 +17,11 @@ limitations under the License.
 
 #include <folly/Function.h>
 
+#include <cstdint>
 #include <functional>
 #include <future>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "common/macros.h"
@@ -28,6 +31,15 @@ limitations under the License.
 #include "engine.h"
 #include "framework/request/request_params.h"
 namespace xllm {
+
+namespace detail {
+
+std::optional<std::string> validate_model_cp(const Options& options,
+                                             EngineType engine_type,
+                                             const std::string& model_type,
+                                             int32_t global_world_size);
+
+}  // namespace detail
 
 class Master {
  public:

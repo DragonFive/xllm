@@ -659,6 +659,8 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
       {"aligned_cp2_kv1", {8, 12}, 2, 1},
       {"non_aligned_cp2_kv2", {5, 7, 1, 3}, 2, 2},
       {"aligned_cp4_kv2", {16, 8, 24}, 4, 2},
+      {"aligned_cp4_kv4", {16, 8, 24}, 4, 4},
+      {"non_aligned_cp4_kv4", {5, 7, 1, 3}, 4, 4},
       {"short_cp4_kv1", {1}, 4, 1},
   };
 
@@ -666,6 +668,7 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
     const CpPlanInput input =
         make_plan_input(test_case.q_seq_lens,
                         std::vector<int32_t>(test_case.q_seq_lens.size(), 0));
+    torch::Tensor ownership_counts;
     for (int32_t cp_rank = 0; cp_rank < test_case.cp_size; ++cp_rank) {
       SCOPED_TRACE(test_case.name);
       SCOPED_TRACE(cp_rank);
@@ -683,10 +686,25 @@ TEST(NpuCpPlanTest, CacheSlotsMatchTwoStageReferenceAcrossRanks) {
       const NpuCpPlan plan = NpuCpPlan::build(input, config);
       torch::Tensor global_slots = make_logical_slots(
           test_case.q_seq_lens, config.block_size * config.kv_split_size);
+      const torch::Tensor local_slots = plan.prepare_cache_slots(global_slots);
 
       expect_tensor_bytes_equal(
-          plan.prepare_cache_slots(global_slots),
+          local_slots,
           prepare_cache_slots_reference(global_slots, plan, config));
+      if (test_case.kv_split_size == test_case.cp_size) {
+        const torch::Tensor owned = local_slots.ge(0).to(torch::kInt32);
+        ownership_counts = ownership_counts.defined() ? ownership_counts + owned
+                                                      : owned.clone();
+      }
+    }
+    if (test_case.kv_split_size == test_case.cp_size) {
+      ASSERT_TRUE(ownership_counts.defined());
+      EXPECT_TRUE(torch::all(ownership_counts.le(1)).item<bool>());
+      int64_t expected_owned_rows = 0;
+      for (int32_t seq_len : test_case.q_seq_lens) {
+        expected_owned_rows += seq_len;
+      }
+      EXPECT_EQ(ownership_counts.sum().item<int64_t>(), expected_owned_rows);
     }
   }
 }

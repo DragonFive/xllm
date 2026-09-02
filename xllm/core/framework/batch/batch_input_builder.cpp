@@ -266,6 +266,9 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
   info.request_id = full_info.request_id;
   info.dp_rank = full_info.dp_rank;
   info.remote_instance_info = full_info.remote_instance_info;
+  info.decode_kv_manifest = full_info.decode_kv_manifest;
+  info.attempt_epoch = full_info.attempt_epoch;
+  info.allocation_generation = full_info.allocation_generation;
   info.dst_xtensor_layer_offsets.clear();
 
   for (const KVTransferMapping& full_mapping : full_info.mappings) {
@@ -280,6 +283,27 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     KVTransferMapping step_mapping;
     step_mapping.group_id = full_mapping.group_id;
     step_mapping.remote_shared_num = full_mapping.remote_shared_num;
+    const bool has_logical_metadata =
+        !full_mapping.logical_block_ordinals.empty() ||
+        !full_mapping.valid_tokens.empty();
+    if (has_logical_metadata) {
+      CHECK_EQ(full_mapping.remote_ids.size(),
+               full_mapping.logical_block_ordinals.size())
+          << "KV logical block metadata size mismatch, request_id="
+          << full_info.request_id << ", group_id=" << full_mapping.group_id;
+      CHECK_EQ(full_mapping.remote_ids.size(), full_mapping.valid_tokens.size())
+          << "KV valid-token metadata size mismatch, request_id="
+          << full_info.request_id << ", group_id=" << full_mapping.group_id;
+      for (size_t i = 1; i < full_mapping.logical_block_ordinals.size(); ++i) {
+        const uint64_t previous = full_mapping.logical_block_ordinals[i - 1];
+        CHECK_LT(previous, std::numeric_limits<uint64_t>::max())
+            << "KV logical block ordinal overflow, request_id="
+            << full_info.request_id << ", group_id=" << full_mapping.group_id;
+        CHECK_EQ(full_mapping.logical_block_ordinals[i], previous + 1)
+            << "KV logical block ordinals must be contiguous, request_id="
+            << full_info.request_id << ", group_id=" << full_mapping.group_id;
+      }
+    }
     if (block_type.value() == BlockType::LINEAR ||
         block_type.value() == BlockType::EMBEDDING) {
       const int32_t local_id = block_type.value() == BlockType::LINEAR
@@ -294,12 +318,17 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
           << "group_id=" << full_mapping.group_id;
       step_mapping.local_ids.emplace_back(static_cast<uint64_t>(local_id));
       step_mapping.remote_ids = full_mapping.remote_ids;
+      step_mapping.logical_block_ordinals = full_mapping.logical_block_ordinals;
+      step_mapping.valid_tokens = full_mapping.valid_tokens;
+      if (!full_info.decode_kv_manifest.empty()) {
+        step_mapping.receipt_remote_ids = full_mapping.remote_ids;
+      }
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
 
     const Slice<Block> blocks = sequence->kv_state().blocks(block_type.value());
-    if (blocks.empty() || full_mapping.remote_ids.empty()) {
+    if (blocks.empty()) {
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
@@ -329,26 +358,62 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t remote_stride =
         uses_kv_split ? static_cast<size_t>(kv_split_size) : 1;
     CHECK_GT(remote_stride, static_cast<size_t>(0));
+    CHECK_EQ(static_cast<size_t>(block_size) % remote_stride,
+             static_cast<size_t>(0))
+        << "KV source block size is not divisible by kv_split_size, "
+        << "request_id=" << full_info.request_id
+        << ", group_id=" << full_mapping.group_id;
+    const uint64_t destination_block_size =
+        static_cast<uint64_t>(block_size) / remote_stride;
     const size_t remote_shared_num =
         static_cast<size_t>(full_mapping.remote_shared_num);
-    CHECK_GE(next_transfer_idx, remote_shared_num)
+    const size_t shared_source_blocks =
+        uses_kv_split ? remote_shared_num / remote_stride : remote_shared_num;
+    CHECK_GE(next_transfer_idx, shared_source_blocks)
         << "P transfer cursor slid below D-side shared prefix, request_id="
         << full_info.request_id << ", group_id=" << full_mapping.group_id
         << ", next_transfer_idx=" << next_transfer_idx
+        << ", shared_source_blocks=" << shared_source_blocks
         << ", remote_shared_num=" << remote_shared_num;
+    if (full_mapping.remote_ids.empty()) {
+      const uint64_t destination_window_end = util::ceil_div(
+          static_cast<uint64_t>(seq_len), destination_block_size);
+      CHECK(is_flat_kv && uses_kv_split &&
+            static_cast<uint64_t>(remote_shared_num) >= destination_window_end)
+          << "Empty KV remote id mapping does not cover current Prefill step, "
+          << "request_id=" << full_info.request_id
+          << ", group_id=" << full_mapping.group_id << ", seq_len=" << seq_len
+          << ", destination_block_size=" << destination_block_size
+          << ", destination_window_end=" << destination_window_end
+          << ", remote_shared_num=" << remote_shared_num;
+      info.mappings.emplace_back(std::move(step_mapping));
+      continue;
+    }
 
-    // Flat KV responses omit D-side shared blocks, while grouped responses
-    // preserve their full logical tables (including SWA placeholders).
-    const size_t remote_origin = is_flat_kv ? remote_shared_num : 0;
-    const size_t remote_end =
-        map_end > remote_origin ? (map_end - remote_origin) * remote_stride : 0;
-    CHECK_GE(util::align_up(full_mapping.remote_ids.size(), remote_stride),
-             remote_end)
-        << "KV remote id coverage shortage, request_id=" << full_info.request_id
-        << ", group_id=" << full_mapping.group_id
-        << ", remote_size=" << full_mapping.remote_ids.size()
-        << ", remote_end=" << remote_end << ", remote_stride=" << remote_stride
-        << ", remote_shared_num=" << remote_shared_num;
+    // Legacy responses have no request-logical ordinals. They remain
+    // positional and therefore can represent only source-block-aligned flat
+    // prefix hits in KV-split mode.
+    const size_t legacy_remote_origin = is_flat_kv ? shared_source_blocks : 0;
+    if (!has_logical_metadata) {
+      if (is_flat_kv && uses_kv_split) {
+        CHECK_EQ(remote_shared_num % remote_stride, static_cast<size_t>(0))
+            << "Legacy KV-split mapping cannot represent a partial shared "
+               "source block, request_id="
+            << full_info.request_id << ", group_id=" << full_mapping.group_id;
+      }
+      const size_t remote_end =
+          map_end > legacy_remote_origin
+              ? (map_end - legacy_remote_origin) * remote_stride
+              : 0;
+      CHECK_GE(util::align_up(full_mapping.remote_ids.size(), remote_stride),
+               remote_end)
+          << "KV remote id coverage shortage, request_id="
+          << full_info.request_id << ", group_id=" << full_mapping.group_id
+          << ", remote_size=" << full_mapping.remote_ids.size()
+          << ", remote_end=" << remote_end
+          << ", remote_stride=" << remote_stride
+          << ", remote_shared_num=" << remote_shared_num;
+    }
 
     const size_t stable_end = static_cast<size_t>(seq_len / block_size);
     const size_t advanced_transfer_idx =
@@ -359,7 +424,8 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
       sequence->kv_state().advance_group_transfer_block_idx(
           block_type.value(), advanced_transfer_idx);
     }
-    if (next_transfer_idx >= map_end || map_end <= remote_origin) {
+    if (next_transfer_idx >= map_end ||
+        (!has_logical_metadata && map_end <= legacy_remote_origin)) {
       info.mappings.emplace_back(std::move(step_mapping));
       continue;
     }
@@ -367,39 +433,122 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const size_t block_count = map_end - next_transfer_idx;
     step_mapping.local_ids.reserve(block_count);
     step_mapping.remote_ids.reserve(block_count * remote_stride);
+    if (has_logical_metadata) {
+      step_mapping.logical_block_ordinals.reserve(block_count * remote_stride);
+      step_mapping.valid_tokens.reserve(block_count * remote_stride);
+      step_mapping.receipt_remote_ids.reserve(block_count * remote_stride);
+    }
     std::vector<size_t> remote_idxs;
     remote_idxs.reserve(block_count * remote_stride);
-    for (size_t local_idx = next_transfer_idx; local_idx < map_end;
-         ++local_idx) {
-      if (local_ids[local_idx] < 0) {
-        continue;
-      }
-      const size_t remote_ids_begin = step_mapping.remote_ids.size();
-      const size_t remote_idxs_begin = remote_idxs.size();
-      bool has_remote_sentinel = false;
-      for (size_t offset = 0; offset < remote_stride; ++offset) {
-        const size_t remote_idx =
-            (local_idx - remote_origin) * remote_stride + offset;
-        if (remote_idx >= full_mapping.remote_ids.size()) {
-          CHECK_GT(remote_stride, static_cast<size_t>(1));
-          break;
+    if (has_logical_metadata) {
+      size_t remote_idx = 0;
+      for (size_t local_idx = next_transfer_idx; local_idx < map_end;
+           ++local_idx) {
+        while (remote_idx < full_mapping.remote_ids.size() &&
+               full_mapping.logical_block_ordinals[remote_idx] /
+                       static_cast<uint64_t>(remote_stride) <
+                   static_cast<uint64_t>(local_idx)) {
+          ++remote_idx;
         }
-        if (full_mapping.remote_ids[remote_idx] ==
-            std::numeric_limits<uint64_t>::max()) {
-          has_remote_sentinel = true;
-          break;
+
+        const size_t remote_ids_begin = step_mapping.remote_ids.size();
+        const size_t remote_idxs_begin = remote_idxs.size();
+        const size_t receipt_ids_begin = step_mapping.receipt_remote_ids.size();
+        bool has_remote_sentinel = false;
+        while (remote_idx < full_mapping.remote_ids.size() &&
+               full_mapping.logical_block_ordinals[remote_idx] /
+                       static_cast<uint64_t>(remote_stride) ==
+                   static_cast<uint64_t>(local_idx)) {
+          const uint64_t logical_block_ordinal =
+              full_mapping.logical_block_ordinals[remote_idx];
+          if (logical_block_ordinal >=
+              static_cast<uint64_t>(remote_shared_num)) {
+            if (full_mapping.remote_ids[remote_idx] ==
+                std::numeric_limits<uint64_t>::max()) {
+              has_remote_sentinel = true;
+            } else if (local_ids[local_idx] >= 0) {
+              const uint32_t valid_tokens =
+                  full_mapping.valid_tokens[remote_idx];
+              step_mapping.remote_ids.emplace_back(
+                  full_mapping.remote_ids[remote_idx]);
+              step_mapping.logical_block_ordinals.emplace_back(
+                  logical_block_ordinal);
+              step_mapping.valid_tokens.emplace_back(valid_tokens);
+              CHECK_LE(logical_block_ordinal,
+                       (std::numeric_limits<uint64_t>::max() - valid_tokens) /
+                           destination_block_size)
+                  << "KV receipt token boundary overflow, request_id="
+                  << full_info.request_id
+                  << ", group_id=" << full_mapping.group_id;
+              const uint64_t final_token_end =
+                  logical_block_ordinal * destination_block_size + valid_tokens;
+              if (!full_info.decode_kv_manifest.empty() && valid_tokens > 0 &&
+                  final_token_end <= static_cast<uint64_t>(seq_len)) {
+                step_mapping.receipt_remote_ids.emplace_back(
+                    full_mapping.remote_ids[remote_idx]);
+              }
+              remote_idxs.emplace_back(remote_idx);
+            }
+          }
+          ++remote_idx;
         }
-        step_mapping.remote_ids.emplace_back(
-            full_mapping.remote_ids[remote_idx]);
-        remote_idxs.emplace_back(remote_idx);
+        if (has_remote_sentinel) {
+          step_mapping.remote_ids.resize(remote_ids_begin);
+          step_mapping.logical_block_ordinals.resize(remote_ids_begin);
+          step_mapping.valid_tokens.resize(remote_ids_begin);
+          step_mapping.receipt_remote_ids.resize(receipt_ids_begin);
+          remote_idxs.resize(remote_idxs_begin);
+          CHECK_LT(local_ids[local_idx], 0)
+              << "KV logical metadata has a destination sentinel for a valid "
+                 "source block, request_id="
+              << full_info.request_id << ", group_id=" << full_mapping.group_id
+              << ", source_ordinal=" << local_idx;
+          continue;
+        }
+        if (local_ids[local_idx] < 0) {
+          continue;
+        }
+        CHECK_GT(step_mapping.remote_ids.size(), remote_ids_begin)
+            << "KV logical metadata does not cover a pending source block, "
+            << "request_id=" << full_info.request_id
+            << ", group_id=" << full_mapping.group_id
+            << ", source_ordinal=" << local_idx;
+        step_mapping.local_ids.emplace_back(
+            static_cast<uint64_t>(local_ids[local_idx]));
       }
-      if (has_remote_sentinel) {
-        step_mapping.remote_ids.resize(remote_ids_begin);
-        remote_idxs.resize(remote_idxs_begin);
-        continue;
+    } else {
+      for (size_t local_idx = next_transfer_idx; local_idx < map_end;
+           ++local_idx) {
+        if (local_ids[local_idx] < 0) {
+          continue;
+        }
+        const size_t remote_ids_begin = step_mapping.remote_ids.size();
+        const size_t remote_idxs_begin = remote_idxs.size();
+        bool has_remote_sentinel = false;
+        for (size_t offset = 0; offset < remote_stride; ++offset) {
+          const size_t remote_idx =
+              (local_idx - legacy_remote_origin) * remote_stride + offset;
+          if (remote_idx >= full_mapping.remote_ids.size()) {
+            CHECK_GT(remote_stride, static_cast<size_t>(1));
+            break;
+          }
+          if (full_mapping.remote_ids[remote_idx] ==
+              std::numeric_limits<uint64_t>::max()) {
+            has_remote_sentinel = true;
+            break;
+          }
+          step_mapping.remote_ids.emplace_back(
+              full_mapping.remote_ids[remote_idx]);
+          remote_idxs.emplace_back(remote_idx);
+        }
+        if (has_remote_sentinel) {
+          step_mapping.remote_ids.resize(remote_ids_begin);
+          remote_idxs.resize(remote_idxs_begin);
+          continue;
+        }
+        step_mapping.local_ids.emplace_back(
+            static_cast<uint64_t>(local_ids[local_idx]));
       }
-      step_mapping.local_ids.emplace_back(
-          static_cast<uint64_t>(local_ids[local_idx]));
     }
     if (step_mapping.local_ids.empty()) {
       info.mappings.emplace_back(std::move(step_mapping));

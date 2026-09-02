@@ -102,6 +102,15 @@ class SpeculativeWorkerImpl : public WorkerImpl {
     impl_->get_cache_info(cluster_id, addr, port);
   };
 
+  KVCacheLayoutQueryResult get_kv_cache_layout() override {
+    return impl_->get_kv_cache_layout();
+  }
+
+  KVTransferNotificationDrainResult drain_kv_transfer_notifications(
+      size_t max_notifications) override {
+    return impl_->drain_kv_transfer_notifications(max_notifications);
+  }
+
   // prepare input for execution
   ForwardInput prepare_inputs(Batch& batch) override {
     return impl_->prepare_inputs(batch);

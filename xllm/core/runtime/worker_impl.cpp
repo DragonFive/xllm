@@ -50,6 +50,7 @@ limitations under the License.
 #include "core/common/constants.h"
 #include "core/common/flash_comm1_context.h"
 #include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
@@ -588,13 +589,51 @@ bool WorkerImpl::allocate_kv_cache_with_transfer(
   CHECK(kv_caches_.empty()) << "KV caches are already initialized.";
 
   const ModelArgs& model_args = context_.get_model_args();
+  const bool enable_lighting_indexer = model_args.index_n_heads() > 0;
+  const std::string& transfer_type =
+      DisaggPDConfig::get_instance().kv_cache_transfer_type();
+  if (transfer_type == "LlmDataDist") {
+    detail::LlmDataDistCapability capability;
+#if defined(USE_NPU)
+    capability.is_npu_backend = true;
+#endif
+    capability.instance_role = options_.instance_role();
+    capability.transfer_mode =
+        DisaggPDConfig::get_instance().kv_cache_transfer_mode();
+    capability.model_type = model_args.model_type();
+    capability.has_lightning_indexer = enable_lighting_indexer;
+    capability.kv_cache_dtype = options_.kv_cache_dtype();
+    capability.enable_xtensor = KVCacheConfig::get_instance().enable_xtensor();
+    capability.has_linear_attention_cache =
+        has_linear_attention_layers(model_args) ||
+        kv_cache_shape.has_conv_cache_shape() ||
+        kv_cache_shape.has_ssm_cache_shape();
+    capability.has_grouped_cache_layout =
+        kv_cache_shape.has_grouped_cache_layout();
+    capability.is_spec_draft = is_spec_draft_ || options_.is_draft_engine();
+    capability.dp_size = parallel_args_.dp_size();
+    capability.cp_size = parallel_args_.cp_size();
+    capability.kv_split_size = parallel_args_.kv_split_size_effective();
+    if (const std::optional<std::string> error =
+            detail::validate_llm_data_dist_capability(capability)) {
+      LOG(ERROR) << "Cannot allocate KV cache with LlmDataDist: " << *error;
+      return false;
+    }
+  }
+
   kv_cache_transfer_ =
-      KVCacheTransferFactory::create(options_.transfer_listen_port(),
+      KVCacheTransferFactory::create(transfer_type,
+                                     options_.transfer_listen_port(),
+                                     options_.instance_role(),
                                      device_,
+                                     enable_lighting_indexer,
                                      model_args.model_type(),
                                      options_.model_id());
-  CHECK(kv_cache_transfer_ != nullptr)
-      << "Failed to create KV cache transfer backend.";
+  if (kv_cache_transfer_ == nullptr) {
+    LOG(ERROR) << "Failed to create KV cache transfer backend: "
+               << transfer_type;
+    return false;
+  }
   kv_cache_transfer_->initialize(device_.index());
 
   bool use_huge_page_allocator = true;
@@ -663,6 +702,26 @@ void WorkerImpl::get_cache_info(uint64_t& cluster_id,
   }
 #endif
   port = options_.transfer_listen_port();
+}
+
+KVCacheLayoutQueryResult WorkerImpl::get_kv_cache_layout() {
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  if (kv_cache_transfer_) {
+    return kv_cache_transfer_->get_kv_cache_layout();
+  }
+#endif
+  return {};
+}
+
+KVTransferNotificationDrainResult WorkerImpl::drain_kv_transfer_notifications(
+    size_t max_notifications) {
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  if (kv_cache_transfer_) {
+    return kv_cache_transfer_->drain_kv_transfer_notifications(
+        max_notifications);
+  }
+#endif
+  return {};
 }
 
 bool WorkerImpl::link_cluster(const std::vector<uint64_t>& cluster_ids,

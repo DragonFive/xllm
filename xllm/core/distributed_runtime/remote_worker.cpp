@@ -89,6 +89,15 @@ void RemoteWorker::get_cache_info(uint64_t& cluster_id,
   channel_->get_cache_info(cluster_id, addr, port);
 }
 
+KVCacheLayoutQueryResult RemoteWorker::get_kv_cache_layout() {
+  return channel_->get_kv_cache_layout();
+}
+
+KVTransferNotificationDrainResult RemoteWorker::drain_kv_transfer_notifications(
+    size_t max_notifications) {
+  return channel_->drain_kv_transfer_notifications(max_notifications);
+}
+
 bool RemoteWorker::link_cluster(const std::vector<uint64_t>& cluster_ids,
                                 const std::vector<std::string>& addrs,
                                 const std::vector<uint16_t>& ports) {

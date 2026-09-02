@@ -622,6 +622,7 @@ class DeepseekV3MLP(nn.Module):
         device: torch.device,
         skip_tp_reduce: bool = False,
         tp_override: Optional[int] = None,
+        tp_reduce_in_fp32: bool = False,
     ) -> None:
         super().__init__()
         tp = tp_override if tp_override is not None else cfg.tp_size
@@ -629,6 +630,7 @@ class DeepseekV3MLP(nn.Module):
         inter_local = intermediate_size // tp
         self.tp = tp
         self.skip_tp_reduce = skip_tp_reduce
+        self.tp_reduce_in_fp32 = tp_reduce_in_fp32
         self.gate_up_proj = W8A8DynamicLinear(cfg.hidden_size, 2 * inter_local, device)
         self.down_proj = W8A8DynamicLinear(
             inter_local,
@@ -698,7 +700,13 @@ class DeepseekV3MLP(nn.Module):
         if tp_reduce_add is not None:
             out = out + tp_reduce_add
         if reduce_result:
-            distributed.all_reduce_(out)
+            if self.tp_reduce_in_fp32:
+                output_dtype = out.dtype
+                out = out.to(torch.float32)
+                distributed.all_reduce_(out)
+                out = out.to(output_dtype)
+            else:
+                distributed.all_reduce_(out)
         return out
 
 
@@ -1351,7 +1359,7 @@ class DeepseekV3MoE(nn.Module):
             distributed.all_reduce_(routed, "moe_ep")
 
         final = routed + shared
-        if self.moe_tp_size > 1:
+        if self.ep_size > 1 and self.moe_tp_size > 1:
             distributed.all_reduce_(final, "moe_tp")
         elif self.cfg.tp_size > 1 and self.ep_size == 1:
             distributed.all_reduce_(final)

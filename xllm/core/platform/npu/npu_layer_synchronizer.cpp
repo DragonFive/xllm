@@ -18,6 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include <utility>
+
+#include "core/util/verbose_trace_logger.h"
+
 namespace xllm {
 
 NPULayerSynchronizerImpl::NPULayerSynchronizerImpl(const int64_t num_layers,
@@ -87,6 +91,14 @@ bool NPULayerSynchronizerImpl::synchronize_layer(const int64_t layer_index) {
     LOG(ERROR) << "Synchronize wait stream failed: " << ret;
     return false;
   }
+  for (const std::string& request_id : trace_context_.request_ids) {
+    XLLM_VERBOSE_TRACE() << "event=kv_layer_event_wait_complete request-id="
+                         << request_id << " layer=" << layer_index
+                         << " source-rank=" << trace_context_.source_rank
+                         << " cp-rank=" << trace_context_.cp_rank
+                         << " kv-shard=" << trace_context_.kv_split_rank
+                         << " kv-split-size=" << trace_context_.kv_split_size;
+  }
   return true;
 }
 
@@ -98,8 +110,21 @@ bool NPULayerSynchronizerImpl::record_event(const int64_t layer_index,
     LOG(ERROR) << "Record event failed: " << ret;
     return false;
   }
+  for (const std::string& request_id : trace_context_.request_ids) {
+    XLLM_VERBOSE_TRACE() << "event=kv_layer_event_recorded request-id="
+                         << request_id << " layer=" << layer_index
+                         << " source-rank=" << trace_context_.source_rank
+                         << " cp-rank=" << trace_context_.cp_rank
+                         << " kv-shard=" << trace_context_.kv_split_rank
+                         << " kv-split-size=" << trace_context_.kv_split_size;
+  }
   event_record_flags_[layer_index].store(true, std::memory_order_release);
   return true;
+}
+
+void NPULayerSynchronizerImpl::set_trace_context(
+    LayerSynchronizerTraceContext context) {
+  trace_context_ = std::move(context);
 }
 
 void NPULayerSynchronizerImpl::abort() {

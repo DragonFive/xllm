@@ -12,6 +12,16 @@ cc_test(
 
 cc_test(
   NAME
+    llm_data_dist_capability_test
+  SRCS
+    llm_data_dist_capability_test.cpp
+  DEPS
+    :kv_cache_transfer
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     pd_topology_guard_test
   SRCS
     pd_topology_guard_test.cpp
@@ -27,6 +37,16 @@ cc_test(
     kv_transfer_completion_test.cpp
   DEPS
     :kv_transfer_completion
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    decode_kv_readiness_test
+  SRCS
+    decode_kv_readiness_test.cpp
+  DEPS
+    :decode_kv_readiness
     GTest::gtest_main
 )
 

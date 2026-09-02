@@ -123,6 +123,10 @@ class ContinuousScheduler : public Scheduler {
 
     PROPERTY(std::string, kv_cache_transfer_mode) = "PUSH";
 
+    // Maximum time Decode waits for receiver-visible KV receipts and the
+    // matching FirstGeneration before failing the request.
+    PROPERTY(int64_t, decode_kv_readiness_timeout_ms) = 30000;
+
     // In general decode instance send a batch responses to prefill in disagg pd
     // mode. here, we add a flag to control whether send a batch or single
     // response once, This will help us to debug code. default value is false.

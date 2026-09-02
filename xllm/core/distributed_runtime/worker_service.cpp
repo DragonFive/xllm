@@ -540,6 +540,38 @@ void WorkerService::GetCacheInfo(::google::protobuf::RpcController* controller,
   return;
 }
 
+void WorkerService::GetKVCacheLayout(
+    ::google::protobuf::RpcController* controller,
+    const proto::Empty* req,
+    proto::KVCacheLayoutResponse* resp,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    const KVCacheLayoutQueryResult result = worker_->get_kv_cache_layout();
+    resp->set_ok(result.ok);
+    resp->set_supported(result.supported);
+    resp->set_serialized_manifest(result.serialized_manifest);
+  });
+}
+
+void WorkerService::DrainKVTransferNotifications(
+    ::google::protobuf::RpcController* controller,
+    const proto::DrainKVTransferNotificationsRequest* req,
+    proto::DrainKVTransferNotificationsResponse* resp,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    const KVTransferNotificationDrainResult result =
+        worker_->drain_kv_transfer_notifications(req->max_notifications());
+    resp->set_ok(result.ok);
+    resp->set_supported(result.supported);
+    resp->set_more_available(result.more_available);
+    for (const std::string& payload : result.payloads) {
+      resp->add_payloads(payload);
+    }
+  });
+}
+
 void WorkerService::PullKVCache(::google::protobuf::RpcController* controller,
                                 const proto::PullKVCacheRequest* req,
                                 proto::Status* resp,

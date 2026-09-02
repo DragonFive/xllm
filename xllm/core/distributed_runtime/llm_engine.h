@@ -22,8 +22,11 @@ limitations under the License.
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/macros.h"
@@ -45,6 +48,40 @@ limitations under the License.
 namespace xllm {
 
 class ModelLoader;
+
+namespace detail {
+
+// Owns request-local Decode KV readiness state and the production notification
+// drain contract. Tests feed deterministic worker drain results through this
+// coordinator instead of reimplementing LLMEngine polling behavior.
+class DecodeKVReadinessCoordinator final {
+ public:
+  using DrainWorkerFn =
+      std::function<KVTransferNotificationDrainResult(size_t worker_rank)>;
+
+  bool contains(const std::string& request_id) const;
+  bool register_ledger(std::shared_ptr<DecodeKVReadinessLedger> ledger);
+
+  DecodeKVReadinessPollResult poll(size_t worker_count,
+                                   const DrainWorkerFn& drain_worker);
+  DecodeKVReadinessSnapshot snapshot(const std::string& request_id) const;
+  bool try_publish(const std::string& request_id);
+  bool discard(const std::string& request_id);
+
+ private:
+  struct LedgerEntry final {
+    std::shared_ptr<DecodeKVReadinessLedger> ledger;
+    bool completed_receiver_poll = false;
+  };
+
+  std::shared_ptr<DecodeKVReadinessLedger> find_ledger(
+      const std::string& request_id) const;
+
+  mutable std::mutex mutex_;
+  std::unordered_map<std::string, LedgerEntry> ledgers_;
+};
+
+}  // namespace detail
 
 class LLMEngine : public Engine {
  public:
@@ -96,6 +133,22 @@ class LLMEngine : public Engine {
   void get_cache_info(std::vector<uint64_t>& cluster_ids,
                       std::vector<std::string>& addrs,
                       std::vector<uint16_t>& ports) override;
+
+  DecodeKVReadinessPrepareResult prepare_decode_kv_readiness(
+      const std::string& request_id,
+      const DecodeKVSourceTopology& source_topology,
+      int32_t destination_dp_rank,
+      const std::vector<KVTransferMapping>& mappings) override;
+
+  DecodeKVReadinessPollResult poll_decode_kv_readiness(
+      size_t max_notifications_per_worker) override;
+
+  DecodeKVReadinessSnapshot get_decode_kv_readiness(
+      const std::string& request_id) const override;
+
+  bool try_publish_decode_kv_readiness(const std::string& request_id) override;
+
+  void discard_decode_kv_readiness(const std::string& request_id) override;
 
   void get_xtensor_info(
       std::vector<size_t>& worker_free_phy_pages,
@@ -220,6 +273,11 @@ class LLMEngine : public Engine {
   std::unique_ptr<ThreadPool> threadpool_ = nullptr;
 
   bool layer_forward_interrupted_ = false;
+
+  std::mutex decode_kv_readiness_generation_mutex_;
+  detail::DecodeKVReadinessCoordinator decode_kv_readiness_coordinator_;
+  uint64_t next_decode_kv_attempt_epoch_ = 1;
+  uint64_t next_decode_kv_allocation_generation_ = 1;
 
   // threadpool for link cluster
   std::unique_ptr<ThreadPool> link_threadpool_;

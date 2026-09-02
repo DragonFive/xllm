@@ -97,6 +97,17 @@ class WorkerService : public proto::DistributeWorker {
                     proto::CacheInfo* resp,
                     ::google::protobuf::Closure* done) override;
 
+  void GetKVCacheLayout(::google::protobuf::RpcController* controller,
+                        const proto::Empty* req,
+                        proto::KVCacheLayoutResponse* resp,
+                        ::google::protobuf::Closure* done) override;
+
+  void DrainKVTransferNotifications(
+      ::google::protobuf::RpcController* controller,
+      const proto::DrainKVTransferNotificationsRequest* req,
+      proto::DrainKVTransferNotificationsResponse* resp,
+      ::google::protobuf::Closure* done) override;
+
   void LinkCluster(::google::protobuf::RpcController* controller,
                    const proto::ClusterInfo* req,
                    proto::Status* resp,

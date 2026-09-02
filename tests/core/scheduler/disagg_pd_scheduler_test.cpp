@@ -15,19 +15,25 @@ limitations under the License.
 
 #include "scheduler/disagg_pd_scheduler.h"
 
+#include <brpc/closure_guard.h>
+#include <brpc/server.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/metrics.h"
-#include "distributed_runtime/engine.h"
+#include "distributed_runtime/comm_channel.h"
+#include "distributed_runtime/llm_engine.h"
 #include "framework/block/block_manager_impl.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/kv_cache_transfer/decode_kv_readiness.h"
 #include "framework/model/model_args.h"
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
@@ -35,6 +41,33 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+constexpr std::chrono::seconds kSlowReadinessRpcDelay{2};
+
+class SlowDecodeKVReadinessService final : public proto::DistributeWorker {
+ public:
+  void GetKVCacheLayout(::google::protobuf::RpcController* /*controller*/,
+                        const proto::Empty* /*request*/,
+                        proto::KVCacheLayoutResponse* response,
+                        ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    std::this_thread::sleep_for(kSlowReadinessRpcDelay);
+    response->set_ok(true);
+    response->set_supported(true);
+    response->set_serialized_manifest("layout");
+  }
+
+  void DrainKVTransferNotifications(
+      ::google::protobuf::RpcController* /*controller*/,
+      const proto::DrainKVTransferNotificationsRequest* /*request*/,
+      proto::DrainKVTransferNotificationsResponse* response,
+      ::google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    std::this_thread::sleep_for(kSlowReadinessRpcDelay);
+    response->set_ok(true);
+    response->set_supported(true);
+  }
+};
 
 class FakeTokenizer final : public Tokenizer {
  public:
@@ -113,9 +146,135 @@ class FakeEngine final : public Engine {
     return true;
   }
 
+  DecodeKVReadinessPollResult poll_decode_kv_readiness(
+      size_t /*max_notifications_per_worker*/) override {
+    ++readiness_poll_count;
+    if (serialized_readiness_enabled_) {
+      std::vector<KVTransferNotificationDrainResult> drains;
+      drains.swap(serialized_readiness_drains_);
+      if (drains.empty()) {
+        KVTransferNotificationDrainResult drain;
+        drain.supported = true;
+        drains.emplace_back(std::move(drain));
+      }
+      return serialized_readiness_coordinator_.poll(
+          drains.size(), [&drains](size_t worker_rank) {
+            return std::move(drains[worker_rank]);
+          });
+    }
+    if (!readiness_poll_result.ok && poison_on_poll_failure &&
+        readiness_snapshot.found) {
+      readiness_snapshot.poisoned = true;
+      readiness_snapshot.failure_reason = readiness_poll_result.error;
+    }
+    return readiness_poll_result;
+  }
+
+  DecodeKVReadinessSnapshot get_decode_kv_readiness(
+      const std::string& request_id) const override {
+    if (serialized_readiness_enabled_) {
+      return serialized_readiness_coordinator_.snapshot(request_id);
+    }
+    if (request_id != "req") {
+      return {};
+    }
+    return readiness_snapshot;
+  }
+
+  bool try_publish_decode_kv_readiness(const std::string& request_id) override {
+    ++readiness_publish_count;
+    if (serialized_readiness_enabled_) {
+      return serialized_readiness_coordinator_.try_publish(request_id);
+    }
+    if (request_id != "req" || !readiness_snapshot.found ||
+        !readiness_snapshot.ready || readiness_snapshot.poisoned ||
+        readiness_snapshot.published) {
+      return false;
+    }
+    readiness_snapshot.published = true;
+    return true;
+  }
+
+  void discard_decode_kv_readiness(const std::string& request_id) override {
+    if (serialized_readiness_enabled_) {
+      if (serialized_readiness_coordinator_.discard(request_id)) {
+        ++readiness_discard_count;
+      }
+      return;
+    }
+    if (request_id == "req" && readiness_snapshot.found) {
+      ++readiness_discard_count;
+      readiness_snapshot.found = false;
+    }
+  }
+
+  bool unlink_cluster(const std::vector<uint64_t>& /*cluster_ids*/,
+                      const std::vector<std::string>& /*addrs*/,
+                      const std::vector<uint16_t>& /*ports*/,
+                      int32_t /*src_dp_size*/,
+                      int32_t /*src_kv_split_size*/) override {
+    ++unlink_count;
+    return true;
+  }
+
+  void configure_strict_readiness(uint64_t attempt_epoch,
+                                  uint64_t allocation_generation) {
+    readiness_snapshot = {};
+    readiness_snapshot.found = true;
+    readiness_snapshot.attempt_epoch = attempt_epoch;
+    readiness_snapshot.allocation_generation = allocation_generation;
+    readiness_poll_result.ok = true;
+    readiness_poll_result.complete = true;
+    readiness_poll_result.error.clear();
+    poison_on_poll_failure = false;
+  }
+
+  void configure_serialized_readiness(DecodeKVExpectedManifest manifest) {
+    serialized_readiness_enabled_ = true;
+    auto ledger =
+        std::make_shared<DecodeKVReadinessLedger>(std::move(manifest));
+    CHECK(!ledger->is_poisoned()) << ledger->failure_reason();
+    CHECK(serialized_readiness_coordinator_.register_ledger(std::move(ledger)));
+  }
+
+  void queue_serialized_readiness_payload(std::string payload) {
+    if (serialized_readiness_drains_.empty()) {
+      KVTransferNotificationDrainResult drain;
+      drain.supported = true;
+      serialized_readiness_drains_.emplace_back(std::move(drain));
+    }
+    serialized_readiness_drains_.front().payloads.emplace_back(
+        std::move(payload));
+  }
+
+  void queue_serialized_readiness_drains(
+      std::vector<KVTransferNotificationDrainResult> drains) {
+    CHECK(serialized_readiness_drains_.empty());
+    serialized_readiness_drains_ = std::move(drains);
+  }
+
+  void mark_readiness_ready() { readiness_snapshot.ready = true; }
+
+  void fail_readiness_poll(const std::string& error) {
+    readiness_poll_result.ok = false;
+    readiness_poll_result.complete = false;
+    readiness_poll_result.error = error;
+    poison_on_poll_failure = true;
+  }
+
   std::vector<KVTransferMapping> pulled_mappings;
+  DecodeKVReadinessSnapshot readiness_snapshot;
+  DecodeKVReadinessPollResult readiness_poll_result;
+  bool poison_on_poll_failure = false;
+  int32_t readiness_poll_count = 0;
+  int32_t readiness_publish_count = 0;
+  int32_t readiness_discard_count = 0;
+  int32_t unlink_count = 0;
 
  private:
+  bool serialized_readiness_enabled_ = false;
+  detail::DecodeKVReadinessCoordinator serialized_readiness_coordinator_;
+  std::vector<KVTransferNotificationDrainResult> serialized_readiness_drains_;
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<BlockManagerPool> block_manager_;
   ModelArgs model_args_;
@@ -132,6 +291,38 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
 
   bool pop_decode_request_for_test(std::shared_ptr<Request>* request) {
     return request_queue_.read(*request);
+  }
+
+  bool enqueue_ready_request_for_test(std::shared_ptr<Request> request) {
+    return enqueue_ready_request(std::move(request));
+  }
+
+  void do_permanent_rejection_for_test(const std::shared_ptr<Request>& request,
+                                       int32_t status_code) {
+    do_permanent_rejection(request, status_code);
+  }
+
+  void poll_decode_kv_readiness_for_test() { poll_decode_kv_readiness(); }
+
+  void expire_quarantine_drain_for_test() {
+    quarantine_drain_deadline_ = std::chrono::steady_clock::now();
+  }
+
+  void wait_for_responses() { response_processor_->wait_completion(); }
+
+  bool is_quarantined_for_test(const std::string& request_id) const {
+    return quarantined_requests_.find(request_id) !=
+           quarantined_requests_.end();
+  }
+
+  const Request* quarantined_request_for_test(
+      const std::string& request_id) const {
+    const auto it = quarantined_requests_.find(request_id);
+    return it == quarantined_requests_.end() ? nullptr : it->second.get();
+  }
+
+  size_t strict_pending_count_for_test() const {
+    return strict_decode_pending_states_.size();
   }
 
   static int64_t amortized_token_latency_for_test(int64_t latency,
@@ -170,7 +361,8 @@ DisaggPDScheduler::Options make_decode_options() {
 }
 
 std::shared_ptr<Request> make_request(
-    const std::vector<int32_t>& prompt_token_ids) {
+    const std::vector<int32_t>& prompt_token_ids,
+    const std::string& request_id = "req") {
   RequestSamplingParam sampling_param;
   SchedulerParam scheduler_param;
 
@@ -196,7 +388,7 @@ std::shared_ptr<Request> make_request(
                      /*service_request_id=*/nullptr);
 
   return std::make_shared<Request>(
-      "req", "x-request-id", "x-request-time", state, "service-req");
+      request_id, "x-request-id", "x-request-time", state, "service-req");
 }
 
 void finish_prefill(Sequence* sequence) {
@@ -210,6 +402,12 @@ size_t first_cache_size(const BlockManagerPool& block_manager) {
       block_manager.num_blocks_in_prefix_cache();
   CHECK(!cache_sizes.empty());
   return cache_sizes[0];
+}
+
+size_t first_free_block_count(const BlockManagerPool& block_manager) {
+  const std::vector<size_t> free_block_counts = block_manager.num_free_blocks();
+  CHECK(!free_block_counts.empty());
+  return free_block_counts[0];
 }
 
 void release_prefix_cache(BlockManagerPool* block_manager) {
@@ -249,7 +447,154 @@ bool recv_first_generation(DisaggPDScheduler* scheduler,
       num_cached_tokens);
 }
 
+bool recv_strict_first_generation(
+    DisaggPDScheduler* scheduler,
+    uint64_t attempt_epoch,
+    uint64_t allocation_generation,
+    double time_to_first_token_latency_seconds = 0.1,
+    std::vector<KVTransferMapping> source_mappings = {},
+    torch::Tensor mtp_embedding = torch::Tensor(),
+    const std::string& request_id = "req") {
+  return scheduler->decode_recv_first_generation(
+      request_id,
+      /*token_id=*/42,
+      /*has_logprob=*/true,
+      /*logprob=*/-0.25f,
+      time_to_first_token_latency_seconds,
+      /*top_tokens=*/{42, 43},
+      /*top_logprobs=*/{-0.25f, -1.0f},
+      /*kv_cache_transfer_mode=*/"PUSH",
+      /*src_cluster_ids=*/{101, 102},
+      /*src_addrs=*/{"source-a", "source-b"},
+      std::move(source_mappings),
+      /*src_dp_size=*/2,
+      /*src_dp_rank=*/1,
+      std::move(mtp_embedding),
+      /*num_cached_tokens=*/2,
+      attempt_epoch,
+      allocation_generation);
+}
+
+DecodeKVContributionKey make_readiness_key(
+    uint64_t logical_block_ordinal,
+    uint64_t destination_physical_block_id) {
+  DecodeKVContributionKey key;
+  key.source_worker_rank = 0;
+  key.destination_worker_rank = 0;
+  key.layer_id = 0;
+  key.group_id = cache_group_id(BlockType::KV);
+  key.cache_role = 0;
+  key.logical_block_ordinal = logical_block_ordinal;
+  key.destination_physical_block_id = destination_physical_block_id;
+  return key;
+}
+
+DecodeKVExpectedManifest make_readiness_manifest(
+    const std::string& request_id,
+    uint64_t attempt_epoch,
+    uint64_t allocation_generation,
+    const std::vector<DecodeKVContributionKey>& keys) {
+  DecodeKVExpectedManifest manifest;
+  manifest.request_id = request_id;
+  manifest.attempt_epoch = attempt_epoch;
+  manifest.allocation_generation = allocation_generation;
+  manifest.contributions.reserve(keys.size());
+  for (const DecodeKVContributionKey& key : keys) {
+    DecodeKVExpectedContribution contribution;
+    contribution.key = key;
+    contribution.valid_tokens = 2;
+    manifest.contributions.emplace_back(std::move(contribution));
+  }
+  return manifest;
+}
+
+DecodeKVReceipt make_readiness_receipt(const std::string& request_id,
+                                       const DecodeKVContributionKey& key,
+                                       const std::string& submission_id,
+                                       uint64_t attempt_epoch,
+                                       uint64_t allocation_generation) {
+  DecodeKVReceipt receipt;
+  receipt.request_id = request_id;
+  receipt.key = key;
+  receipt.submission_id = submission_id;
+  receipt.attempt_epoch = attempt_epoch;
+  receipt.allocation_generation = allocation_generation;
+  receipt.valid_tokens = 2;
+  receipt.completion_level = DecodeKVCompletionLevel::REMOTE_VISIBLE;
+  return receipt;
+}
+
+std::string serialize_readiness_notification(
+    const std::string& submission_id,
+    std::vector<DecodeKVReceipt> receipts) {
+  MooncakeDecodeKVNotification notification;
+  notification.submission_id = submission_id;
+  notification.receipts = std::move(receipts);
+  std::string serialized;
+  std::string error;
+  CHECK(serialize_mooncake_decode_kv_notification(
+      notification, &serialized, &error))
+      << error;
+  return serialized;
+}
+
+KVTransferNotificationDrainResult make_readiness_drain(
+    std::vector<std::string> payloads = {},
+    bool more_available = false,
+    bool ok = true,
+    bool supported = true) {
+  KVTransferNotificationDrainResult drain;
+  drain.ok = ok;
+  drain.supported = supported;
+  drain.more_available = more_available;
+  drain.payloads = std::move(payloads);
+  return drain;
+}
+
+OutputFunc capture_failure_output(int32_t* callback_count,
+                                  std::optional<Status>* callback_status) {
+  CHECK(callback_count != nullptr);
+  CHECK(callback_status != nullptr);
+  return [callback_count, callback_status](const RequestOutput& output) {
+    ++(*callback_count);
+    *callback_status = output.status;
+    return true;
+  };
+}
+
 }  // namespace
+
+TEST(CommChannelTest, DecodeKVReadinessRpcsUseFiniteTimeouts) {
+  SlowDecodeKVReadinessService service;
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+
+  CommChannel channel;
+  const std::string server_address =
+      "127.0.0.1:" + std::to_string(server.listen_address().port);
+  ASSERT_TRUE(channel.init_brpc(server_address));
+
+  const std::chrono::steady_clock::time_point layout_start =
+      std::chrono::steady_clock::now();
+  const KVCacheLayoutQueryResult layout = channel.get_kv_cache_layout();
+  const std::chrono::steady_clock::duration layout_elapsed =
+      std::chrono::steady_clock::now() - layout_start;
+  EXPECT_FALSE(layout.ok);
+  EXPECT_LT(layout_elapsed, kSlowReadinessRpcDelay);
+
+  const std::chrono::steady_clock::time_point drain_start =
+      std::chrono::steady_clock::now();
+  const KVTransferNotificationDrainResult drain =
+      channel.drain_kv_transfer_notifications(/*max_notifications=*/1);
+  const std::chrono::steady_clock::duration drain_elapsed =
+      std::chrono::steady_clock::now() - drain_start;
+  EXPECT_FALSE(drain.ok);
+  EXPECT_LT(drain_elapsed, kSlowReadinessRpcDelay);
+
+  EXPECT_EQ(server.Stop(/*closewait_ms=*/0), 0);
+  EXPECT_EQ(server.Join(), 0);
+}
 
 TEST(DisaggPDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
   FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
@@ -431,15 +776,845 @@ TEST(DisaggPDSchedulerTest, PreservesPrefillCachedTokensOnDecodeRequest) {
   EXPECT_EQ(queued->num_prefix_cache_tokens(), 2u);
 }
 
+TEST(DisaggPDSchedulerTest,
+     StrictReadinessTokenFirstPublishesAndEnqueuesExactlyOnce) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  ASSERT_TRUE(scheduler.try_allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.local_ids = {1};
+  mapping.remote_ids = {101};
+  mapping.logical_block_ordinals = {2};
+  mapping.valid_tokens = {1};
+  mapping.receipt_remote_ids = {101};
+  mapping.remote_shared_num = 2;
+  const torch::Tensor embedding = torch::tensor({1.0f, 2.0f});
+  EXPECT_TRUE(recv_strict_first_generation(&scheduler,
+                                           kAttemptEpoch,
+                                           kAllocationGeneration,
+                                           /*ttft_seconds=*/0.1,
+                                           {mapping},
+                                           embedding));
+  EXPECT_TRUE(recv_strict_first_generation(&scheduler,
+                                           kAttemptEpoch,
+                                           kAllocationGeneration,
+                                           /*ttft_seconds=*/0.1,
+                                           {mapping},
+                                           embedding.clone()));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 1u);
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+
+  engine.mark_readiness_ready();
+  scheduler.poll_decode_kv_readiness_for_test();
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued->sequences()[0]->tokens().back(), 42);
+  EXPECT_EQ(engine.readiness_publish_count, 1);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+
+  scheduler.poll_decode_kv_readiness_for_test();
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&request));
+  EXPECT_EQ(engine.readiness_publish_count, 1);
+  engine.block_manager_pool()->deallocate(queued.get());
+}
+
+TEST(DisaggPDSchedulerTest, StrictReadinessReceiptFirstWaitsForToken) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  ASSERT_TRUE(scheduler.try_allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  engine.mark_readiness_ready();
+  scheduler.poll_decode_kv_readiness_for_test();
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(engine.readiness_publish_count, 0);
+
+  ASSERT_TRUE(recv_strict_first_generation(
+      &scheduler, kAttemptEpoch, kAllocationGeneration));
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  scheduler.poll_decode_kv_readiness_for_test();
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(engine.readiness_publish_count, 1);
+  engine.block_manager_pool()->deallocate(queued.get());
+}
+
+TEST(DisaggPDSchedulerTest,
+     StrictReadinessWaitsForCurrentReceiverDrainToComplete) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  ASSERT_TRUE(scheduler.try_allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  ASSERT_TRUE(recv_strict_first_generation(
+      &scheduler, kAttemptEpoch, kAllocationGeneration));
+
+  engine.mark_readiness_ready();
+  engine.readiness_poll_result.complete = false;
+  scheduler.poll_decode_kv_readiness_for_test();
+
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(engine.readiness_publish_count, 0);
+
+  engine.readiness_poll_result.complete = true;
+  scheduler.poll_decode_kv_readiness_for_test();
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(engine.readiness_publish_count, 1);
+  engine.block_manager_pool()->deallocate(queued.get());
+}
+
+TEST(DisaggPDSchedulerTest,
+     SerializedNotificationDelayedFinalReceiptEnqueuesOnlyAfterComplete) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  const std::string request_id = "delayed-request";
+  const DecodeKVContributionKey first_key =
+      make_readiness_key(/*logical_block_ordinal=*/0,
+                         /*destination_physical_block_id=*/100);
+  const DecodeKVContributionKey delayed_key =
+      make_readiness_key(/*logical_block_ordinal=*/1,
+                         /*destination_physical_block_id=*/101);
+
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_serialized_readiness(
+      make_readiness_manifest(request_id,
+                              kAttemptEpoch,
+                              kAllocationGeneration,
+                              {first_key, delayed_key}));
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4}, request_id);
+  ASSERT_TRUE(scheduler.try_allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  ASSERT_TRUE(recv_strict_first_generation(&scheduler,
+                                           kAttemptEpoch,
+                                           kAllocationGeneration,
+                                           /*ttft_seconds=*/0.1,
+                                           /*source_mappings=*/{},
+                                           torch::Tensor(),
+                                           request_id));
+
+  engine.queue_serialized_readiness_drains(
+      {make_readiness_drain({serialize_readiness_notification(
+           "submission-first",
+           {make_readiness_receipt(request_id,
+                                   first_key,
+                                   "submission-first",
+                                   kAttemptEpoch,
+                                   kAllocationGeneration)})}),
+       make_readiness_drain()});
+  scheduler.poll_decode_kv_readiness_for_test();
+
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 1u);
+  EXPECT_EQ(engine.readiness_publish_count, 0);
+
+  engine.queue_serialized_readiness_drains(
+      {make_readiness_drain(
+           {serialize_readiness_notification(
+               "submission-delayed",
+               {make_readiness_receipt(request_id,
+                                       delayed_key,
+                                       "submission-delayed",
+                                       kAttemptEpoch,
+                                       kAllocationGeneration)})},
+           /*more_available=*/true),
+       make_readiness_drain()});
+  scheduler.poll_decode_kv_readiness_for_test();
+
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 1u);
+  EXPECT_EQ(engine.readiness_publish_count, 0);
+
+  engine.queue_serialized_readiness_drains(
+      {make_readiness_drain(), make_readiness_drain()});
+  scheduler.poll_decode_kv_readiness_for_test();
+
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued->request_id(), request_id);
+  EXPECT_EQ(queued->sequences()[0]->tokens().back(), 42);
+  EXPECT_EQ(engine.readiness_publish_count, 1);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  engine.block_manager_pool()->deallocate(queued.get());
+}
+
+TEST(DisaggPDSchedulerTest,
+     SerializedNotificationFailuresQuarantineAndIsolateNextRequest) {
+  enum class FailureKind : int8_t {
+    MISSING_RECEIPT = 0,
+    CONFLICTING_DUPLICATE = 1,
+    WORKER_DRAIN = 2,
+  };
+  struct FailureCase {
+    std::string name;
+    FailureKind kind;
+    std::string expected_message;
+  };
+  const std::vector<FailureCase> failure_cases = {
+      {"missing", FailureKind::MISSING_RECEIPT, "receiver receipts"},
+      {"conflicting-duplicate",
+       FailureKind::CONFLICTING_DUPLICATE,
+       "conflicting"},
+      {"worker-drain", FailureKind::WORKER_DRAIN, "failed to drain"}};
+
+  for (const FailureCase& failure_case : failure_cases) {
+    SCOPED_TRACE(failure_case.name);
+    constexpr uint64_t kAttemptEpoch = 7;
+    constexpr uint64_t kAllocationGeneration = 11;
+    const std::string failed_request_id = "failed-" + failure_case.name;
+    const std::string healthy_request_id = "healthy-" + failure_case.name;
+    const DecodeKVContributionKey first_key =
+        make_readiness_key(/*logical_block_ordinal=*/0,
+                           /*destination_physical_block_id=*/100);
+    const DecodeKVContributionKey missing_key =
+        make_readiness_key(/*logical_block_ordinal=*/1,
+                           /*destination_physical_block_id=*/101);
+
+    FakeEngine engine(/*num_blocks=*/16, /*block_size=*/2);
+    DisaggPDScheduler::Options options = make_decode_options();
+    options.decode_kv_readiness_timeout_ms(0);
+    int32_t callback_count = 0;
+    std::optional<Status> callback_status;
+    TestDisaggPDScheduler scheduler(&engine, options);
+    engine.configure_serialized_readiness(
+        make_readiness_manifest(failed_request_id,
+                                kAttemptEpoch,
+                                kAllocationGeneration,
+                                {first_key, missing_key}));
+    std::shared_ptr<Request> failed_request =
+        make_request({1, 2, 3, 4}, failed_request_id);
+    failed_request->state().output_func =
+        capture_failure_output(&callback_count, &callback_status);
+    ASSERT_TRUE(scheduler.try_allocate(failed_request->sequences()[0].get()));
+    ASSERT_TRUE(scheduler.decode_schedule(failed_request, "prefill"));
+    ASSERT_TRUE(recv_strict_first_generation(&scheduler,
+                                             kAttemptEpoch,
+                                             kAllocationGeneration,
+                                             /*ttft_seconds=*/0.1,
+                                             /*source_mappings=*/{},
+                                             torch::Tensor(),
+                                             failed_request_id));
+
+    const std::string original_payload = serialize_readiness_notification(
+        "submission-original",
+        {make_readiness_receipt(failed_request_id,
+                                first_key,
+                                "submission-original",
+                                kAttemptEpoch,
+                                kAllocationGeneration)});
+    if (failure_case.kind == FailureKind::WORKER_DRAIN) {
+      engine.queue_serialized_readiness_drains(
+          {make_readiness_drain({original_payload}),
+           make_readiness_drain(/*payloads=*/{},
+                                /*more_available=*/false,
+                                /*ok=*/false)});
+    } else {
+      engine.queue_serialized_readiness_payload(original_payload);
+    }
+    if (failure_case.kind == FailureKind::CONFLICTING_DUPLICATE) {
+      engine.queue_serialized_readiness_payload(
+          serialize_readiness_notification(
+              "submission-conflict",
+              {make_readiness_receipt(failed_request_id,
+                                      first_key,
+                                      "submission-conflict",
+                                      kAttemptEpoch,
+                                      kAllocationGeneration)}));
+    }
+    scheduler.poll_decode_kv_readiness_for_test();
+    scheduler.wait_for_responses();
+
+    EXPECT_TRUE(scheduler.is_quarantined_for_test(failed_request_id));
+    EXPECT_EQ(callback_count, 1);
+    ASSERT_TRUE(callback_status.has_value());
+    EXPECT_NE(callback_status->message().find(failure_case.expected_message),
+              std::string::npos);
+    std::shared_ptr<Request> queued;
+    EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+
+    const DecodeKVContributionKey healthy_key =
+        make_readiness_key(/*logical_block_ordinal=*/2,
+                           /*destination_physical_block_id=*/102);
+    engine.configure_serialized_readiness(
+        make_readiness_manifest(healthy_request_id,
+                                kAttemptEpoch + 1,
+                                kAllocationGeneration + 1,
+                                {healthy_key}));
+    std::shared_ptr<Request> healthy_request =
+        make_request({5, 6, 7, 8}, healthy_request_id);
+    ASSERT_TRUE(scheduler.try_allocate(healthy_request->sequences()[0].get()));
+    ASSERT_TRUE(scheduler.decode_schedule(healthy_request, "prefill"));
+    ASSERT_TRUE(recv_strict_first_generation(&scheduler,
+                                             kAttemptEpoch + 1,
+                                             kAllocationGeneration + 1,
+                                             /*ttft_seconds=*/0.1,
+                                             /*source_mappings=*/{},
+                                             torch::Tensor(),
+                                             healthy_request_id));
+    engine.queue_serialized_readiness_payload(serialize_readiness_notification(
+        "submission-healthy",
+        {make_readiness_receipt(healthy_request_id,
+                                healthy_key,
+                                "submission-healthy",
+                                kAttemptEpoch + 1,
+                                kAllocationGeneration + 1)}));
+    scheduler.poll_decode_kv_readiness_for_test();
+
+    ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+    EXPECT_EQ(queued->request_id(), healthy_request_id);
+    EXPECT_EQ(queued->sequences()[0]->tokens().back(), 42);
+    EXPECT_FALSE(scheduler.is_quarantined_for_test(healthy_request_id));
+    EXPECT_EQ(engine.readiness_publish_count, 1);
+    EXPECT_EQ(engine.readiness_discard_count, 2);
+    engine.block_manager_pool()->deallocate(queued.get());
+  }
+}
+
+TEST(DisaggPDSchedulerTest,
+     SerializedNotificationRoutesReceiptToMatchingRequestLedger) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  const std::string first_request_id = "route-first";
+  const std::string second_request_id = "route-second";
+  const DecodeKVContributionKey first_key =
+      make_readiness_key(/*logical_block_ordinal=*/0,
+                         /*destination_physical_block_id=*/100);
+  const DecodeKVContributionKey second_key =
+      make_readiness_key(/*logical_block_ordinal=*/1,
+                         /*destination_physical_block_id=*/101);
+
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_serialized_readiness(make_readiness_manifest(
+      first_request_id, kAttemptEpoch, kAllocationGeneration, {first_key}));
+  engine.configure_serialized_readiness(
+      make_readiness_manifest(second_request_id,
+                              kAttemptEpoch + 1,
+                              kAllocationGeneration + 1,
+                              {second_key}));
+  engine.queue_serialized_readiness_drains(
+      {make_readiness_drain({serialize_readiness_notification(
+           "submission-second",
+           {make_readiness_receipt(second_request_id,
+                                   second_key,
+                                   "submission-second",
+                                   kAttemptEpoch + 1,
+                                   kAllocationGeneration + 1)})}),
+       make_readiness_drain()});
+
+  const DecodeKVReadinessPollResult poll =
+      engine.poll_decode_kv_readiness(/*max_notifications_per_worker=*/256);
+
+  EXPECT_TRUE(poll.ok);
+  EXPECT_TRUE(poll.complete);
+  const DecodeKVReadinessSnapshot first =
+      engine.get_decode_kv_readiness(first_request_id);
+  const DecodeKVReadinessSnapshot second =
+      engine.get_decode_kv_readiness(second_request_id);
+  EXPECT_FALSE(first.ready);
+  EXPECT_TRUE(second.ready);
+  EXPECT_FALSE(engine.try_publish_decode_kv_readiness(first_request_id));
+  EXPECT_TRUE(engine.try_publish_decode_kv_readiness(second_request_id));
+  engine.discard_decode_kv_readiness(first_request_id);
+  engine.discard_decode_kv_readiness(second_request_id);
+}
+
+TEST(DecodeKVReadinessCoordinatorTest,
+     LedgerRegisteredDuringDrainWaitsForNextCompletePoll) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  const std::string request_id = "registered-during-drain";
+  const DecodeKVContributionKey key =
+      make_readiness_key(/*logical_block_ordinal=*/0,
+                         /*destination_physical_block_id=*/100);
+  DecodeKVExpectedManifest manifest = make_readiness_manifest(
+      request_id, kAttemptEpoch, kAllocationGeneration, {key});
+  const std::string payload = serialize_readiness_notification(
+      "submission",
+      {make_readiness_receipt(request_id,
+                              key,
+                              "submission",
+                              kAttemptEpoch,
+                              kAllocationGeneration)});
+  detail::DecodeKVReadinessCoordinator coordinator;
+  bool registered = false;
+
+  const DecodeKVReadinessPollResult first_poll = coordinator.poll(
+      /*worker_count=*/1,
+      [&coordinator, &manifest, &payload, &registered](size_t worker_rank) {
+        EXPECT_EQ(worker_rank, 0u);
+        std::shared_ptr<DecodeKVReadinessLedger> ledger =
+            std::make_shared<DecodeKVReadinessLedger>(std::move(manifest));
+        registered = coordinator.register_ledger(std::move(ledger));
+        return make_readiness_drain({payload});
+      });
+
+  EXPECT_TRUE(registered);
+  EXPECT_TRUE(first_poll.ok);
+  EXPECT_TRUE(first_poll.complete);
+  const DecodeKVReadinessSnapshot first_snapshot =
+      coordinator.snapshot(request_id);
+  EXPECT_TRUE(first_snapshot.found);
+  EXPECT_FALSE(first_snapshot.ready);
+  EXPECT_FALSE(first_snapshot.poisoned);
+  EXPECT_FALSE(coordinator.try_publish(request_id));
+
+  const DecodeKVReadinessPollResult second_poll = coordinator.poll(
+      /*worker_count=*/1, [](size_t worker_rank) {
+        EXPECT_EQ(worker_rank, 0u);
+        return make_readiness_drain();
+      });
+
+  EXPECT_TRUE(second_poll.ok);
+  EXPECT_TRUE(second_poll.complete);
+  EXPECT_TRUE(coordinator.snapshot(request_id).ready);
+  EXPECT_TRUE(coordinator.try_publish(request_id));
+  EXPECT_FALSE(coordinator.try_publish(request_id));
+  EXPECT_TRUE(coordinator.discard(request_id));
+}
+
+TEST(DecodeKVReadinessCoordinatorTest,
+     WorkerDrainFailurePoisonsOnlyPollStartLedgers) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  const std::string first_request_id = "worker-failure-first";
+  const std::string second_request_id = "worker-failure-second";
+  const std::string new_request_id = "worker-failure-new";
+  const DecodeKVContributionKey first_key =
+      make_readiness_key(/*logical_block_ordinal=*/0,
+                         /*destination_physical_block_id=*/100);
+  const DecodeKVContributionKey second_key =
+      make_readiness_key(/*logical_block_ordinal=*/1,
+                         /*destination_physical_block_id=*/101);
+  const DecodeKVContributionKey new_key =
+      make_readiness_key(/*logical_block_ordinal=*/2,
+                         /*destination_physical_block_id=*/102);
+  detail::DecodeKVReadinessCoordinator coordinator;
+  ASSERT_TRUE(
+      coordinator.register_ledger(std::make_shared<DecodeKVReadinessLedger>(
+          make_readiness_manifest(first_request_id,
+                                  kAttemptEpoch,
+                                  kAllocationGeneration,
+                                  {first_key}))));
+  ASSERT_TRUE(
+      coordinator.register_ledger(std::make_shared<DecodeKVReadinessLedger>(
+          make_readiness_manifest(second_request_id,
+                                  kAttemptEpoch + 1,
+                                  kAllocationGeneration + 1,
+                                  {second_key}))));
+  std::vector<KVTransferNotificationDrainResult> drains = {
+      make_readiness_drain({serialize_readiness_notification(
+          "submission-new",
+          {make_readiness_receipt(new_request_id,
+                                  new_key,
+                                  "submission-new",
+                                  kAttemptEpoch + 2,
+                                  kAllocationGeneration + 2)})}),
+      make_readiness_drain(/*payloads=*/{},
+                           /*more_available=*/false,
+                           /*ok=*/false)};
+  bool registered_during_drain = false;
+
+  const DecodeKVReadinessPollResult poll = coordinator.poll(
+      drains.size(),
+      [&coordinator,
+       &drains,
+       &new_key,
+       &new_request_id,
+       &registered_during_drain,
+       kAttemptEpoch,
+       kAllocationGeneration](size_t worker_rank) {
+        if (worker_rank == 0) {
+          registered_during_drain = coordinator.register_ledger(
+              std::make_shared<DecodeKVReadinessLedger>(
+                  make_readiness_manifest(new_request_id,
+                                          kAttemptEpoch + 2,
+                                          kAllocationGeneration + 2,
+                                          {new_key})));
+        }
+        return std::move(drains[worker_rank]);
+      });
+
+  EXPECT_TRUE(registered_during_drain);
+  EXPECT_FALSE(poll.ok);
+  EXPECT_FALSE(poll.complete);
+  EXPECT_NE(poll.error.find("failed to drain"), std::string::npos);
+  const DecodeKVReadinessSnapshot first =
+      coordinator.snapshot(first_request_id);
+  const DecodeKVReadinessSnapshot second =
+      coordinator.snapshot(second_request_id);
+  const DecodeKVReadinessSnapshot newly_registered =
+      coordinator.snapshot(new_request_id);
+  EXPECT_TRUE(first.poisoned);
+  EXPECT_TRUE(second.poisoned);
+  EXPECT_FALSE(newly_registered.poisoned);
+  EXPECT_FALSE(first.ready);
+  EXPECT_FALSE(second.ready);
+  EXPECT_FALSE(newly_registered.ready);
+  EXPECT_NE(first.failure_reason.find("failed to drain"), std::string::npos);
+  EXPECT_NE(second.failure_reason.find("failed to drain"), std::string::npos);
+  EXPECT_FALSE(coordinator.try_publish(first_request_id));
+  EXPECT_FALSE(coordinator.try_publish(second_request_id));
+  EXPECT_TRUE(coordinator.discard(first_request_id));
+  EXPECT_TRUE(coordinator.discard(second_request_id));
+
+  const DecodeKVReadinessPollResult next_poll = coordinator.poll(
+      /*worker_count=*/2,
+      [](size_t /*worker_rank*/) { return make_readiness_drain(); });
+  EXPECT_TRUE(next_poll.ok);
+  EXPECT_TRUE(next_poll.complete);
+  EXPECT_TRUE(coordinator.snapshot(new_request_id).ready);
+  EXPECT_TRUE(coordinator.try_publish(new_request_id));
+  EXPECT_TRUE(coordinator.discard(new_request_id));
+}
+
+TEST(DisaggPDSchedulerTest, StrictReadinessTimesOutWithoutReceipt) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  DisaggPDScheduler::Options options = make_decode_options();
+  options.decode_kv_readiness_timeout_ms(0);
+  TestDisaggPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  ASSERT_TRUE(recv_strict_first_generation(
+      &scheduler, kAttemptEpoch, kAllocationGeneration));
+
+  scheduler.poll_decode_kv_readiness_for_test();
+  scheduler.wait_for_responses();
+
+  EXPECT_TRUE(scheduler.is_quarantined_for_test("req"));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 0u);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+  EXPECT_NE(callback_status->message().find("receiver receipts"),
+            std::string::npos);
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+}
+
+TEST(DisaggPDSchedulerTest, StrictReadinessTimesOutWithoutFirstGeneration) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  engine.mark_readiness_ready();
+  DisaggPDScheduler::Options options = make_decode_options();
+  options.decode_kv_readiness_timeout_ms(0);
+  TestDisaggPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  scheduler.poll_decode_kv_readiness_for_test();
+  scheduler.wait_for_responses();
+
+  EXPECT_TRUE(scheduler.is_quarantined_for_test("req"));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 0u);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+  EXPECT_NE(callback_status->message().find("FirstGeneration"),
+            std::string::npos);
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+}
+
+TEST(DisaggPDSchedulerTest,
+     QuarantineDrainsLateNotificationsAndRejectsRequestIdReuse) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  DisaggPDScheduler::Options options = make_decode_options();
+  options.decode_kv_readiness_timeout_ms(0);
+  TestDisaggPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  const size_t retained_free_block_count =
+      first_free_block_count(*engine.block_manager_pool());
+  const Request* quarantined_request = request.get();
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  scheduler.poll_decode_kv_readiness_for_test();
+  scheduler.wait_for_responses();
+  ASSERT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+  ASSERT_EQ(scheduler.quarantined_request_for_test("req"), quarantined_request);
+  EXPECT_EQ(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+
+  scheduler.poll_decode_kv_readiness_for_test();
+  EXPECT_EQ(engine.readiness_poll_count, 2);
+  scheduler.expire_quarantine_drain_for_test();
+  scheduler.poll_decode_kv_readiness_for_test();
+  EXPECT_EQ(engine.readiness_poll_count, 2);
+
+  engine.configure_strict_readiness(kAttemptEpoch + 1,
+                                    kAllocationGeneration + 1);
+  std::shared_ptr<Request> retry = make_request({5, 6, 7, 8});
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(retry->sequences()[0].get()));
+  EXPECT_LT(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+  EXPECT_FALSE(scheduler.decode_schedule(retry, "prefill"));
+  EXPECT_EQ(scheduler.quarantined_request_for_test("req"), quarantined_request);
+  EXPECT_EQ(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+}
+
+TEST(DisaggPDSchedulerTest, UnlinkFailsAndQuarantinesStrictPendingRequest) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  const size_t retained_free_block_count =
+      first_free_block_count(*engine.block_manager_pool());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  EXPECT_TRUE(scheduler.unlink_instance("prefill",
+                                        /*cluster_ids=*/{101},
+                                        /*addrs=*/{"source-a"},
+                                        /*ports=*/{1234},
+                                        /*dp_size=*/1,
+                                        /*src_kv_split_size=*/1));
+  scheduler.wait_for_responses();
+  scheduler.poll_decode_kv_readiness_for_test();
+
+  EXPECT_TRUE(scheduler.is_quarantined_for_test("req"));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 0u);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  EXPECT_EQ(engine.unlink_count, 1);
+  EXPECT_EQ(engine.readiness_poll_count, 1);
+  EXPECT_EQ(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+  EXPECT_NE(callback_status->message().find("unlinked"), std::string::npos);
+}
+
+TEST(DisaggPDSchedulerTest, StrictReadinessRejectsStaleIdentity) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  const size_t retained_free_block_count =
+      first_free_block_count(*engine.block_manager_pool());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  EXPECT_FALSE(recv_strict_first_generation(
+      &scheduler, kAttemptEpoch - 1, kAllocationGeneration));
+  scheduler.wait_for_responses();
+  EXPECT_TRUE(scheduler.is_quarantined_for_test("req"));
+  EXPECT_EQ(scheduler.strict_pending_count_for_test(), 0u);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  EXPECT_EQ(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+}
+
+TEST(DisaggPDSchedulerTest,
+     StrictReadinessRejectsConflictingFirstGenerationMapping) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  const size_t retained_free_block_count =
+      first_free_block_count(*engine.block_manager_pool());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  KVTransferMapping mapping;
+  mapping.group_id = cache_group_id(BlockType::KV);
+  mapping.remote_ids = {101};
+  mapping.logical_block_ordinals = {2};
+  mapping.valid_tokens = {1};
+  mapping.receipt_remote_ids = {101};
+  ASSERT_TRUE(recv_strict_first_generation(
+      &scheduler, kAttemptEpoch, kAllocationGeneration, 0.1, {mapping}));
+
+  mapping.receipt_remote_ids = {102};
+  EXPECT_FALSE(recv_strict_first_generation(
+      &scheduler, kAttemptEpoch, kAllocationGeneration, 0.1, {mapping}));
+  scheduler.wait_for_responses();
+  EXPECT_TRUE(scheduler.is_quarantined_for_test("req"));
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  EXPECT_EQ(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+}
+
+TEST(DisaggPDSchedulerTest, StrictReadinessPollFailureQuarantinesRequest) {
+  constexpr uint64_t kAttemptEpoch = 7;
+  constexpr uint64_t kAllocationGeneration = 11;
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.configure_strict_readiness(kAttemptEpoch, kAllocationGeneration);
+  engine.fail_readiness_poll("Decode worker failed to drain notifications");
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  int32_t callback_count = 0;
+  std::optional<Status> callback_status;
+  request->state().output_func =
+      capture_failure_output(&callback_count, &callback_status);
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  const size_t retained_free_block_count =
+      first_free_block_count(*engine.block_manager_pool());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  scheduler.poll_decode_kv_readiness_for_test();
+  scheduler.wait_for_responses();
+  EXPECT_TRUE(scheduler.is_quarantined_for_test("req"));
+  EXPECT_EQ(engine.readiness_poll_count, 1);
+  EXPECT_EQ(engine.readiness_discard_count, 1);
+  EXPECT_EQ(first_free_block_count(*engine.block_manager_pool()),
+            retained_free_block_count);
+  EXPECT_EQ(callback_count, 1);
+  ASSERT_TRUE(callback_status.has_value());
+  EXPECT_EQ(callback_status->code(), StatusCode::UNKNOWN);
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+}
+
+TEST(DisaggPDSchedulerTest, LegacyPushEnqueuesWithoutReadinessLedger) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  ASSERT_TRUE(scheduler.try_allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+  ASSERT_TRUE(recv_first_generation(&scheduler, torch::Tensor()));
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(engine.readiness_poll_count, 0);
+  EXPECT_EQ(engine.readiness_publish_count, 0);
+  engine.block_manager_pool()->deallocate(queued.get());
+}
+
+TEST(DisaggPDSchedulerTest,
+     SingleDpPrefillAdmissionAssignsSourceRankBeforeDecodeRpc) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_EQ(sequence->dp_rank(), -1);
+
+  ASSERT_TRUE(scheduler.enqueue_ready_request_for_test(request));
+
+  EXPECT_EQ(sequence->dp_rank(), 0);
+}
+
 TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
   EXPECT_FALSE(exceeds_decode_capacity(
       /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
 }
 
-TEST(DisaggPDSchedulerTest, OnlyOversizedDecodeResponseIsTerminal) {
-  EXPECT_FALSE(is_permanent_rejection(/*status_code=*/404));
+TEST(DisaggPDSchedulerTest, OnlyTemporaryDecodeCapacityResponseIsRetryable) {
+  EXPECT_FALSE(is_permanent_rejection(kDecodeAddNewRequestSuccessStatusCode));
+  EXPECT_FALSE(
+      is_permanent_rejection(kDecodeAddNewTemporaryCapacityStatusCode));
   EXPECT_TRUE(is_permanent_rejection(kDecodeAddNewPromptTooLongStatusCode));
-  EXPECT_FALSE(is_permanent_rejection(/*status_code=*/500));
+  EXPECT_TRUE(is_permanent_rejection(/*status_code=*/500));
+}
+
+TEST(DisaggPDSchedulerTest, TerminalDecodeAdmissionMapsStatusAndMessage) {
+  struct TestCase {
+    int32_t status_code;
+    StatusCode expected_code;
+    std::string expected_message;
+  };
+  const std::vector<TestCase> test_cases = {
+      {kDecodeAddNewPromptTooLongStatusCode,
+       StatusCode::RESOURCE_EXHAUSTED,
+       "Request prompt exceeds decode KV cache capacity"},
+      {/*status_code=*/500,
+       StatusCode::UNKNOWN,
+       "Decode rejected request during admission, status_code=500"}};
+
+  for (const TestCase& test_case : test_cases) {
+    FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+    TestDisaggPDScheduler scheduler(&engine, make_options());
+    std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+    int32_t callback_count = 0;
+    std::optional<Status> callback_status;
+    request->state().output_func =
+        capture_failure_output(&callback_count, &callback_status);
+    ASSERT_TRUE(
+        engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+
+    scheduler.do_permanent_rejection_for_test(request, test_case.status_code);
+    scheduler.wait_for_responses();
+
+    EXPECT_EQ(callback_count, 1);
+    ASSERT_TRUE(callback_status.has_value());
+    EXPECT_EQ(callback_status->code(), test_case.expected_code);
+    EXPECT_EQ(callback_status->message(), test_case.expected_message);
+  }
 }
 
 TEST(DisaggPDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {

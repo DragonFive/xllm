@@ -53,6 +53,15 @@ void WorkerClient::get_cache_info(uint64_t& cluster_id,
   worker_->get_cache_info(cluster_id, addr, port);
 }
 
+KVCacheLayoutQueryResult WorkerClient::get_kv_cache_layout() {
+  return worker_->get_kv_cache_layout();
+}
+
+KVTransferNotificationDrainResult WorkerClient::drain_kv_transfer_notifications(
+    size_t max_notifications) {
+  return worker_->drain_kv_transfer_notifications(max_notifications);
+}
+
 bool WorkerClient::link_cluster(const std::vector<uint64_t>& cluster_ids,
                                 const std::vector<std::string>& addrs,
                                 const std::vector<uint16_t>& ports) {

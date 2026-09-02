@@ -15,12 +15,16 @@ limitations under the License.
 
 #include "framework/kv_cache_transfer/mooncake_transfer_engine.h"
 
+#include <butil/base64.h>
+#include <butil/strings/string_number_conversions.h>
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <numeric>
+#include <utility>
 
 #include "common/metrics.h"
 #include "util/net.h"
@@ -77,6 +81,133 @@ bool wait_batch(TransferEngine* engine, BatchID batch_id) {
 }
 
 }  // namespace
+
+namespace detail {
+
+size_t mooncake_transfer_batch_count(size_t region_count) {
+  return region_count / kMooncakeMaxRegionsPerBatch +
+         static_cast<size_t>(region_count % kMooncakeMaxRegionsPerBatch != 0);
+}
+
+MooncakeDecodeKVNotification make_mooncake_batch_notification(
+    const MooncakeDecodeKVNotification& notification,
+    uint32_t batch_index,
+    uint32_t batch_count) {
+  MooncakeDecodeKVNotification batch_notification = notification;
+  batch_notification.batch_index = batch_index;
+  batch_notification.batch_count = batch_count;
+  if (batch_index + 1 != batch_count) {
+    batch_notification.receipts.clear();
+  }
+  return batch_notification;
+}
+
+std::string frame_mooncake_notification_payload(const std::string& payload) {
+  std::string encoded_payload;
+  butil::Base64Encode(payload, &encoded_payload);
+  return std::string(kMooncakeDecodeKVNotificationFramePrefix) +
+         std::to_string(payload.size()) + ":" + encoded_payload;
+}
+
+bool unframe_mooncake_notification_payload(const std::string& framed_payload,
+                                           std::string* payload,
+                                           std::string* error) {
+  if (payload == nullptr || error == nullptr) {
+    return false;
+  }
+  payload->clear();
+  error->clear();
+
+  constexpr size_t kPrefixSize =
+      sizeof(kMooncakeDecodeKVNotificationFramePrefix) - 1;
+  if (framed_payload.compare(
+          0, kPrefixSize, kMooncakeDecodeKVNotificationFramePrefix) != 0) {
+    *payload = framed_payload;
+    return true;
+  }
+
+  const size_t size_separator = framed_payload.find(':', kPrefixSize);
+  if (size_separator == std::string::npos || size_separator == kPrefixSize ||
+      !std::all_of(framed_payload.begin() + kPrefixSize,
+                   framed_payload.begin() + size_separator,
+                   [](char value) { return value >= '0' && value <= '9'; })) {
+    *error = "MoonCake notification carrier frame length is malformed";
+    return false;
+  }
+
+  size_t expected_size = 0;
+  const butil::StringPiece size_text(framed_payload.data() + kPrefixSize,
+                                     size_separator - kPrefixSize);
+  if (!butil::StringToSizeT(size_text, &expected_size)) {
+    *error = "MoonCake notification carrier frame length is malformed";
+    return false;
+  }
+
+  const size_t encoded_offset = size_separator + 1;
+  const butil::StringPiece encoded_payload(
+      framed_payload.data() + encoded_offset,
+      framed_payload.size() - encoded_offset);
+  std::string decoded_payload;
+  if (!butil::Base64Decode(encoded_payload, &decoded_payload)) {
+    *error = "MoonCake notification carrier frame Base64 is malformed";
+    return false;
+  }
+  if (decoded_payload.size() != expected_size) {
+    *error = "MoonCake notification carrier frame length mismatch";
+    return false;
+  }
+  payload->swap(decoded_payload);
+  return true;
+}
+
+bool drain_mooncake_pending_notifications(
+    std::deque<TransferMetadata::NotifyDesc>* pending_notifications,
+    const std::string& notification_name,
+    size_t max_notifications,
+    std::vector<std::string>* payloads,
+    bool* more_available,
+    std::string* error) {
+  payloads->clear();
+  *more_available = false;
+  std::vector<std::string> framed_payloads;
+  framed_payloads.reserve(
+      std::min(max_notifications, pending_notifications->size()));
+  std::deque<TransferMetadata::NotifyDesc> retained;
+  while (!pending_notifications->empty()) {
+    TransferMetadata::NotifyDesc notification =
+        std::move(pending_notifications->front());
+    pending_notifications->pop_front();
+    if (notification.name == notification_name &&
+        framed_payloads.size() < max_notifications) {
+      framed_payloads.emplace_back(std::move(notification.notify_msg));
+      continue;
+    }
+    retained.emplace_back(std::move(notification));
+  }
+  pending_notifications->swap(retained);
+  *more_available = std::any_of(
+      pending_notifications->begin(),
+      pending_notifications->end(),
+      [&notification_name](const TransferMetadata::NotifyDesc& notification) {
+        return notification.name == notification_name;
+      });
+
+  std::vector<std::string> decoded_payloads;
+  decoded_payloads.reserve(framed_payloads.size());
+  for (const std::string& framed_payload : framed_payloads) {
+    std::string payload;
+    if (!unframe_mooncake_notification_payload(
+            framed_payload, &payload, error)) {
+      *more_available = false;
+      return false;
+    }
+    decoded_payloads.emplace_back(std::move(payload));
+  }
+  payloads->swap(decoded_payloads);
+  return true;
+}
+
+}  // namespace detail
 
 // ============================================================================
 // MooncakeTransferEngineCore (Singleton)
@@ -320,6 +451,47 @@ std::optional<WorkerCacheLayoutManifest>
 MooncakeTransferEngineCore::local_cache_layout() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return local_cache_layout_;
+}
+
+bool MooncakeTransferEngineCore::drain_notifications(
+    const std::string& notification_name,
+    size_t max_notifications,
+    std::vector<std::string>* payloads,
+    bool* more_available) {
+  if (payloads != nullptr) {
+    payloads->clear();
+  }
+  if (more_available != nullptr) {
+    *more_available = false;
+  }
+  if (notification_name.empty() || max_notifications == 0 ||
+      payloads == nullptr || more_available == nullptr) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(notification_mutex_);
+  std::vector<TransferMetadata::NotifyDesc> received;
+  const int32_t result = engine_->getNotifies(received);
+  if (result != 0) {
+    LOG(ERROR) << "MoonCake getNotifies failed, error=" << result;
+    return false;
+  }
+  pending_notifications_.insert(pending_notifications_.end(),
+                                std::make_move_iterator(received.begin()),
+                                std::make_move_iterator(received.end()));
+
+  std::string error;
+  if (!detail::drain_mooncake_pending_notifications(&pending_notifications_,
+                                                    notification_name,
+                                                    max_notifications,
+                                                    payloads,
+                                                    more_available,
+                                                    &error)) {
+    LOG(ERROR) << "Decode MoonCake notification carrier frame failed: "
+               << error;
+    return false;
+  }
+  return true;
 }
 
 Status MooncakeTransferEngineCore::install_peer_cache_layout(
@@ -793,8 +965,14 @@ bool MooncakeTransferEngine::move_memory_groups(
 bool MooncakeTransferEngine::move_memory_regions(
     const std::string& remote_addr,
     const std::vector<ByteRegion>& regions,
-    MoveOpcode move_opcode) {
+    MoveOpcode move_opcode,
+    const std::optional<MooncakeDecodeKVNotification>& notification) {
   if (regions.empty()) {
+    if (notification.has_value() && !notification->receipts.empty()) {
+      LOG(ERROR) << "MoonCake cannot publish Decode KV receipts without a "
+                    "transfer region";
+      return false;
+    }
     return true;
   }
 
@@ -874,15 +1052,46 @@ bool MooncakeTransferEngine::move_memory_regions(
     entries.emplace_back(std::move(entry));
   }
 
-  constexpr size_t kMaxRegionsPerBatch = 4096;
+  const size_t batch_count =
+      detail::mooncake_transfer_batch_count(entries.size());
+  if (batch_count > std::numeric_limits<uint32_t>::max()) {
+    LOG(ERROR) << "MoonCake transfer batch count exceeds notification limit";
+    return false;
+  }
   Timer transfer_timer;
-  for (size_t begin = 0; begin < entries.size(); begin += kMaxRegionsPerBatch) {
-    const size_t end = std::min(begin + kMaxRegionsPerBatch, entries.size());
+  for (size_t begin = 0; begin < entries.size();
+       begin += detail::kMooncakeMaxRegionsPerBatch) {
+    const size_t end =
+        std::min(begin + detail::kMooncakeMaxRegionsPerBatch, entries.size());
     std::vector<TransferRequest> batch_entries(entries.begin() + begin,
                                                entries.begin() + end);
     const BatchID batch_id = engine->allocateBatchID(batch_entries.size());
-    mooncake::Status submit_status =
-        engine->submitTransfer(batch_id, batch_entries);
+    mooncake::Status submit_status;
+    if (notification.has_value()) {
+      MooncakeDecodeKVNotification batch_notification =
+          detail::make_mooncake_batch_notification(
+              *notification,
+              static_cast<uint32_t>(begin /
+                                    detail::kMooncakeMaxRegionsPerBatch),
+              static_cast<uint32_t>(batch_count));
+      std::string payload;
+      std::string error;
+      if (!serialize_mooncake_decode_kv_notification(
+              batch_notification, &payload, &error)) {
+        LOG(ERROR) << "Serialize MoonCake Decode KV notification failed: "
+                   << error;
+        engine->freeBatchID(batch_id);
+        return false;
+      }
+      const std::string framed_payload =
+          detail::frame_mooncake_notification_payload(payload);
+      TransferMetadata::NotifyDesc notify_desc{
+          kMooncakeDecodeKVNotificationName, framed_payload};
+      submit_status = engine->submitTransferWithNotify(
+          batch_id, batch_entries, std::move(notify_desc));
+    } else {
+      submit_status = engine->submitTransfer(batch_id, batch_entries);
+    }
     if (!submit_status.ok()) {
       LOG(ERROR) << "submit byte regions failed";
       COUNTER_INC(mooncake_transfer_failed_total);
@@ -912,6 +1121,15 @@ bool MooncakeTransferEngine::move_memory_regions(
                       latency_microseconds);
   }
   return true;
+}
+
+bool MooncakeTransferEngine::drain_notifications(
+    const std::string& notification_name,
+    size_t max_notifications,
+    std::vector<std::string>* payloads,
+    bool* more_available) {
+  return core_.drain_notifications(
+      notification_name, max_notifications, payloads, more_available);
 }
 
 bool MooncakeTransferEngine::move_memory_by_global_offsets(

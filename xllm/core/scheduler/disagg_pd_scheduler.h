@@ -17,12 +17,15 @@ limitations under the License.
 
 #include <brpc/channel.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "disagg_pd.pb.h"
@@ -36,6 +39,8 @@ limitations under the License.
 
 namespace xllm {
 
+inline constexpr int32_t kDecodeAddNewRequestSuccessStatusCode = 200;
+inline constexpr int32_t kDecodeAddNewTemporaryCapacityStatusCode = 404;
 inline constexpr int32_t kDecodeAddNewPromptTooLongStatusCode = 413;
 
 bool is_permanent_rejection(int32_t status_code);
@@ -83,7 +88,9 @@ class DisaggPDScheduler : public ContinuousScheduler {
       int32_t src_dp_size,
       int32_t src_dp_rank,
       torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
-      int32_t num_cached_tokens = 0);
+      int32_t num_cached_tokens = 0,
+      uint64_t attempt_epoch = 0,
+      uint64_t allocation_generation = 0);
 
   // decode allocate blocks with prefix cache.
   bool try_allocate(Sequence* sequence);
@@ -113,7 +120,34 @@ class DisaggPDScheduler : public ContinuousScheduler {
                        const int32_t src_kv_split_size);
 
  protected:
-  void do_permanent_rejection(const std::shared_ptr<Request>& request);
+  struct DecodeFirstGeneration final {
+    int64_t token_id = 0;
+    bool has_logprob = false;
+    float logprob = 0.0f;
+    double time_to_first_token_latency_seconds = 0.0;
+    std::vector<int64_t> top_tokens;
+    std::vector<float> top_logprobs;
+    std::string kv_cache_transfer_mode;
+    std::vector<uint64_t> src_cluster_ids;
+    std::vector<std::string> src_addrs;
+    std::vector<KVTransferMapping> source_mappings;
+    int32_t src_dp_size = 0;
+    int32_t src_dp_rank = 0;
+    torch::Tensor mtp_bootstrap_embedding;
+    int32_t num_cached_tokens = 0;
+    uint64_t attempt_epoch = 0;
+    uint64_t allocation_generation = 0;
+  };
+
+  struct StrictDecodePendingState final {
+    uint64_t attempt_epoch = 0;
+    uint64_t allocation_generation = 0;
+    std::chrono::steady_clock::time_point deadline;
+    std::optional<DecodeFirstGeneration> first_generation;
+  };
+
+  void do_permanent_rejection(const std::shared_ptr<Request>& request,
+                              int32_t status_code);
 
   bool enqueue_ready_request(std::shared_ptr<Request> request) override;
 
@@ -124,6 +158,15 @@ class DisaggPDScheduler : public ContinuousScheduler {
   void profile_tpot();
 
   void cache_prefill_blocks(Request* request);
+
+  bool complete_decode_first_generation(const std::shared_ptr<Request>& request,
+                                        DecodeFirstGeneration first_generation,
+                                        bool release_allocation_on_failure);
+
+  void poll_decode_kv_readiness();
+
+  void quarantine_decode_request(const std::string& request_id,
+                                 const std::string& reason);
 
   // check remote instance info, if not exist, get from master service
   bool check_remote_instance_info(const std::string& instance_name);
@@ -184,6 +227,17 @@ class DisaggPDScheduler : public ContinuousScheduler {
   // request_id -> Request object
   std::unordered_map<std::string, std::shared_ptr<Request>>
       received_request_map_;
+  std::unordered_map<std::string, StrictDecodePendingState>
+      strict_decode_pending_states_;
+  // A timed-out receiver allocation can still be the target of remote DMA.
+  // Keep it non-reusable until process teardown because the transfer backends
+  // do not provide a request-scoped quiescence fence.
+  std::unordered_map<std::string, std::shared_ptr<Request>>
+      quarantined_requests_;
+  // Drain likely late notifications for a bounded grace period. The retained
+  // allocation, not an empty poll, remains the safety boundary after expiry.
+  std::optional<std::chrono::steady_clock::time_point>
+      quarantine_drain_deadline_;
   // prefill_instance_name -> set of request_ids.
   // Used for bulk cleanup when a prefill instance is unlinked.
   std::unordered_map<std::string, std::unordered_set<std::string>>

@@ -50,8 +50,10 @@ class DisaggPDConfig final {
          "enable_pd_ooc",
          "disagg_pd_port",
          "instance_role",
+         "kv_cache_transfer_type",
          "kv_cache_transfer_mode",
-         "transfer_listen_port"}};
+         "transfer_listen_port",
+         "decode_kv_readiness_timeout_ms"}};
     return kOptionCategory;
   }
 
@@ -63,9 +65,13 @@ class DisaggPDConfig final {
 
   PROPERTY(std::string, instance_role) = "DEFAULT";
 
+  PROPERTY(std::string, kv_cache_transfer_type) = "Mooncake";
+
   PROPERTY(std::string, kv_cache_transfer_mode) = "PUSH";
 
   PROPERTY(int32_t, transfer_listen_port) = 26000;
+
+  PROPERTY(int64_t, decode_kv_readiness_timeout_ms) = 30000;
 
   PROPERTY(bool, kv_push_dst_rotate) = false;
 };

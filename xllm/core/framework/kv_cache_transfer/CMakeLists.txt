@@ -62,9 +62,24 @@ cc_library(
 
 cc_library(
   NAME
+    decode_kv_readiness
+  HDRS
+    decode_kv_readiness.h
+  SRCS
+    decode_kv_readiness.cpp
+  DEPS
+    :cache_layout
+    :common
+    :push_route
+    proto::xllm_proto
+)
+
+cc_library(
+  NAME
     kv_cache_transfer
   HDRS
     kv_cache_transfer.h
+    $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.h>
     kv_cache_store.h
     prefetch_result.h
     hierarchy_kv_cache_transfer.h
@@ -73,6 +88,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.h>
   SRCS
     kv_cache_transfer.cpp
+    $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.cpp>
     kv_cache_store.cpp
     hierarchy_kv_cache_transfer.cpp
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_transfer_engine.cpp>
@@ -81,6 +97,7 @@ cc_library(
   DEPS
     :cache_layout
     :common
+    :decode_kv_readiness
     :kv_cache
     :push_route
     :reshard_planner
@@ -89,6 +106,7 @@ cc_library(
     :platform
     $<$<BOOL:${USE_NPU}>:graph>
     glog::glog
+    $<$<BOOL:${USE_NPU}>:llm_datadist>
     $<$<BOOL:${USE_NPU}>:c_sec>
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>

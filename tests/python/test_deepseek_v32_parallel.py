@@ -53,6 +53,7 @@ from xllm.python.model_executor.forward_context import (  # noqa: E402
 )
 from xllm.python.models.deepseek_v32 import (  # noqa: E402
     DeepseekV3Config,
+    DeepseekV3MLP,
     DeepseekV3MoE,
 )
 
@@ -137,6 +138,115 @@ class TestDeepseekV3ConfigValidation:
 
 
 # ---------------------------------------------------------------------------
+# Dense MLP tensor-parallel reduction tests
+# ---------------------------------------------------------------------------
+
+
+def _make_mlp_for_reduction(tp_size: int, **kwargs: bool) -> DeepseekV3MLP:
+    cfg = _config(tp_size=tp_size, world_size=tp_size)
+    mlp = DeepseekV3MLP(
+        cfg,
+        cfg.intermediate_size,
+        torch.bfloat16,
+        torch.device("cpu"),
+        **kwargs,
+    )
+    mlp.gate_up_proj = torch.nn.Identity()
+    mlp.down_proj = torch.nn.Identity()
+    return mlp
+
+
+class TestDeepseekV3MLPTensorParallelReduction:
+    def setup_method(self) -> None:
+        distributed.all_reduce_.reset_mock(side_effect=True)
+        kernels.silu_and_mul.reset_mock(side_effect=True)
+
+    def teardown_method(self) -> None:
+        distributed.all_reduce_.reset_mock(side_effect=True)
+        kernels.silu_and_mul.reset_mock(side_effect=True)
+
+    def test_default_reduction_preserves_partial_dtype(self) -> None:
+        mlp = _make_mlp_for_reduction(tp_size=2)
+        partial = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        kernels.silu_and_mul.return_value = partial
+
+        output = mlp(torch.empty_like(partial))
+
+        distributed.all_reduce_.assert_called_once_with(partial)
+        assert output is partial
+        assert output.dtype == torch.bfloat16
+
+    def test_opt_in_reduction_uses_fp32_and_restores_partial_dtype(self) -> None:
+        mlp = _make_mlp_for_reduction(tp_size=2, tp_reduce_in_fp32=True)
+        partial = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        reduction_delta = torch.tensor([[0.25, -0.5]], dtype=torch.float32)
+        kernels.silu_and_mul.return_value = partial
+
+        def reduce_output(output: torch.Tensor) -> None:
+            assert output.dtype == torch.float32
+            output.add_(reduction_delta)
+
+        distributed.all_reduce_.side_effect = reduce_output
+
+        output = mlp(torch.empty_like(partial))
+
+        distributed.all_reduce_.assert_called_once()
+        assert output.dtype == partial.dtype
+        torch.testing.assert_close(
+            output,
+            (partial.float() + reduction_delta).to(partial.dtype),
+        )
+
+    def test_opt_in_tp_one_skips_collective_and_dtype_round_trip(self) -> None:
+        mlp = _make_mlp_for_reduction(tp_size=1, tp_reduce_in_fp32=True)
+        partial = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        kernels.silu_and_mul.return_value = partial
+
+        output = mlp(torch.empty_like(partial))
+
+        distributed.all_reduce_.assert_not_called()
+        assert output is partial
+
+    def test_skip_tp_reduce_still_skips_collective_and_dtype_round_trip(self) -> None:
+        mlp = _make_mlp_for_reduction(
+            tp_size=2,
+            skip_tp_reduce=True,
+            tp_reduce_in_fp32=True,
+        )
+        partial = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+        kernels.silu_and_mul.return_value = partial
+
+        output = mlp(torch.empty_like(partial))
+
+        distributed.all_reduce_.assert_not_called()
+        assert output is partial
+
+    def test_tp_reduce_add_stays_before_fp32_collective(self) -> None:
+        mlp = _make_mlp_for_reduction(tp_size=2, tp_reduce_in_fp32=True)
+        partial = torch.tensor([[1.0]], dtype=torch.bfloat16)
+        tp_reduce_add = torch.tensor([[1.0 / 256.0]], dtype=torch.bfloat16)
+        expected_collective_input = (partial + tp_reduce_add).float()
+        kernels.silu_and_mul.return_value = partial
+
+        def check_collective_input(output: torch.Tensor) -> None:
+            assert output.dtype == torch.float32
+            torch.testing.assert_close(
+                output,
+                expected_collective_input,
+                rtol=0,
+                atol=0,
+            )
+
+        distributed.all_reduce_.side_effect = check_collective_input
+
+        output = mlp(torch.empty_like(partial), tp_reduce_add)
+
+        distributed.all_reduce_.assert_called_once()
+        assert output.dtype == partial.dtype
+        torch.testing.assert_close(output, partial + tp_reduce_add)
+
+
+# ---------------------------------------------------------------------------
 # MoE layer construction tests
 # ---------------------------------------------------------------------------
 
@@ -146,18 +256,23 @@ def _make_moe(
     ep_rank: int = 0,
     dp_size: int = 1,
     dp_rank: int = 0,
+    tp_size: int = 1,
+    cp_size: int = 1,
     moe_tp_size: int = 1,
     n_experts: int = 16,
 ) -> DeepseekV3MoE:
+    world_size = ep_size * moe_tp_size if ep_size > 1 else tp_size * dp_size * cp_size
     cfg = _config(
         n_routed_experts=n_experts,
         ep_size=ep_size,
         ep_rank=ep_rank,
         dp_size=dp_size,
         dp_rank=dp_rank,
+        tp_size=tp_size,
         moe_tp_size=moe_tp_size,
-        world_size=max(ep_size, 1) * dp_size,
+        world_size=world_size,
     )
+    cfg.cp_size = cp_size
     return DeepseekV3MoE(cfg, layer_id=0, dtype=torch.float32, device=torch.device("cpu"))
 
 
@@ -296,6 +411,29 @@ class TestDeepseekV3MoEForward:
 
         reduce_calls = [c for c in distributed.all_reduce_.call_args_list if len(c[0]) > 1 and c[0][1] == "moe_tp"]
         assert len(reduce_calls) == 1
+
+    def test_cp_only_topology_does_not_reduce_moe_rows(self) -> None:
+        moe = _make_moe(ep_size=1, tp_size=1, cp_size=4, moe_tp_size=4)
+        routed = torch.randn(4, 64)
+        shared = torch.randn(4, 64)
+
+        assert moe.cfg.tp_size == 1
+        assert moe.moe_tp_size == 4
+        output = moe._combine_expert_outputs(routed, shared)
+
+        torch.testing.assert_close(output, routed + shared)
+        distributed.all_reduce_.assert_not_called()
+
+    def test_tp_only_topology_uses_default_tp_reduction(self) -> None:
+        moe = _make_moe(ep_size=1, tp_size=2, moe_tp_size=2)
+        routed = torch.randn(4, 64)
+        shared = torch.randn(4, 64)
+
+        assert moe.moe_tp_size == 2
+        output = moe._combine_expert_outputs(routed, shared)
+
+        torch.testing.assert_close(output, routed + shared)
+        distributed.all_reduce_.assert_called_once_with(output)
 
     def test_grouped_moe_active_range_ep2_rank1(self):
         moe = _make_moe(ep_size=2, ep_rank=1, n_experts=16)

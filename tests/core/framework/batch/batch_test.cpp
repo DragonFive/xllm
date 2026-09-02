@@ -352,7 +352,12 @@ TEST(BatchInputBuilderTest, FlatRemoteSharedPrefixUsesTrimmedRemoteMapping) {
   sequence.kv_state().advance_transfer_block_idx(2);
 
   TransferKVInfo full_info = make_info({102, 103, 104});
+  full_info.decode_kv_manifest = "strict-manifest";
+  full_info.attempt_epoch = 7;
+  full_info.allocation_generation = 11;
   full_info.mappings[0].remote_shared_num = 2;
+  full_info.mappings[0].logical_block_ordinals = {2, 3, 4};
+  full_info.mappings[0].valid_tokens = {16, 16, 16};
   full_info.dst_xtensor_layer_offsets = {
       make_offsets({1002, 1003, 1004}, {2002, 2003, 2004})};
 
@@ -364,6 +369,15 @@ TEST(BatchInputBuilderTest, FlatRemoteSharedPrefixUsesTrimmedRemoteMapping) {
   const std::vector<uint64_t> expected_local(ids.begin() + 2, ids.end());
   expect_mapping(info, BlockType::KV, expected_local, {102, 103, 104});
   EXPECT_EQ(find_mapping(info, BlockType::KV).remote_shared_num, 2u);
+  EXPECT_EQ(find_mapping(info, BlockType::KV).logical_block_ordinals,
+            (std::vector<uint64_t>{2, 3, 4}));
+  EXPECT_EQ(find_mapping(info, BlockType::KV).valid_tokens,
+            (std::vector<uint32_t>{16, 16, 16}));
+  EXPECT_EQ(find_mapping(info, BlockType::KV).receipt_remote_ids,
+            (std::vector<uint64_t>{102, 103, 104}));
+  EXPECT_EQ(info.decode_kv_manifest, "strict-manifest");
+  EXPECT_EQ(info.attempt_epoch, 7u);
+  EXPECT_EQ(info.allocation_generation, 11u);
   EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 5u);
   ASSERT_EQ(info.dst_xtensor_layer_offsets.size(), 1u);
   EXPECT_EQ(info.dst_xtensor_layer_offsets[0].k_offsets,
@@ -534,6 +548,211 @@ TEST(BatchInputBuilderTest, DSV4KvSplitMapsOneSourceBlockToTwoDecodeBlocks) {
   expect_mapping(info, BlockType::C4, block_ids(blocks), {100, 101, 102, 103});
   EXPECT_EQ(sequence.kv_state().next_group_transfer_block_idx(BlockType::C4),
             2u);
+}
+
+TEST(BatchInputBuilderTest,
+     KvSplitAlignedPrefixUsesDestinationLogicalOrdinals) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(4);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(2);
+
+  TransferKVInfo full_info = make_info({104, 105, 106, 107});
+  full_info.decode_kv_manifest = "strict-manifest";
+  full_info.attempt_epoch = 7;
+  full_info.allocation_generation = 11;
+  full_info.mappings[0].remote_shared_num = 4;
+  full_info.mappings[0].logical_block_ordinals = {4, 5, 6, 7};
+  full_info.mappings[0].valid_tokens = {16, 16, 16, 16};
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/128, /*kv_split_size=*/2);
+
+  const std::vector<uint64_t> ids = block_ids(blocks);
+  expect_mapping(info, BlockType::KV, {ids[2], ids[3]}, {104, 105, 106, 107});
+  EXPECT_EQ(find_mapping(info, BlockType::KV).logical_block_ordinals,
+            (std::vector<uint64_t>{4, 5, 6, 7}));
+  EXPECT_EQ(find_mapping(info, BlockType::KV).receipt_remote_ids,
+            (std::vector<uint64_t>{104, 105, 106, 107}));
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 4u);
+}
+
+TEST(BatchInputBuilderTest, KvSplitOddPrefixKeepsPartialFirstSourceBlock) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(3);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(1);
+
+  TransferKVInfo full_info = make_info({103, 104, 105});
+  full_info.decode_kv_manifest = "strict-manifest";
+  full_info.attempt_epoch = 7;
+  full_info.allocation_generation = 11;
+  full_info.mappings[0].remote_shared_num = 3;
+  full_info.mappings[0].logical_block_ordinals = {3, 4, 5};
+  full_info.mappings[0].valid_tokens = {16, 16, 16};
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/96, /*kv_split_size=*/2);
+
+  const std::vector<uint64_t> ids = block_ids(blocks);
+  expect_mapping(info, BlockType::KV, {ids[1], ids[2]}, {103, 104, 105});
+  EXPECT_EQ(find_mapping(info, BlockType::KV).logical_block_ordinals,
+            (std::vector<uint64_t>{3, 4, 5}));
+  EXPECT_EQ(find_mapping(info, BlockType::KV).receipt_remote_ids,
+            (std::vector<uint64_t>{103, 104, 105}));
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 3u);
+}
+
+TEST(BatchInputBuilderTest,
+     KvSplitPrefixHit2304Plus27TokenSuffixKeepsTransferReceipt) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(256);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(10);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(9);
+
+  TransferKVInfo full_info = make_info({118});
+  full_info.decode_kv_manifest = "strict-manifest";
+  full_info.attempt_epoch = 7;
+  full_info.allocation_generation = 11;
+  full_info.mappings[0].remote_shared_num = 18;
+  full_info.mappings[0].logical_block_ordinals = {18};
+  full_info.mappings[0].valid_tokens = {27};
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/2331, /*kv_split_size=*/2);
+
+  const std::vector<uint64_t> ids = block_ids(blocks);
+  expect_mapping(info, BlockType::KV, {ids[9]}, {118});
+  EXPECT_EQ(find_mapping(info, BlockType::KV).logical_block_ordinals,
+            (std::vector<uint64_t>{18}));
+  EXPECT_EQ(find_mapping(info, BlockType::KV).valid_tokens,
+            (std::vector<uint32_t>{27}));
+  EXPECT_EQ(find_mapping(info, BlockType::KV).receipt_remote_ids,
+            (std::vector<uint64_t>{118}));
+  EXPECT_EQ(info.decode_kv_manifest, "strict-manifest");
+  EXPECT_EQ(info.attempt_epoch, 7u);
+  EXPECT_EQ(info.allocation_generation, 11u);
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 9u);
+}
+
+TEST(BatchInputBuilderTest, KvSplitOddExactPrefixWithNoSuffixIsEmpty) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(2);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(1);
+
+  TransferKVInfo full_info = make_info({});
+  full_info.mappings[0].remote_shared_num = 3;
+
+  const TransferKVInfo info =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/48, /*kv_split_size=*/2);
+
+  EXPECT_TRUE(find_mapping(info, BlockType::KV).local_ids.empty());
+  EXPECT_TRUE(find_mapping(info, BlockType::KV).remote_ids.empty());
+  EXPECT_TRUE(info.decode_kv_manifest.empty());
+  EXPECT_EQ(info.attempt_epoch, 0u);
+  EXPECT_EQ(info.allocation_generation, 0u);
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 1u);
+}
+
+TEST(BatchInputBuilderTest, KvSplitEmptyRemoteIdsWithUncoveredSuffixDies) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(2);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(1);
+
+  TransferKVInfo full_info = make_info({});
+  full_info.mappings[0].remote_shared_num = 3;
+
+  EXPECT_DEATH(
+      {
+        const TransferKVInfo info =
+            BatchInputBuilderTestPeer::build_step_transfer_info(
+                full_info, &sequence, /*seq_len=*/64, /*kv_split_size=*/2);
+        (void)info;
+      },
+      "Empty KV remote id mapping does not cover current Prefill step");
+}
+
+TEST(BatchInputBuilderTest, KvSplitTruncatedLogicalMetadataDies) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(4);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(2);
+
+  TransferKVInfo full_info = make_info({104, 105});
+  full_info.mappings[0].remote_shared_num = 4;
+  full_info.mappings[0].logical_block_ordinals = {4, 5};
+  full_info.mappings[0].valid_tokens = {16, 16};
+
+  EXPECT_DEATH(
+      {
+        const TransferKVInfo info =
+            BatchInputBuilderTestPeer::build_step_transfer_info(
+                full_info, &sequence, /*seq_len=*/128, /*kv_split_size=*/2);
+        (void)info;
+      },
+      "does not cover a pending source block");
+}
+
+TEST(BatchInputBuilderTest,
+     KvSplitExactPrefixAndPartialTailPreserveChunkReceipts) {
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(32);
+  BlockManagerImpl manager(options);
+  std::vector<Block> blocks = manager.allocate(3);
+  Sequence sequence = make_basic_sequence({1});
+  sequence.add_blocks(BlockType::KV, blocks);
+  sequence.kv_state().advance_transfer_block_idx(2);
+
+  TransferKVInfo full_info = make_info({104, 105});
+  full_info.decode_kv_manifest = "strict-manifest";
+  full_info.attempt_epoch = 7;
+  full_info.allocation_generation = 11;
+  full_info.mappings[0].remote_shared_num = 4;
+  full_info.mappings[0].logical_block_ordinals = {4, 5};
+  full_info.mappings[0].valid_tokens = {16, 1};
+
+  const TransferKVInfo partial_chunk =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/65, /*kv_split_size=*/2);
+  const std::vector<uint64_t> ids = block_ids(blocks);
+  expect_mapping(partial_chunk, BlockType::KV, {ids[2]}, {104, 105});
+  EXPECT_TRUE(
+      find_mapping(partial_chunk, BlockType::KV).receipt_remote_ids.empty());
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 2u);
+
+  const TransferKVInfo final_chunk =
+      BatchInputBuilderTestPeer::build_step_transfer_info(
+          full_info, &sequence, /*seq_len=*/81, /*kv_split_size=*/2);
+  expect_mapping(final_chunk, BlockType::KV, {ids[2]}, {104, 105});
+  EXPECT_EQ(find_mapping(final_chunk, BlockType::KV).valid_tokens,
+            (std::vector<uint32_t>{16, 1}));
+  EXPECT_EQ(find_mapping(final_chunk, BlockType::KV).receipt_remote_ids,
+            (std::vector<uint64_t>{104, 105}));
+  EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 2u);
 }
 
 TEST(BatchInputBuilderTest, DSV4LaterChunkSkipsExpiredSWABlocks) {
@@ -1766,6 +1985,15 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   ForwardInput input =
       builder.build_forward_input(/*num_decoding_tokens=*/1,
                                   /*min_decoding_batch_size=*/0);
+  ASSERT_EQ(input.transfer_kv_infos.size(), 1u);
+  input.transfer_kv_infos[0].decode_kv_manifest = "strict-manifest";
+  input.transfer_kv_infos[0].attempt_epoch = 7;
+  input.transfer_kv_infos[0].allocation_generation = 11;
+  ASSERT_EQ(input.transfer_kv_infos[0].mappings.size(), 1u);
+  input.transfer_kv_infos[0].mappings[0].logical_block_ordinals = {2};
+  input.transfer_kv_infos[0].mappings[0].valid_tokens = {3};
+  input.transfer_kv_infos[0].mappings[0].receipt_remote_ids = {100};
+  input.transfer_kv_infos[0].mappings[0].remote_shared_num = 2;
   input.input_params.parallel.dp_global_batch_generations = {3, 7};
   input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
   input.input_params.embedding.mtp_bootstrap_embeddings =
@@ -1800,6 +2028,14 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       find_mapping(round_trip.transfer_kv_infos[0], BlockType::KV);
   EXPECT_EQ(mapping.local_ids, (std::vector<uint64_t>{1}));
   EXPECT_EQ(mapping.remote_ids, (std::vector<uint64_t>{100}));
+  EXPECT_EQ(mapping.logical_block_ordinals, (std::vector<uint64_t>{2}));
+  EXPECT_EQ(mapping.valid_tokens, (std::vector<uint32_t>{3}));
+  EXPECT_EQ(mapping.receipt_remote_ids, (std::vector<uint64_t>{100}));
+  EXPECT_EQ(mapping.remote_shared_num, 2u);
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].decode_kv_manifest,
+            "strict-manifest");
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].attempt_epoch, 7u);
+  EXPECT_EQ(round_trip.transfer_kv_infos[0].allocation_generation, 11u);
   EXPECT_EQ(round_trip.input_params.embedding.mtp_bootstrap_row_idxes,
             std::vector<int32_t>{0});
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,

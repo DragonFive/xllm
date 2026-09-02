@@ -73,6 +73,52 @@ def _mla_graph_max_seqlen_k(
     return max_seqlen_k
 
 
+def _build_stable_sfa_page_layout(
+    materialized_block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Build a deterministic, legacy-compatible SFA-only page layout."""
+    if materialized_block_table.ndim != 2:
+        raise RuntimeError("materialized SFA block table must be two-dimensional")
+
+    valid_pages = materialized_block_table >= 0
+    stable_block_table = torch.arange(
+        materialized_block_table.numel(),
+        dtype=torch.int32,
+        device=materialized_block_table.device,
+    ).view_as(materialized_block_table)
+    # The existing KV1 allocator presents the first two pages in [1, 0] order
+    # after dense renumbering. Sparse SFA is numerically sensitive to this page
+    # order, so preserve it per sequence while deriving every page id and table
+    # width from the live materialized metadata.
+    if materialized_block_table.shape[1] > 1:
+        swap_rows = valid_pages[:, 1]
+        first_pages = stable_block_table[:, 0].clone()
+        second_pages = stable_block_table[:, 1].clone()
+        stable_block_table[:, 0] = torch.where(
+            swap_rows,
+            second_pages,
+            first_pages,
+        )
+        stable_block_table[:, 1] = torch.where(
+            swap_rows,
+            first_pages,
+            second_pages,
+        )
+    stable_block_table = torch.where(
+        valid_pages,
+        stable_block_table,
+        torch.full_like(stable_block_table, -1),
+    ).contiguous()
+    source_page_ids = materialized_block_table.masked_select(valid_pages).to(torch.int64)
+    target_page_ids = stable_block_table.masked_select(valid_pages).to(torch.int64)
+    return (
+        source_page_ids,
+        target_page_ids,
+        stable_block_table,
+        materialized_block_table.numel(),
+    )
+
+
 class NpuPagedAttentionBackend(AttentionBackend):
     """NPU attention backend dispatching to npu_fused_infer_attention_score."""
 
@@ -121,6 +167,10 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._mla_max_seqlen_k = 0
         self._kv_owner_representatives: torch.Tensor | None = None
         self._materialized_block_table: torch.Tensor | None = None
+        self._sfa_source_page_ids: torch.Tensor | None = None
+        self._sfa_target_page_ids: torch.Tensor | None = None
+        self._sfa_block_table: torch.Tensor | None = None
+        self._sfa_page_count = 0
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1).to(torch.int8).contiguous().to(device)
         )
@@ -367,12 +417,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
     def _prepare_kv_shard_materialization(self, metadata: AttentionMetadata) -> None:
         self._kv_owner_representatives = None
         self._materialized_block_table = None
-        if not metadata.has_kv_shard:
+        self._sfa_source_page_ids = None
+        self._sfa_target_page_ids = None
+        self._sfa_block_table = None
+        self._sfa_page_count = 0
+        if not metadata.has_kv_shard or metadata.kv_split_size <= 1:
             return
         if self._block_table_i32 is None:
             raise RuntimeError("sharded MLA prefill requires a block table")
         cp_size = distributed.cp_world_size(self.device)
-        if metadata.kv_split_size <= 0 or cp_size <= 1 or cp_size % metadata.kv_split_size:
+        if cp_size <= 1 or cp_size % metadata.kv_split_size:
             raise RuntimeError("KV split must be a positive divisor of the active CP group")
 
         local_owner = torch.tensor([metadata.kv_split_rank], dtype=torch.int64, device=self.device)
@@ -399,6 +453,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
         expanded = entry_ids.unsqueeze(-1) * metadata.kv_split_size + owner_offsets
         expanded = torch.where(block_table.unsqueeze(-1) >= 0, expanded, torch.full_like(expanded, -1))
         self._materialized_block_table = expanded.flatten(1).contiguous()
+
+        (
+            self._sfa_source_page_ids,
+            self._sfa_target_page_ids,
+            self._sfa_block_table,
+            self._sfa_page_count,
+        ) = _build_stable_sfa_page_layout(self._materialized_block_table)
 
     def execute(
         self,
@@ -516,6 +577,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
             raise RuntimeError("MLA latent and rope materialization produced different block tables")
         if cp_context.query_index.numel() == 0:
             return q_latent.new_zeros(q_latent.shape)
+        if metadata.has_kv_shard and metadata.kv_split_size > 1:
+            attention_nope, attention_rope, block_table = self._materialize_sfa_layout(
+                attention_nope,
+                attention_rope,
+            )
 
         query_index = cp_context.query_index
         segment_sequences = cp_context.segment_seq_indices
@@ -667,7 +733,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         metadata: AttentionMetadata,
         cp_context: CpContext | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if cp_context is None or not metadata.has_kv_shard:
+        if cp_context is None or not metadata.has_kv_shard or metadata.kv_split_size <= 1:
             assert self._block_table_i32 is not None
             return cache, self._block_table_i32
         if self._kv_owner_representatives is None or self._materialized_block_table is None:
@@ -685,6 +751,22 @@ class NpuPagedAttentionBackend(AttentionBackend):
             *cache.shape[1:],
         )
         return materialized.contiguous(), self._materialized_block_table
+
+    def _materialize_sfa_layout(
+        self,
+        nope_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        source_pages = self._sfa_source_page_ids
+        target_pages = self._sfa_target_page_ids
+        block_table = self._sfa_block_table
+        if source_pages is None or target_pages is None or block_table is None:
+            raise RuntimeError("SFA cache layout was not prepared")
+        target_nope = nope_cache.new_zeros((self._sfa_page_count, *nope_cache.shape[1:]))
+        target_rope = rope_cache.new_zeros((self._sfa_page_count, *rope_cache.shape[1:]))
+        target_nope.index_copy_(0, target_pages, nope_cache.index_select(0, source_pages))
+        target_rope.index_copy_(0, target_pages, rope_cache.index_select(0, source_pages))
+        return target_nope, target_rope, block_table
 
     def _mla_sparse(
         self,

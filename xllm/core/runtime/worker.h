@@ -76,6 +76,11 @@ class Worker {
 
   void get_cache_info(uint64_t& cluster_id, std::string& addr, uint16_t& port);
 
+  KVCacheLayoutQueryResult get_kv_cache_layout();
+
+  KVTransferNotificationDrainResult drain_kv_transfer_notifications(
+      size_t max_notifications);
+
   bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                     const std::vector<std::string>& addrs,
                     const std::vector<uint16_t>& ports);
